@@ -7903,8 +7903,23 @@ skip_pointer:
 			sub->args[i].arg_type = ARG_ANYTHING;
 			continue;
 		}
-		if (!is_global)
+		/*
+		 * vsched: previously this branch returned -EINVAL silently for any
+		 * non-CTX, non-int pointer arg in a static subprog, leaving the
+		 * user with -EINVAL and an empty verifier log. That hides the real
+		 * failure for SCHED programs whose static helpers take kernel
+		 * struct pointers (e.g. `struct rq *`), because the SCHED canonical
+		 * ctx type is `void *` so btf_is_prog_ctx_type() never matches a
+		 * named struct. Emit a real log line so libbpf can surface it; the
+		 * error is still -EINVAL.
+		 */
+		if (!is_global) {
+			bpf_log(log,
+				"arg#%d in static function %s() has unsupported type '%s %s'; static subprogs only support scalars and the program's ctx pointer\n",
+				i, tname, btf_type_str(t),
+				btf_name_by_offset(btf, t->name_off));
 			return -EINVAL;
+		}
 		bpf_log(log, "Arg#%d type %s in %s() is not supported yet.\n",
 			i, btf_type_str(t), tname);
 		return -EINVAL;
