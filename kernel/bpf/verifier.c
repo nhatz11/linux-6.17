@@ -23746,6 +23746,16 @@ int bpf_check_attach_target(struct bpf_verifier_log *log,
 	case BPF_LSM_CGROUP:
 	case BPF_TRACE_FENTRY:
 	case BPF_TRACE_FEXIT:
+	/*
+	 * vsched: BPF_SCHED programs use the same BTF-based trampoline attach
+	 * mechanism as LSM/TRACING/MODIFY_RETURN. Without this case, the switch
+	 * falls through to the unreachable `default:` branch in callers and
+	 * returns -EINVAL *before* any verifier log line is written, so the load
+	 * fails with -EINVAL and an empty verifier log. Joining the fall-through
+	 * group routes BPF_SCHED through the btf_type_is_func() check and the
+	 * normal verifier setup path, so failures emit real log messages.
+	 */
+	case BPF_SCHED:
 		if (!btf_type_is_func(t)) {
 			bpf_log(log, "attach_btf_id %u is not a function\n",
 				btf_id);

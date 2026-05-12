@@ -4508,6 +4508,12 @@ static int bpf_prog_detach(const union bpf_attr *attr)
 	case BPF_PROG_TYPE_CGROUP_SYSCTL:
 	case BPF_PROG_TYPE_SOCK_OPS:
 	case BPF_PROG_TYPE_LSM:
+	/* vsched: match reference kernel; routes through cgroup detach
+	 * dispatcher for symmetry with attach. cgroup_bpf_prog_detach()
+	 * does not special-case SCHED today, but keeping this case lets
+	 * BPF_PROG_DETACH return a real error instead of -EINVAL.
+	 */
+	case BPF_PROG_TYPE_SCHED:
 		ret = cgroup_bpf_prog_detach(attr, ptype);
 		break;
 	case BPF_PROG_TYPE_SCHED_CLS:
@@ -5587,6 +5593,15 @@ static int link_create(union bpf_attr *attr, bpfptr_t uattr)
 		break;
 	case BPF_PROG_TYPE_LSM:
 	case BPF_PROG_TYPE_TRACING:
+	/*
+	 * vsched: SCHED programs use BPF_LINK_CREATE (via libbpf's
+	 * bpf_program__attach_sched -> bpf_program__attach_btf_id ->
+	 * bpf_link_create) to attach to scheduler trampolines. Without
+	 * this case, link_create() falls through to the default and
+	 * returns -EINVAL, so even a successfully-loaded SCHED program
+	 * cannot be attached. Reuse the TRACING attach path.
+	 */
+	case BPF_PROG_TYPE_SCHED:
 		if (attr->link_create.attach_type != prog->expected_attach_type) {
 			ret = -EINVAL;
 			goto out;
