@@ -22,6 +22,7 @@
 #include <linux/ctype.h>
 #include <linux/error-injection.h>
 #include <linux/bpf_lsm.h>
+#include <linux/bpf_sched.h>	/* vsched: bpf_sched_verify_prog */
 #include <linux/btf_ids.h>
 #include <linux/poison.h>
 #include <linux/module.h>
@@ -23948,7 +23949,9 @@ static int check_attach_btf_id(struct bpf_verifier_env *env)
 
 	if (prog->type != BPF_PROG_TYPE_TRACING &&
 	    prog->type != BPF_PROG_TYPE_LSM &&
-	    prog->type != BPF_PROG_TYPE_EXT)
+	    prog->type != BPF_PROG_TYPE_EXT &&
+	    /* vsched: SCHED uses BTF-based trampoline attach, needs check_attach_btf_id */
+	    prog->type != BPF_PROG_TYPE_SCHED)
 		return 0;
 
 	ret = bpf_check_attach_target(&env->log, prog, tgt_prog, btf_id, &tgt_info);
@@ -23983,6 +23986,11 @@ static int check_attach_btf_id(struct bpf_verifier_env *env)
 
 	if (prog->type == BPF_PROG_TYPE_LSM) {
 		ret = bpf_lsm_verify_prog(&env->log, prog);
+		if (ret < 0)
+			return ret;
+	} else if (prog->type == BPF_PROG_TYPE_SCHED) {
+		/* vsched: verify that attach_btf_id points to a known bpf_sched_ hook */
+		ret = bpf_sched_verify_prog(&env->log, prog);
 		if (ret < 0)
 			return ret;
 	} else if (prog->type == BPF_PROG_TYPE_TRACING &&

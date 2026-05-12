@@ -136,6 +136,8 @@ static const char * const attach_type_name[] = {
 	[BPF_NETKIT_PEER]		= "netkit_peer",
 	[BPF_TRACE_KPROBE_SESSION]	= "trace_kprobe_session",
 	[BPF_TRACE_UPROBE_SESSION]	= "trace_uprobe_session",
+	/* vsched: attach type name for BPF_PROG_TYPE_SCHED */
+	[BPF_SCHED]			= "sched",
 };
 
 static const char * const link_type_name[] = {
@@ -227,6 +229,8 @@ static const char * const prog_type_name[] = {
 	[BPF_PROG_TYPE_SK_LOOKUP]		= "sk_lookup",
 	[BPF_PROG_TYPE_SYSCALL]			= "syscall",
 	[BPF_PROG_TYPE_NETFILTER]		= "netfilter",
+	/* vsched: CFS scheduler BPF hook program type */
+	[BPF_PROG_TYPE_SCHED]			= "sched",
 };
 
 static int __base_pr(enum libbpf_print_level level, const char *format,
@@ -3443,7 +3447,9 @@ static int bpf_object_fixup_btf(struct bpf_object *obj)
 static bool prog_needs_vmlinux_btf(struct bpf_program *prog)
 {
 	if (prog->type == BPF_PROG_TYPE_STRUCT_OPS ||
-	    prog->type == BPF_PROG_TYPE_LSM)
+	    prog->type == BPF_PROG_TYPE_LSM ||
+	    /* vsched: SCHED programs use vmlinux BTF to resolve bpf_sched_ hooks */
+	    prog->type == BPF_PROG_TYPE_SCHED)
 		return true;
 
 	/* BPF_PROG_TYPE_TRACING programs which do not attach to other programs
@@ -9508,6 +9514,8 @@ static int attach_kprobe_session(const struct bpf_program *prog, long cookie, st
 static int attach_uprobe_multi(const struct bpf_program *prog, long cookie, struct bpf_link **link);
 static int attach_lsm(const struct bpf_program *prog, long cookie, struct bpf_link **link);
 static int attach_iter(const struct bpf_program *prog, long cookie, struct bpf_link **link);
+/* vsched: forward declaration for SEC("sched/") auto-attach */
+static int attach_sched(const struct bpf_program *prog, long cookie, struct bpf_link **link);
 
 static const struct bpf_sec_def section_defs[] = {
 	SEC_DEF("socket",		SOCKET_FILTER, 0, SEC_NONE),
@@ -9558,6 +9566,8 @@ static const struct bpf_sec_def section_defs[] = {
 	SEC_DEF("lsm+",			LSM, BPF_LSM_MAC, SEC_ATTACH_BTF, attach_lsm),
 	SEC_DEF("lsm.s+",		LSM, BPF_LSM_MAC, SEC_ATTACH_BTF | SEC_SLEEPABLE, attach_lsm),
 	SEC_DEF("lsm_cgroup+",		LSM, BPF_LSM_CGROUP, SEC_ATTACH_BTF),
+	/* vsched: SEC("sched/<hookname>") maps to BPF_PROG_TYPE_SCHED with BPF_SCHED attach */
+	SEC_DEF("sched+",		SCHED, BPF_SCHED, SEC_ATTACH_BTF, attach_sched),
 	SEC_DEF("iter+",		TRACING, BPF_TRACE_ITER, SEC_ATTACH_BTF, attach_iter),
 	SEC_DEF("iter.s+",		TRACING, BPF_TRACE_ITER, SEC_ATTACH_BTF | SEC_SLEEPABLE, attach_iter),
 	SEC_DEF("syscall",		SYSCALL, 0, SEC_SLEEPABLE),
@@ -9983,6 +9993,8 @@ static int bpf_object__collect_st_ops_relos(struct bpf_object *obj,
 #define BTF_TRACE_PREFIX "btf_trace_"
 #define BTF_LSM_PREFIX "bpf_lsm_"
 #define BTF_ITER_PREFIX "bpf_iter_"
+/* vsched: scheduler BPF hook functions are named bpf_sched_<hookname> in vmlinux BTF */
+#define BTF_SCHED_PREFIX "bpf_sched_"
 #define BTF_MAX_NAME_SIZE 128
 
 void btf_get_kernel_prefix_kind(enum bpf_attach_type attach_type,
@@ -10000,6 +10012,11 @@ void btf_get_kernel_prefix_kind(enum bpf_attach_type attach_type,
 		break;
 	case BPF_TRACE_ITER:
 		*prefix = BTF_ITER_PREFIX;
+		*kind = BTF_KIND_FUNC;
+		break;
+	/* vsched: CFS hook trampoline stubs are named bpf_sched_<hookname> in vmlinux */
+	case BPF_SCHED:
+		*prefix = BTF_SCHED_PREFIX;
 		*kind = BTF_KIND_FUNC;
 		break;
 	default:
@@ -12794,6 +12811,18 @@ static int attach_trace(const struct bpf_program *prog, long cookie, struct bpf_
 static int attach_lsm(const struct bpf_program *prog, long cookie, struct bpf_link **link)
 {
 	*link = bpf_program__attach_lsm(prog);
+	return libbpf_get_error(*link);
+}
+
+/* vsched: attach a BPF_PROG_TYPE_SCHED program via BTF trampoline */
+struct bpf_link *bpf_program__attach_sched(const struct bpf_program *prog)
+{
+	return bpf_program__attach_btf_id(prog, NULL);
+}
+
+static int attach_sched(const struct bpf_program *prog, long cookie, struct bpf_link **link)
+{
+	*link = bpf_program__attach_sched(prog);
 	return libbpf_get_error(*link);
 }
 

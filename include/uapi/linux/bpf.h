@@ -1071,6 +1071,8 @@ enum bpf_prog_type {
 	BPF_PROG_TYPE_SK_LOOKUP,
 	BPF_PROG_TYPE_SYSCALL, /* a program that can execute syscalls */
 	BPF_PROG_TYPE_NETFILTER,
+	/* vsched: BPF programs that hook into the CFS scheduler via trampolines */
+	BPF_PROG_TYPE_SCHED,
 	__MAX_BPF_PROG_TYPE
 };
 
@@ -1133,6 +1135,8 @@ enum bpf_attach_type {
 	BPF_NETKIT_PEER,
 	BPF_TRACE_KPROBE_SESSION,
 	BPF_TRACE_UPROBE_SESSION,
+	/* vsched: attach type for BPF_PROG_TYPE_SCHED programs */
+	BPF_SCHED,
 	__MAX_BPF_ATTACH_TYPE
 };
 

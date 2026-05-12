@@ -143,6 +143,17 @@ static int probe_prog_load(enum bpf_prog_type prog_type,
 		exp_err = -EINVAL;
 		exp_msg = "attach_btf_id 1 is not a function";
 		break;
+	/* vsched: BPF_PROG_TYPE_SCHED also uses attach_btf_id + expected_attach_type */
+	case BPF_PROG_TYPE_SCHED:
+		opts.log_buf = buf;
+		opts.log_size = sizeof(buf);
+		opts.log_level = 1;
+		opts.expected_attach_type = BPF_SCHED;
+		opts.attach_btf_id = 1;
+
+		exp_err = -EINVAL;
+		exp_msg = "attach_btf_id 1 is not a function";
+		break;
 	case BPF_PROG_TYPE_EXT:
 		opts.log_buf = buf;
 		opts.log_size = sizeof(buf);
@@ -434,6 +445,8 @@ int libbpf_probe_bpf_helper(enum bpf_prog_type prog_type, enum bpf_func_id helpe
 	case BPF_PROG_TYPE_TRACING:
 	case BPF_PROG_TYPE_EXT:
 	case BPF_PROG_TYPE_LSM:
+	/* vsched: SCHED can't be probed with a simple helper call */
+	case BPF_PROG_TYPE_SCHED:
 	case BPF_PROG_TYPE_STRUCT_OPS:
 		return -EOPNOTSUPP;
 	default:

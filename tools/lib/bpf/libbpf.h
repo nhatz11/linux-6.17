@@ -822,6 +822,9 @@ bpf_program__attach_trace_opts(const struct bpf_program *prog, const struct bpf_
 
 LIBBPF_API struct bpf_link *
 bpf_program__attach_lsm(const struct bpf_program *prog);
+/* vsched: attach a BPF_PROG_TYPE_SCHED program (SEC("sched/<hookname>")) */
+LIBBPF_API struct bpf_link *
+bpf_program__attach_sched(const struct bpf_program *prog);
 LIBBPF_API struct bpf_link *
 bpf_program__attach_cgroup(const struct bpf_program *prog, int cgroup_fd);
 LIBBPF_API struct bpf_link *

@@ -1071,6 +1071,8 @@ enum bpf_prog_type {
 	BPF_PROG_TYPE_SK_LOOKUP,
 	BPF_PROG_TYPE_SYSCALL, /* a program that can execute syscalls */
 	BPF_PROG_TYPE_NETFILTER,
+	/* vsched: BPF programs that hook into the CFS scheduler via trampolines */
+	BPF_PROG_TYPE_SCHED,
 	__MAX_BPF_PROG_TYPE
 };
 
@@ -1133,6 +1135,8 @@ enum bpf_attach_type {
 	BPF_NETKIT_PEER,
 	BPF_TRACE_KPROBE_SESSION,
 	BPF_TRACE_UPROBE_SESSION,
+	/* vsched: attach type for BPF_PROG_TYPE_SCHED programs */
+	BPF_SCHED,
 	__MAX_BPF_ATTACH_TYPE
 };
 
@@ -6064,6 +6068,10 @@ union bpf_attr {
 	FN(user_ringbuf_drain, 209, ##ctx)		\
 	FN(cgrp_storage_get, 210, ##ctx)		\
 	FN(cgrp_storage_delete, 211, ##ctx)		\
+	/* vsched: BPF helpers for scheduler entity inspection */	\
+	FN(sched_entity_to_tgidpid, 212, ##ctx)		\
+	FN(sched_entity_to_cgrpid, 213, ##ctx)			\
+	FN(sched_entity_belongs_to_cgrp, 214, ##ctx)		\
 	/* This helper list is effectively frozen. If you are trying to	\
 	 * add a new helper, you should add a kfunc instead which has	\
 	 * less stability guarantees. See Documentation/bpf/kfuncs.rst	\

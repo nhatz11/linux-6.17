@@ -29,6 +29,7 @@
 #include <uapi/linux/btf.h>
 #include <linux/pgtable.h>
 #include <linux/bpf_lsm.h>
+#include <linux/bpf_sched.h>	/* vsched: bpf_sched_inc/dec for trampoline link count */
 #include <linux/poll.h>
 #include <linux/sort.h>
 #include <linux/bpf-netns.h>
@@ -2623,6 +2624,8 @@ bpf_prog_load_check_attach(enum bpf_prog_type prog_type,
 		case BPF_PROG_TYPE_LSM:
 		case BPF_PROG_TYPE_STRUCT_OPS:
 		case BPF_PROG_TYPE_EXT:
+		/* vsched: BPF_PROG_TYPE_SCHED uses BTF-based trampolines like LSM */
+		case BPF_PROG_TYPE_SCHED:
 			break;
 		default:
 			return -EINVAL;
@@ -2755,6 +2758,8 @@ static bool is_perfmon_prog_type(enum bpf_prog_type prog_type)
 	case BPF_PROG_TYPE_LSM:
 	case BPF_PROG_TYPE_STRUCT_OPS: /* has access to struct sock */
 	case BPF_PROG_TYPE_EXT: /* extends any prog */
+	/* vsched: SCHED uses btf_ctx_access for context type validation */
+	case BPF_PROG_TYPE_SCHED:
 		return true;
 	default:
 		return false;
@@ -3392,6 +3397,10 @@ static void bpf_tracing_link_release(struct bpf_link *link)
 						tr_link->trampoline,
 						tr_link->tgt_prog));
 
+	/* vsched: decrement static key so scheduler hot paths skip BPF dispatch */
+	if (link->prog->type == BPF_PROG_TYPE_SCHED)
+		bpf_sched_dec();
+
 	bpf_trampoline_put(tr_link->trampoline);
 
 	/* tgt_prog is NULL if target is a kernel function */
@@ -3483,6 +3492,13 @@ static int bpf_tracing_prog_attach(struct bpf_prog *prog,
 			goto out_put_prog;
 		}
 		break;
+	/* vsched: BPF_PROG_TYPE_SCHED attaches via trampoline with BPF_SCHED */
+	case BPF_PROG_TYPE_SCHED:
+		if (prog->expected_attach_type != BPF_SCHED) {
+			err = -EINVAL;
+			goto out_put_prog;
+		}
+		break;
 	default:
 		err = -EINVAL;
 		goto out_put_prog;
@@ -3556,8 +3572,10 @@ static int bpf_tracing_prog_attach(struct bpf_prog *prog,
 		 * EXT programs need to specify tgt_prog_fd, so they
 		 * re-attach in separate code path.
 		 */
+		/* vsched: allow re-attach for SCHED like TRACING/LSM */
 		if (prog->type != BPF_PROG_TYPE_TRACING &&
-		    prog->type != BPF_PROG_TYPE_LSM) {
+		    prog->type != BPF_PROG_TYPE_LSM &&
+		    prog->type != BPF_PROG_TYPE_SCHED) {
 			err = -EINVAL;
 			goto out_unlock;
 		}
@@ -3618,6 +3636,10 @@ static int bpf_tracing_prog_attach(struct bpf_prog *prog,
 
 	link->tgt_prog = tgt_prog;
 	link->trampoline = tr;
+
+	/* vsched: increment static key so scheduler hot paths invoke BPF dispatch */
+	if (prog->type == BPF_PROG_TYPE_SCHED)
+		bpf_sched_inc();
 
 	/* Always clear the trampoline and target prog from prog->aux to make
 	 * sure the original attach destination is not kept alive after a
@@ -4106,6 +4128,8 @@ static int bpf_raw_tp_link_attach(struct bpf_prog *prog,
 	case BPF_PROG_TYPE_TRACING:
 	case BPF_PROG_TYPE_EXT:
 	case BPF_PROG_TYPE_LSM:
+	/* vsched: BPF_PROG_TYPE_SCHED attaches via BTF trampoline, not raw_tp name */
+	case BPF_PROG_TYPE_SCHED:
 		if (user_tp_name)
 			/* The attach point for this category of programs
 			 * should be specified via btf_id during program load.
@@ -4254,6 +4278,9 @@ attach_type_to_prog_type(enum bpf_attach_type attach_type)
 	case BPF_NETKIT_PRIMARY:
 	case BPF_NETKIT_PEER:
 		return BPF_PROG_TYPE_SCHED_CLS;
+	/* vsched: BPF_SCHED attach type maps to the vsched prog type */
+	case BPF_SCHED:
+		return BPF_PROG_TYPE_SCHED;
 	default:
 		return BPF_PROG_TYPE_UNSPEC;
 	}

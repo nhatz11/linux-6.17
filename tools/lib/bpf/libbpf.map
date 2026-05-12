@@ -155,6 +155,7 @@ LIBBPF_0.0.8 {
 		bpf_prog_attach_opts;
 		bpf_program__attach_cgroup;
 		bpf_program__attach_lsm;
+		bpf_program__attach_sched;
 		bpf_program__set_attach_target;
 } LIBBPF_0.0.7;
 
