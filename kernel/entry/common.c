@@ -70,7 +70,7 @@ __always_inline unsigned long exit_to_user_mode_loop(struct pt_regs *regs,
 	}
 
 	/* Return the latest work state for arch_exit_to_user_mode() */
-	return ti_work;
+	return ti_work | ignore_mask;
 }
 
 noinstr void irqentry_enter_from_user_mode(struct pt_regs *regs)

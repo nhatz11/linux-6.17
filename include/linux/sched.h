@@ -993,6 +993,9 @@ struct task_struct {
 #ifdef CONFIG_RT_MUTEXES
 	unsigned			sched_rt_mutex:1;
 #endif
+#if defined(CONFIG_RSEQ) && defined(CONFIG_SCHED_HRTICK)
+	unsigned			rseq_sched_delay:1;
+#endif
 
 	/* Bit to tell TOMOYO we're in execve(): */
 	unsigned			in_execve:1;
@@ -1922,10 +1925,20 @@ union thread_union {
 	unsigned long stack[THREAD_SIZE/sizeof(long)];
 };
 
-#ifdef CONFIG_RSEQ
+#if defined(CONFIG_RSEQ) && defined(CONFIG_SCHED_HRTICK)
 extern bool rseq_delay_resched(void);
+extern void rseq_delay_resched_fini(unsigned long ti_work);
+extern void rseq_delay_resched_tick(void);
 #else
 static inline bool rseq_delay_resched(void) { return false; }
+static inline void rseq_delay_resched_fini(unsigned long ti_work) { }
+static inline void rseq_delay_resched_tick(void) { }
+#endif
+
+#ifdef CONFIG_SCHED_HRTICK
+extern void hrtick_local_start(u64 delay);
+#else
+static inline void hrtick_local_start(u64 delay) { }
 #endif
 
 #ifndef CONFIG_THREAD_INFO_IN_TASK

@@ -1370,6 +1370,13 @@ static void do_sched_yield(void)
  */
 SYSCALL_DEFINE0(sched_yield)
 {
+#if defined(CONFIG_RSEQ) && defined(CONFIG_SCHED_HRTICK)
+	if (current->rseq_sched_delay) {
+		trace_printk("yield -- made it\n");
+		schedule();
+		return 0;
+	}
+#endif
 	do_sched_yield();
 	return 0;
 }

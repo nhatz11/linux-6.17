@@ -448,34 +448,81 @@ error:
 	force_sigsegv(sig);
 }
 
+#ifdef CONFIG_SCHED_HRTICK
+void rseq_delay_resched_fini(unsigned long ti_work)
+{
+	struct task_struct *t = current;
+
+	if (!t->rseq)
+		return;
+
+	if (!(ti_work & _TIF_NEED_RESCHED_LAZY)) {
+		t->rseq_sched_delay = 0;
+		return;
+	}
+
+	if (t->rseq_sched_delay)
+		return;
+
+	t->rseq_sched_delay = 1;
+	hrtick_local_start(50 * NSEC_PER_USEC);
+}
+
 bool rseq_delay_resched(void)
 {
 	struct task_struct *t = current;
 	u32 flags;
 
 	if (!t->rseq)
-		return false;
+		goto nodelay;
 
-	/* Make sure the cr_counter field exists */
 	if (current->rseq_len <= offsetof(struct rseq, cr_counter))
-		return false;
+		goto nodelay;
 
 	if (copy_from_user_nofault(&flags, &t->rseq->cr_counter, sizeof(flags)))
-		return false;
+		goto nodelay;
 
 	if (!(flags & RSEQ_CR_FLAG_IN_CRITICAL_SECTION_MASK))
-		return false;
+		goto nodelay;
 
 	trace_printk("Extend time slice\n");
 	flags |= RSEQ_CR_FLAG_KERNEL_REQUEST_SCHED;
 
 	if (copy_to_user_nofault(&t->rseq->cr_counter, &flags, sizeof(flags))) {
 		trace_printk("Faulted writing rseq\n");
-		return false;
+		goto nodelay;
 	}
 
 	return true;
+
+nodelay:
+	t->rseq_sched_delay = 0;
+	return false;
 }
+
+void rseq_delay_resched_tick(void)
+{
+	struct task_struct *t = current;
+
+	if (t->rseq_sched_delay) {
+		u32 flags;
+
+		set_tsk_need_resched(t);
+		t->rseq_sched_delay = 0;
+		trace_printk("timeout -- force resched\n");
+
+		if (!t->rseq)
+			return;
+
+		if (copy_from_user_nofault(&flags, &t->rseq->cr_counter,
+					   sizeof(flags)))
+			return;
+
+		flags &= ~RSEQ_CR_FLAG_KERNEL_REQUEST_SCHED;
+		copy_to_user_nofault(&t->rseq->cr_counter, &flags, sizeof(flags));
+	}
+}
+#endif /* CONFIG_SCHED_HRTICK */
 
 #ifdef CONFIG_DEBUG_RSEQ
 
