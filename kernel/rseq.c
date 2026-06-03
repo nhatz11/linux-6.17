@@ -448,6 +448,35 @@ error:
 	force_sigsegv(sig);
 }
 
+bool rseq_delay_resched(void)
+{
+	struct task_struct *t = current;
+	u32 flags;
+
+	if (!t->rseq)
+		return false;
+
+	/* Make sure the cr_counter field exists */
+	if (current->rseq_len <= offsetof(struct rseq, cr_counter))
+		return false;
+
+	if (copy_from_user_nofault(&flags, &t->rseq->cr_counter, sizeof(flags)))
+		return false;
+
+	if (!(flags & RSEQ_CR_FLAG_IN_CRITICAL_SECTION_MASK))
+		return false;
+
+	trace_printk("Extend time slice\n");
+	flags |= RSEQ_CR_FLAG_KERNEL_REQUEST_SCHED;
+
+	if (copy_to_user_nofault(&t->rseq->cr_counter, &flags, sizeof(flags))) {
+		trace_printk("Faulted writing rseq\n");
+		return false;
+	}
+
+	return true;
+}
+
 #ifdef CONFIG_DEBUG_RSEQ
 
 /*

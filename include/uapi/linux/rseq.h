@@ -37,6 +37,18 @@ enum rseq_cs_flags {
 		(1U << RSEQ_CS_FLAG_NO_RESTART_ON_MIGRATE_BIT),
 };
 
+enum rseq_cr_flags_bit {
+	RSEQ_CR_FLAG_IN_CRITICAL_SECTION_BIT	= 0,
+	RSEQ_CR_FLAG_KERNEL_REQUEST_SCHED_BIT	= 1,
+};
+
+enum rseq_cr_flags {
+	RSEQ_CR_FLAG_KERNEL_REQUEST_SCHED =
+		(1U << RSEQ_CR_FLAG_KERNEL_REQUEST_SCHED_BIT),
+};
+
+#define RSEQ_CR_FLAG_IN_CRITICAL_SECTION_MASK	(~0U >> 1)
+
 /*
  * struct rseq_cs is aligned on 4 * 8 bytes to ensure it is always
  * contained within a single cache-line. It is usually declared as
@@ -147,6 +159,14 @@ struct rseq {
 	 * (allocated uniquely within a memory map).
 	 */
 	__u32 mm_cid;
+
+	/*
+	 * cr_counter: user space sets any bit to indicate it is in a
+	 * critical section. Bit 1 is reserved for the kernel to request
+	 * that the task yield (RSEQ_CR_FLAG_KERNEL_REQUEST_SCHED).
+	 * Any non-zero value in bits [31:1] means in critical section.
+	 */
+	__u32 cr_counter;
 
 	/*
 	 * Flexible array member at end of structure, after last feature field.

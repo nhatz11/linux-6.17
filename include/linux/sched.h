@@ -1922,6 +1922,12 @@ union thread_union {
 	unsigned long stack[THREAD_SIZE/sizeof(long)];
 };
 
+#ifdef CONFIG_RSEQ
+extern bool rseq_delay_resched(void);
+#else
+static inline bool rseq_delay_resched(void) { return false; }
+#endif
+
 #ifndef CONFIG_THREAD_INFO_IN_TASK
 extern struct thread_info init_thread_info;
 #endif
