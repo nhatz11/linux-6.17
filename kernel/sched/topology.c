@@ -1758,11 +1758,8 @@ static struct sched_domain_topology_level *sched_domain_topology_saved;
 #define for_each_sd_topology(tl)			\
 	for (tl = sched_domain_topology; tl->mask; tl++)
 
-void __init set_sched_topology(struct sched_domain_topology_level *tl)
+void set_sched_topology(struct sched_domain_topology_level *tl)
 {
-	if (WARN_ON_ONCE(sched_smp_initialized))
-		return;
-
 	sched_domain_topology = tl;
 	sched_domain_topology_saved = NULL;
 }
@@ -1778,7 +1775,7 @@ EXPORT_SYMBOL(get_sched_topology);
 void set_live_topology(struct sched_domain_topology_level *tl)
 {
         set_sched_topology(tl);
-#ifdef CONFIG_X86
+#if defined(CONFIG_X86) && defined(CONFIG_SMP)
         x86_topology_update = true;
 #endif
         rebuild_sched_domains();

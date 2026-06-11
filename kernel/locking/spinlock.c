@@ -21,6 +21,7 @@
 #include <linux/interrupt.h>
 #include <linux/debug_locks.h>
 #include <linux/export.h>
+#include <linux/sched.h>
 
 #ifdef CONFIG_MMIOWB
 #ifndef arch_mmiowb_state
@@ -152,6 +153,8 @@ EXPORT_SYMBOL(_raw_spin_trylock_bh);
 noinline void __lockfunc _raw_spin_lock(raw_spinlock_t *lock)
 {
 	__raw_spin_lock(lock);
+	if (!in_interrupt())
+		current->lock_depth++;
 }
 EXPORT_SYMBOL(_raw_spin_lock);
 #endif
@@ -159,7 +162,12 @@ EXPORT_SYMBOL(_raw_spin_lock);
 #ifndef CONFIG_INLINE_SPIN_LOCK_IRQSAVE
 noinline unsigned long __lockfunc _raw_spin_lock_irqsave(raw_spinlock_t *lock)
 {
-	return __raw_spin_lock_irqsave(lock);
+        unsigned long flags;
+
+        flags = __raw_spin_lock_irqsave(lock);
+        if (!in_interrupt())
+                current->lock_depth++;
+        return flags;
 }
 EXPORT_SYMBOL(_raw_spin_lock_irqsave);
 #endif
@@ -168,6 +176,8 @@ EXPORT_SYMBOL(_raw_spin_lock_irqsave);
 noinline void __lockfunc _raw_spin_lock_irq(raw_spinlock_t *lock)
 {
 	__raw_spin_lock_irq(lock);
+	if (!in_interrupt())
+                current->lock_depth++;
 }
 EXPORT_SYMBOL(_raw_spin_lock_irq);
 #endif
@@ -176,6 +186,8 @@ EXPORT_SYMBOL(_raw_spin_lock_irq);
 noinline void __lockfunc _raw_spin_lock_bh(raw_spinlock_t *lock)
 {
 	__raw_spin_lock_bh(lock);
+        if (!in_interrupt())
+                current->lock_depth++;
 }
 EXPORT_SYMBOL(_raw_spin_lock_bh);
 #endif
@@ -183,6 +195,8 @@ EXPORT_SYMBOL(_raw_spin_lock_bh);
 #ifdef CONFIG_UNINLINE_SPIN_UNLOCK
 noinline void __lockfunc _raw_spin_unlock(raw_spinlock_t *lock)
 {
+	if (!in_interrupt())
+		current->lock_depth--;
 	__raw_spin_unlock(lock);
 }
 EXPORT_SYMBOL(_raw_spin_unlock);
@@ -191,6 +205,8 @@ EXPORT_SYMBOL(_raw_spin_unlock);
 #ifndef CONFIG_INLINE_SPIN_UNLOCK_IRQRESTORE
 noinline void __lockfunc _raw_spin_unlock_irqrestore(raw_spinlock_t *lock, unsigned long flags)
 {
+        if (!in_interrupt())
+                current->lock_depth--;
 	__raw_spin_unlock_irqrestore(lock, flags);
 }
 EXPORT_SYMBOL(_raw_spin_unlock_irqrestore);
@@ -199,6 +215,8 @@ EXPORT_SYMBOL(_raw_spin_unlock_irqrestore);
 #ifndef CONFIG_INLINE_SPIN_UNLOCK_IRQ
 noinline void __lockfunc _raw_spin_unlock_irq(raw_spinlock_t *lock)
 {
+        if (!in_interrupt())
+                current->lock_depth--;
 	__raw_spin_unlock_irq(lock);
 }
 EXPORT_SYMBOL(_raw_spin_unlock_irq);
@@ -207,6 +225,8 @@ EXPORT_SYMBOL(_raw_spin_unlock_irq);
 #ifndef CONFIG_INLINE_SPIN_UNLOCK_BH
 noinline void __lockfunc _raw_spin_unlock_bh(raw_spinlock_t *lock)
 {
+        if (!in_interrupt())
+                current->lock_depth--;
 	__raw_spin_unlock_bh(lock);
 }
 EXPORT_SYMBOL(_raw_spin_unlock_bh);

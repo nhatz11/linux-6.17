@@ -1421,6 +1421,8 @@ struct task_struct {
 # endif
 #endif
 
+	int				lock_depth;	/* kernel spinlocks held in process context */
+
 #ifdef CONFIG_SCHED_MM_CID
 	int				mm_cid;		/* Current cid in mm */
 	int				last_mm_cid;	/* Most recent cid in mm */

@@ -62,8 +62,6 @@
 int nr_ivh;
 static DEFINE_RAW_SPINLOCK(my_spinlock);
 
-#define PRMPT_HELD_MASK (1U << 2)
-
 /* average capacity across CPUs, defined in core.c */
 extern int average_capacity_all;
 
@@ -9912,12 +9910,17 @@ static void update_cpu_capacity(struct sched_domain *sd, int cpu)
 {
 	unsigned long capacity = scale_rt_capacity(cpu);
 	struct sched_group *sdg = sd->groups;
+	struct rq *rq = cpu_rq(cpu);
 
 	if (!capacity)
 		capacity = 1;
 
-	cpu_rq(cpu)->cpu_capacity = capacity;
-	trace_sched_cpu_capacity_tp(cpu_rq(cpu));
+	rq->cpu_capacity = capacity;
+	if (rq->cpu_capacity_custom > 0) {
+		rq->cpu_capacity = rq->cpu_capacity_custom;
+		capacity = rq->cpu_capacity_custom;
+	}
+	trace_sched_cpu_capacity_tp(rq);
 
 	sdg->sgc->capacity = capacity;
 	sdg->sgc->min_capacity = capacity;
@@ -12851,6 +12854,77 @@ static __latent_entropy void sched_balance_softirq(void)
 	sched_balance_domains(this_rq, idle);
 }
 
+int migrate_task_to_async_fair(void *data)
+{
+	struct rq *busiest_rq = data;
+	int busiest_cpu = cpu_of(busiest_rq);
+	int target_cpu = busiest_rq->preempt_migrate_target;
+	struct rq *target_rq = cpu_rq(target_cpu);
+	struct sched_domain *sd;
+	struct task_struct *p = NULL;
+	struct rq_flags rf;
+
+	rq_lock_irq(busiest_rq, &rf);
+	/*
+	 * Between queueing the stop-work and running it is a hole in which
+	 * CPUs can become inactive. We should not move tasks from or to
+	 * inactive CPUs.
+	 */
+	if (!cpu_active(busiest_cpu))
+		goto out_unlock;
+
+	/* Make sure the requested CPU hasn't gone down in the meantime: */
+	if (unlikely(busiest_cpu != smp_processor_id()))
+		goto out_unlock;
+
+	/* Is there any task to move? */
+	if (busiest_rq->nr_running <= 1)
+		goto out_unlock;
+
+	/*
+	 * This condition is "impossible", if it occurs
+	 * we need to fix it. Originally reported by
+	 * Bjorn Helgaas on a 128-CPU setup.
+	 */
+	WARN_ON_ONCE(busiest_rq == target_rq);
+
+	/* Search for an sd spanning us and the target CPU. */
+	rcu_read_lock();
+	for_each_domain(target_cpu, sd) {
+		if (cpumask_test_cpu(busiest_cpu, sched_domain_span(sd)))
+			break;
+	}
+
+	if (likely(sd)) {
+		struct lb_env env = {
+			.sd		= sd,
+			.dst_cpu	= target_cpu,
+			.dst_rq		= target_rq,
+			.src_cpu	= busiest_rq->cpu,
+			.src_rq		= busiest_rq,
+			.idle		= CPU_IDLE,
+			.flags		= LBF_ACTIVE_LB,
+		};
+
+		update_rq_clock(busiest_rq);
+		p = detach_one_task(&env);
+	}
+	rcu_read_unlock();
+out_unlock:
+	busiest_rq->preempt_migrate_locked = 0;
+	rq_unlock(busiest_rq, &rf);
+	if (p) {
+		attach_one_task(target_rq, p);
+		target_rq->avg_wakeup_latency =
+			sched_clock() - target_rq->wakeup_stamp;
+	} else {
+		target_rq->avg_wakeup_latency = (unsigned long)-1UL;
+	}
+	atomic_fetch_andnot(PRMPT_HELD_MASK, prmpt_flags(target_cpu));
+	local_irq_enable();
+	return 0;
+}
+
 //ivh start
 
 int running_migration(struct rq *rq)
@@ -12864,10 +12938,52 @@ int running_migration(struct rq *rq)
         int should_spin_lock;
 
 
-        should_run = bpf_sched_cfs_sched_tick_end(
-                        rq,
-                        now_time,
-                        cpumask_weight(nohz.idle_cpus_mask));
+        {
+                int curr_lock_depth = rq->curr->lock_depth;
+                int curr_kernel_lockholder = (curr_lock_depth > 0);
+                int curr_user_lockholder = 0;
+#ifdef CONFIG_RSEQ
+                if (rq->curr->rseq && rq->curr->rseq_len >= 32) {
+                        u32 cr;
+                        if (!copy_from_user_nofault(&cr, &rq->curr->rseq->cr_counter, sizeof(cr)))
+                                curr_user_lockholder = (cr & 0xFFFFFFFEu) != 0;
+                }
+#endif
+                int curr_lockholder = curr_kernel_lockholder || curr_user_lockholder;
+
+                /* classify and snapshot for debugfs */
+                {
+                        int movable = cpumask_weight(rq->curr->cpus_ptr) > 1;
+                        enum lhp_class cls;
+
+                        if (!curr_lockholder)
+                                cls = LHP_NOT_LOCKHOLDER;
+                        else if (curr_user_lockholder)
+                                cls = movable ? LHP_USER_MOVABLE : LHP_USER_NONMOVABLE;
+                        else
+                                cls = movable ? LHP_KERNEL_MOVABLE : LHP_KERNEL_NONMOVABLE;
+
+                        struct lhp_classify_snapshot *snap = this_cpu_ptr(&lhp_last_class);
+                        snap->pid        = rq->curr->pid;
+                        memcpy(snap->comm, rq->curr->comm, TASK_COMM_LEN);
+                        snap->cls        = cls;
+                        snap->lock_depth = curr_lock_depth;
+                        snap->movable    = movable;
+                }
+
+                should_run = bpf_sched_cfs_sched_tick_end(
+                                rq,
+                                now_time,
+#ifdef CONFIG_NO_HZ_COMMON
+                                cpumask_weight(nohz.idle_cpus_mask),
+#else
+                                0,
+#endif
+                                curr_lock_depth,
+                                curr_kernel_lockholder,
+                                curr_user_lockholder,
+                                curr_lockholder);
+        }
 
         pr_info_ratelimited("ivh: tick_end cpu=%d now=%llu should_run=%d locked=%d\n",
                             cpu, now_time, should_run,

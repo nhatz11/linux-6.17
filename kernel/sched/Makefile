@@ -35,6 +35,6 @@ endif
 #
 obj-y += core.o
 obj-y += fair.o
-obj-y += bpf_sched.o
+obj-$(CONFIG_BPF_SYSCALL) += bpf_sched.o
 obj-y += build_policy.o
 obj-y += build_utility.o

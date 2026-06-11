@@ -24,7 +24,7 @@ char LICENSE[] SEC("license") = "Dual BSD/GPL";
 static int idle_cpu(struct rq *rq)
 {
     if (rq->nr_running && rq->curr->policy == 5)
-        return 1; 
+        return 1;
     if (rq->curr != rq->idle)
         return 0;
     if (rq->nr_running)
@@ -36,7 +36,7 @@ static int idle_cpu(struct rq *rq)
 
 //Function to get how long the current task has been running without interruption
 //Interruptions include going idle, preemption, etc
-static u64 get_task_runtime(u64 now_time, struct rq *rq) 
+static u64 get_task_runtime(u64 now_time, struct rq *rq)
 {
 	u64 ref;
 
@@ -51,14 +51,14 @@ if (ref > now_time)
 return now_time - ref;
 }
 
-//Hook to determine whether to initiate IVH
+//Hook to determine whether to initiate IVH — only fires for lock holders
 SEC("sched/cfs_sched_tick_end")
 int BPF_PROG(test, struct rq *rq, u64 now, unsigned int idle_cpus,
              int curr_lock_depth, int curr_kernel_lockholder,
              int curr_user_lockholder, int curr_lockholder)
 {
     struct task_struct *curr = rq->curr;
-    
+
     //if we have already decided to trigger IVH - no point in going through this again
     if (rq->preempt_migrate_locked == 1) {
         return 0;
@@ -101,6 +101,17 @@ int BPF_PROG(test, struct rq *rq, u64 now, unsigned int idle_cpus,
         return 0;
     }
 
+    //only proceed if the current task is a lock holder
+    if (!curr_lockholder)
+        return 0;
+
+    u32 _cpu = rq->cpu;
+    u32 _ld = (u32)curr_lock_depth;
+    u32 _ul = (u32)curr_user_lockholder;
+    char fmt[] = "MY_ivh_atc: lockholder IVH fired cpu=%d lock_depth=%d user=%d\n";
+    bpf_trace_printk(fmt, sizeof(fmt), _cpu, _ld, _ul);
+
+
     return 1;
 }
 
@@ -109,22 +120,22 @@ int BPF_PROG(test, struct rq *rq, u64 now, unsigned int idle_cpus,
 static int is_cpu_preempted(struct rq *rq, u64 now_time)
 {
     u64 time_diff = now_time - rq->clock_preempt;
-    
+
     if (rq->clock_preempt > now_time) {
         return 0;
     }
-    
+
     if (time_diff < 300000) {
         return 0;
     }
-    
+
     return time_diff;
 }
 
 struct task_ctx {
     struct task_struct *curr;          /* task that is to be moved */
     int *target_cpu_ptr;               /* result - where should the task be moved? */
-    u64 now; 
+    u64 now;
     u64 *last_preempt_time_ptr;        /* pointer to track best preemption time */
     int start;                         /* starting CPU */
     int has_seen_sched_idle;           /* sched_idle task flag */
@@ -135,7 +146,7 @@ struct task_ctx {
     int total_cpus;                    /* total number of CPUs in system */
 };
 
-static int process_cpu(u32 iter, void *data) 
+static int process_cpu(u32 iter, void *data)
 {
     struct task_ctx *ctx = data;
 
@@ -147,7 +158,7 @@ static int process_cpu(u32 iter, void *data)
     //cpumask of curr cpu
     const cpumask_t *cpumask = curr->cpus_ptr;
     unsigned long cpumask_bits = *(cpumask->bits);
-    
+
     //is valid cpu for task?
     if (!(cpumask_bits & (1UL << cpu))) {
         return 0;
@@ -155,7 +166,7 @@ static int process_cpu(u32 iter, void *data)
 
     int *target_cpu_ptr = ctx->target_cpu_ptr;
     u64 *last_preempt_time_ptr = ctx->last_preempt_time_ptr;
-    
+
     //RQ for current cpu
     struct rq *select_rq = bpf_per_cpu_ptr(&runqueues, cpu);
 
@@ -181,7 +192,7 @@ static int process_cpu(u32 iter, void *data)
         *(ctx->found_sched_idle_ptr) = 1;
 
         u64 time_since_heartbeat = is_cpu_preempted(select_rq, ctx->now);
-        
+
         //if cpu is preempted - we don't want it
         if (!time_since_heartbeat) {
             return 0;
@@ -202,7 +213,7 @@ static int process_cpu(u32 iter, void *data)
     } else if (*(ctx->found_sched_idle_ptr) && *target_cpu_ptr != -1) {
         return 0;
     }
-    
+
     //select a core with "good enough" capacity
     if (select_rq->cpu_capacity > ctx->average_capacity || select_rq->cpu_capacity > 500) {
         *target_cpu_ptr = (int)(cpu);
@@ -266,27 +277,27 @@ struct latency_ctx {
     int average_capacity;              /* average CPU capacity in system */
 };
 
-static int search_latency(u32 iter, void *data) 
+static int search_latency(u32 iter, void *data)
 {
     struct latency_ctx *ctx = data;
     struct task_struct *curr = ctx->curr;
     int cpu = (iter + ctx->start) % ctx->total_cpus;
-    
+
     //leave if we've checked each cpu
     if (iter >= ctx->total_cpus) {
         return 1;
     }
-    
+
     const cpumask_t *cpumask_const = curr->cpus_ptr;
     unsigned long cpumask_bits = *(cpumask_const->bits);
-    
+
     //check if task is allowed to run on said cpu
     if (!(cpumask_bits & (1UL << cpu))) {
         return 0;
     }
-    
+
     struct rq *select_rq = bpf_per_cpu_ptr(&runqueues, cpu);
-    if (!select_rq) { 
+    if (!select_rq) {
         return 0;
     }
 
@@ -306,27 +317,27 @@ static int search_latency(u32 iter, void *data)
             *target_cpu_ptr = cpu;
             return 1;
         }
-        
+
         //if it has been running recently - good enough
         if (get_task_runtime(ctx->now, select_rq) < 2000000) {
             *target_cpu_ptr = cpu;
             return 1;
         }
-        
+
         return 0;
     }
-    
+
     if (idle_cpu(select_rq)) {
         //normal loop, if a cpu is less than the median - ignore it. Otherwise pick lowest latency
-        if (select_rq->cpu_capacity > (ctx->average_capacity) && 
+        if (select_rq->cpu_capacity > (ctx->average_capacity) &&
             select_rq->avg_latency <= *(ctx->min_latency_ptr)) {
-            
+
             *(ctx->min_latency_ptr) = select_rq->avg_latency;
             *target_cpu_ptr = cpu;
             return 0;
         }
     }
-    
+
     return 0;
 }
 
@@ -339,22 +350,22 @@ int BPF_PROG(test32, int prev, struct task_struct *curr, struct cpumask *idle_cp
     int target_cpu = -1;
     u64 preemption_time = 0;
     int util_percent = (curr->se.avg.util_avg * 100) / (1L << 10);
-    
+
     if (util_percent > 10 || curr->policy == 5) {
         return -1;
     }
-    
+
     u64 min_latency = 0xFFFFFFFFFFFFFFFFULL; // Using max u64 value
     u64 max_bad_latency = 0xFFFFFFFFFFFFFFFFULL; // Using max u64 value
     int found_good_cpu = 0;
     u64 longest_runtime = 0xFFFFFFFFFFFFFFFFULL; // Using max u64 value
     u64 now = 0;
-    
+
     struct rq *current_rq = bpf_this_cpu_ptr(&runqueues);
     if (current_rq) {
         now = current_rq->clock_preempt;
     }
-    
+
     struct latency_ctx latency_context = {
         .curr = curr,
         .target_cpu_ptr = &target_cpu,
@@ -369,7 +380,7 @@ int BPF_PROG(test32, int prev, struct task_struct *curr, struct cpumask *idle_cp
         .total_cpus = total_cpus,
         .average_capacity = average_capacity
     };
-    
+
     bpf_loop(256, &search_latency, &latency_context, 0);
     return target_cpu;
 }
