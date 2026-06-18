@@ -14,6 +14,7 @@
 #include <linux/rseq.h>
 #include <linux/types.h>
 #include <linux/ratelimit.h>
+#include <linux/sysctl.h>
 #include <asm/ptrace.h>
 
 #define CREATE_TRACE_POINTS
@@ -449,6 +450,8 @@ error:
 }
 
 #ifdef CONFIG_SCHED_HRTICK
+__read_mostly unsigned int rseq_sched_extend_usec = 50;
+
 void rseq_delay_resched_fini(unsigned long ti_work)
 {
 	struct task_struct *t = current;
@@ -464,8 +467,22 @@ void rseq_delay_resched_fini(unsigned long ti_work)
 	if (t->rseq_sched_delay)
 		return;
 
+	/*
+	 * Extension disabled: let the lazy resched fire immediately on the
+	 * next opportunity instead of giving userspace a grace period.
+	 */
+	if (!rseq_sched_extend_usec)
+		return;
+
+	/*
+	 * Give userspace rseq_sched_extend_usec microseconds to notice the
+	 * KERNEL_REQUEST_SCHED bit we set in rseq_delay_resched() and call
+	 * sched_yield() cooperatively.  If the timer fires before that
+	 * happens, rseq_delay_resched_tick() forces the resched.
+	 * Tunable at runtime via /proc/sys/kernel/rseq_sched_extend_usec.
+	 */
 	t->rseq_sched_delay = 1;
-	hrtick_local_start(50 * NSEC_PER_USEC);
+	hrtick_local_start((u64)rseq_sched_extend_usec * NSEC_PER_USEC);
 }
 
 bool rseq_delay_resched(void)
@@ -476,12 +493,26 @@ bool rseq_delay_resched(void)
 	if (!t->rseq)
 		goto nodelay;
 
+	/*
+	 * Extension is disabled at runtime; fall through to normal scheduling.
+	 * cr_counter bits 2-31 (lock nesting depth) are unaffected — the BPF
+	 * lock-holder check in running_migration() still works correctly.
+	 */
+	if (!rseq_sched_extend_usec)
+		goto nodelay;
+
+	/* Task registered with the old 32-byte rseq ABI, which has no cr_counter. */
 	if (current->rseq_len <= offsetof(struct rseq, cr_counter))
 		goto nodelay;
 
 	if (copy_from_user_nofault(&flags, &t->rseq->cr_counter, sizeof(flags)))
 		goto nodelay;
 
+	/*
+	 * Only delay if userspace is inside a critical section (bit 0 set).
+	 * Bare bit 0 is the entry marker; bits 2-31 are the lock nesting depth
+	 * incremented by extend()/inc_extend() in userspace.
+	 */
 	if (!(flags & RSEQ_CR_FLAG_IN_CRITICAL_SECTION_MASK))
 		goto nodelay;
 
@@ -523,6 +554,40 @@ void rseq_delay_resched_tick(void)
 	}
 }
 #endif /* CONFIG_SCHED_HRTICK */
+
+#if defined(CONFIG_SYSCTL) && defined(CONFIG_SCHED_HRTICK)
+/*
+ * Expose rseq_sched_extend_usec under /proc/sys/kernel/rseq_sched_extend_usec.
+ *
+ * Write a non-zero value to change the grace period the kernel gives a task
+ * inside an rseq critical section before it forces preemption.  Write 0 to
+ * disable the extension entirely — useful when you only care about cr_counter
+ * for lock-holder identification (BPF IVH) and don't want the cooperative
+ * yield logic running at all.
+ *
+ * Example usage:
+ *   echo 100 | sudo tee /proc/sys/kernel/rseq_sched_extend_usec   # 100 µs
+ *   echo 0   | sudo tee /proc/sys/kernel/rseq_sched_extend_usec   # disabled
+ */
+static const struct ctl_table rseq_sysctls[] = {
+	{
+		.procname	= "rseq_sched_extend_usec",
+		.data		= &rseq_sched_extend_usec,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		/* minimum 0 (disabled); no upper bound enforced by kernel */
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+	},
+};
+
+static int __init rseq_sysctl_init(void)
+{
+	register_sysctl_init("kernel", rseq_sysctls);
+	return 0;
+}
+late_initcall(rseq_sysctl_init);
+#endif /* CONFIG_SYSCTL && CONFIG_SCHED_HRTICK */
 
 #ifdef CONFIG_DEBUG_RSEQ
 

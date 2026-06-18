@@ -22,6 +22,7 @@ struct cs_event {
 struct cs_entry {
 	u64 entry_ts;
 	u32 cpu;
+	u32 depth;
 };
 
 struct {
@@ -101,9 +102,17 @@ int BPF_PROG(track_kern_cs_entry)
 {
 	u64 pidtgid = bpf_get_current_pid_tgid();
 	u32 pid = (u32)pidtgid;
+
+	/* Nested lock: bump depth so the unlock side knows not to emit yet. */
+	struct cs_entry *existing = bpf_map_lookup_elem(&kern_cs_map, &pid);
+	if (existing) {
+		existing->depth++;
+		return 0;
+	}
+	/* Outermost lock: record the entry timestamp for this TID. */
 	u64 ts = bpf_ktime_get_ns();
-	struct cs_entry ent = { .entry_ts = ts, .cpu = 0 };
-	bpf_map_update_elem(&kern_cs_map, &pid, &ent, BPF_ANY);
+	struct cs_entry ent = { .entry_ts = ts, .cpu = bpf_get_smp_processor_id(), .depth = 1 };
+	bpf_map_update_elem(&kern_cs_map, &pid, &ent, BPF_NOEXIST);
 	return 0;
 }
 
@@ -118,11 +127,19 @@ int BPF_PROG(track_kern_cs_exit)
 	if (!ent)
 		return 0;
 
+	/* Nested unlock: decrement depth and wait for the outermost unlock. */
+	if (ent->depth > 1) {
+		ent->depth--;
+		return 0;
+	}
+
+	/* Outermost unlock: measure from the first lock acquisition to now. */
 	u64 duration = bpf_ktime_get_ns() - ent->entry_ts;
+	u32 cpu = ent->cpu;
 	bpf_map_delete_elem(&kern_cs_map, &pid);
 
 	char comm[16];
 	bpf_get_current_comm(comm, sizeof(comm));
-	emit_event(pid, tgid, comm, 0, duration, 1);
+	emit_event(pid, tgid, comm, cpu, duration, 1);
 	return 0;
 }

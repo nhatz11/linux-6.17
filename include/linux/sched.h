@@ -1422,6 +1422,32 @@ struct task_struct {
 #endif
 
 	int				lock_depth;	/* kernel spinlocks held in process context */
+	/* Incremented on entry to a contended qspinlock or OSQ slowpath,
+	 * decremented when spinning ends (lock acquired or bail to sleep).
+	 * > 0: task is currently spinning/waiting; == 0: not spinning. */
+	int				wait_depth;
+
+	/*
+	 * Kernel spinlock critical-section timing (outermost CS only).
+	 * cs_start_ts: ktime_get_ns() snapshot taken when lock_depth transitions
+	 *   0→1 (outermost acquire).  Reset to 0 on outermost release.
+	 * cumulative_cs_time: total nanoseconds spent inside kernel spinlock CSes,
+	 *   accumulated on each outermost unlock (lock_depth 1→0).
+	 * Invariant: cs_start_ts == 0 iff lock_depth == 0.
+	 * Updated only in process context (!in_interrupt()) by spinlock.c.
+	 */
+	u64				cs_start_ts;
+	u64				cumulative_cs_time;
+
+	/*
+	 * On-CPU (active) time accounting.
+	 * sched_in_stamp: ktime_get_ns() recorded in finish_task_switch() when
+	 *   this task is scheduled in.  0 when the task is off-CPU.
+	 * cumulative_active_time: total nanoseconds on CPU, accumulated in
+	 *   prepare_task_switch() on each schedule-out.
+	 */
+	u64				sched_in_stamp;
+	u64				cumulative_active_time;
 
 #ifdef CONFIG_SCHED_MM_CID
 	int				mm_cid;		/* Current cid in mm */

@@ -169,7 +169,82 @@ struct rseq {
 	__u32 cr_counter;
 
 	/*
+	 * wait_counter: user space increments (by 4, same encoding as
+	 * cr_counter bits [31:2]) to indicate it is in a spin/wait region
+	 * waiting to acquire a lock. Bits [1:0] are reserved.
+	 * Non-zero bits [31:2] mean the thread is currently spinning/waiting.
+	 * Distinct from cr_counter: cr_counter tracks holding; wait_counter
+	 * tracks waiting.
+	 */
+	__u32 wait_counter;
+
+	/*
+	 * _cs_pad: explicit alignment padding so the u64 CS timing fields
+	 * below begin on an 8-byte boundary (wait_counter ends at offset 36;
+	 * next 8-byte boundary is offset 40).  Reserved for future use.
+	 */
+	__u32 _cs_pad;
+
+	/*
+	 * last_cs_overall_ns: written by user space at the moment a spinlock
+	 * or rseq-tracked critical section is released.  Contains the wall-
+	 * clock duration of the most recently completed CS in nanoseconds:
+	 *
+	 *   last_cs_overall_ns = unlock_ts(CLOCK_MONOTONIC)
+	 *                      - lock_ts(CLOCK_MONOTONIC)
+	 *
+	 * "CS" means from successful lock acquisition to the moment of unlock.
+	 * Written by the locking library (LD_PRELOAD or glibc pthread), not
+	 * by the kernel.  Zero until the first CS completes.
+	 */
+	__u64 last_cs_overall_ns;
+
+	/*
+	 * last_cs_active_ns: written by user space at unlock alongside
+	 * last_cs_overall_ns.  Contains the on-CPU (active) duration of the
+	 * most recently completed CS in nanoseconds:
+	 *
+	 *   last_cs_active_ns = unlock_ts(CLOCK_THREAD_CPUTIME_ID)
+	 *                     - lock_ts(CLOCK_THREAD_CPUTIME_ID)
+	 *
+	 * CLOCK_THREAD_CPUTIME_ID does not advance while the thread is off-CPU,
+	 * so last_cs_overall_ns - last_cs_active_ns gives the off-CPU time
+	 * accumulated while the lock was held.
+	 * Written by the locking library, not by the kernel.
+	 */
+	__u64 last_cs_active_ns;
+
+	/*
+	 * last_wait_overall_ns: written by user space at unlock alongside the
+	 * CS timing fields.  Contains the wall-clock duration from the moment
+	 * the locking library first attempted to acquire the lock (before any
+	 * spinning) to the moment the lock was successfully acquired:
+	 *
+	 *   last_wait_overall_ns = lock_acquired_ts(CLOCK_MONOTONIC)
+	 *                        - lock_attempt_ts(CLOCK_MONOTONIC)
+	 *
+	 * When the lock is acquired without contention this value is the
+	 * latency of the first CAS; under contention it includes all spinning
+	 * time.  Together with last_cs_overall_ns it gives the full lock-cycle
+	 * wall time: last_wait_overall_ns + last_cs_overall_ns.
+	 *
+	 * Note: last_wait_active_ns is intentionally omitted from the ABI.
+	 * Spinning is CPU-bound so wait_active ≈ wait_overall in the common
+	 * case, and adding a second wait u64 would push sizeof to 96 bytes,
+	 * which increases the chance of spanning two cache lines under the
+	 * current 32-byte alignment.  The locking library may track it
+	 * internally.
+	 *
+	 * This field fills the 8 bytes of alignment padding that existed
+	 * between last_cs_active_ns and the struct boundary, so sizeof remains
+	 * 64 bytes.
+	 */
+	__u64 last_wait_overall_ns;
+
+	/*
 	 * Flexible array member at end of structure, after last feature field.
+	 * offsetof(struct rseq, end) = 64.
+	 * AT_RSEQ_FEATURE_SIZE will report 64 after a kernel rebuild.
 	 */
 	char end[];
 } __attribute__((aligned(4 * sizeof(__u64))));

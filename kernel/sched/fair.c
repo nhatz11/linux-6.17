@@ -12942,14 +12942,22 @@ int running_migration(struct rq *rq)
                 int curr_lock_depth = rq->curr->lock_depth;
                 int curr_kernel_lockholder = (curr_lock_depth > 0);
                 int curr_user_lockholder = 0;
+                int curr_user_waiter = 0;
 #ifdef CONFIG_RSEQ
                 if (rq->curr->rseq && rq->curr->rseq_len >= 32) {
                         u32 cr;
                         if (!copy_from_user_nofault(&cr, &rq->curr->rseq->cr_counter, sizeof(cr)))
                                 curr_user_lockholder = (cr & 0xFFFFFFFEu) != 0;
                 }
+                /* wait_counter at offset 32; guard rseq_len >= 36 mirrors cr_counter pattern */
+                if (rq->curr->rseq && rq->curr->rseq_len >= 36) {
+                        u32 wc;
+                        if (!copy_from_user_nofault(&wc, &rq->curr->rseq->wait_counter, sizeof(wc)))
+                                curr_user_waiter = (wc & ~3u) != 0; /* bits [31:2] = nesting depth */
+                }
 #endif
                 int curr_lockholder = curr_kernel_lockholder || curr_user_lockholder;
+                int curr_waiter = (rq->curr->wait_depth > 0) || curr_user_waiter;
 
                 /* classify and snapshot for debugfs */
                 {
@@ -12967,8 +12975,11 @@ int running_migration(struct rq *rq)
                         snap->pid        = rq->curr->pid;
                         memcpy(snap->comm, rq->curr->comm, TASK_COMM_LEN);
                         snap->cls        = cls;
-                        snap->lock_depth = curr_lock_depth;
-                        snap->movable    = movable;
+                        snap->lock_depth   = curr_lock_depth;
+                        snap->movable      = movable;
+                        snap->user_waiter  = curr_user_waiter;
+                        snap->cumulative_cs_time     = rq->curr->cumulative_cs_time;
+                        snap->cumulative_active_time = rq->curr->cumulative_active_time;
                 }
 
                 should_run = bpf_sched_cfs_sched_tick_end(
@@ -12982,7 +12993,8 @@ int running_migration(struct rq *rq)
                                 curr_lock_depth,
                                 curr_kernel_lockholder,
                                 curr_user_lockholder,
-                                curr_lockholder);
+                                curr_lockholder,
+                                curr_waiter);
         }
 
         pr_info_ratelimited("ivh: tick_end cpu=%d now=%llu should_run=%d locked=%d\n",

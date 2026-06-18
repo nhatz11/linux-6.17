@@ -11,6 +11,7 @@
 static char verifier_log[LOG_BUF_SIZE];
 
 static volatile int done;
+static int use_corrected;  /* -c: print cs_corrected_ns instead of cs_duration_ns */
 
 struct wt_event {
 	int cpu;
@@ -18,6 +19,7 @@ struct wt_event {
 	int tgid;
 	char comm[16];
 	unsigned long long cs_duration_ns;
+	unsigned long long cs_corrected_ns;
 	unsigned long long wait_time_ns;
 };
 
@@ -41,13 +43,17 @@ static void bump_memlock_rlimit(void)
 static int handle_event(void *ctx, void *data, size_t size)
 {
 	struct wt_event *e = data;
+	unsigned long long cs = use_corrected ? e->cs_corrected_ns : e->cs_duration_ns;
 	printf("pid %d (%s) cpu %d cs=%llu ns wait=%llu ns\n",
-	       e->pid, e->comm, e->cpu, e->cs_duration_ns, e->wait_time_ns);
+	       e->pid, e->comm, e->cpu, cs, e->wait_time_ns);
 	return 0;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+	if (argc == 2 && __builtin_strcmp(argv[1], "-c") == 0)
+		use_corrected = 1;
+
 	struct lhp_waittime *skel;
 	struct ring_buffer *rb = NULL;
 	struct bpf_program *p;

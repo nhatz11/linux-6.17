@@ -262,8 +262,12 @@ static int lhp_class_show(struct seq_file *m, void *v)
 		const char *name = (snap.cls < ARRAY_SIZE(lhp_class_names))
 			? lhp_class_names[snap.cls] : "unknown";
 
-		seq_printf(m, "cpu=%-3d pid=%-6d comm=%-16s class=%-20s lock_depth=%-3d movable=%d\n",
-			   cpu, snap.pid, snap.comm, name, snap.lock_depth, snap.movable);
+		seq_printf(m, "cpu=%-3d pid=%-6d comm=%-16s class=%-20s lock_depth=%-3d movable=%d user_waiter=%d cs_us=%-12llu active_us=%-12llu cs_pct=%llu\n",
+			   cpu, snap.pid, snap.comm, name, snap.lock_depth, snap.movable, snap.user_waiter,
+			   snap.cumulative_cs_time / 1000,
+			   snap.cumulative_active_time / 1000,
+			   snap.cumulative_active_time ?
+				snap.cumulative_cs_time * 100 / snap.cumulative_active_time : 0);
 	}
 	return 0;
 }
@@ -4630,6 +4634,11 @@ static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
 {
 	p->on_rq			= 0;
 	p->lock_depth			= 0;
+	p->wait_depth			= 0;
+	p->cs_start_ts			= 0;
+	p->cumulative_cs_time		= 0;
+	p->sched_in_stamp		= 0;
+	p->cumulative_active_time	= 0;
 
 	p->se.on_rq			= 0;
 	p->se.exec_start		= 0;
@@ -5325,7 +5334,27 @@ prepare_task_switch(struct rq *rq, struct task_struct *prev,
 	 * finish_lock_switch().  Undo prev's lock_depth increment here so
 	 * that when prev resumes it does not carry a phantom +1.
 	 */
+
+	/*
+	 * Pause the outermost-CS clock before going off-CPU.  cs_start_ts
+	 * must NOT tick while the task is preempted: off-CPU time is not
+	 * CS time.  We accumulate the on-CPU portion now and clear the stamp;
+	 * finish_task_switch will reopen it if the task still holds locks.
+	 * This must happen before lock_depth-- so the check below sees the
+	 * full (rq-lock-inclusive) depth.
+	 */
+	if (prev->cs_start_ts) {
+		prev->cumulative_cs_time += sched_clock() - prev->cs_start_ts;
+		prev->cs_start_ts = 0;
+	}
+
 	prev->lock_depth--;
+
+	/* Accumulate on-CPU time for the task being switched out. */
+	if (prev->sched_in_stamp) {
+		prev->cumulative_active_time += sched_clock() - prev->sched_in_stamp;
+		prev->sched_in_stamp = 0;
+	}
 }
 
 /**
@@ -5389,6 +5418,15 @@ static struct rq *finish_task_switch(struct task_struct *prev)
 	finish_task(prev);
 	tick_nohz_task_switch();
 	finish_lock_switch(rq);
+	/*
+	 * rq->lock is now released.  lock_depth here reflects only real user
+	 * spinlocks (the rq-lock +1/-1 in finish_lock_switch/raw_spin_rq_unlock
+	 * cancels out).  If the task was preempted mid-CS, reopen the CS clock
+	 * so cumulative_cs_time resumes counting from schedule-in.
+	 */
+	if (current->lock_depth > 0)
+		current->cs_start_ts = sched_clock();
+	current->sched_in_stamp = sched_clock();
 	finish_arch_post_lock_switch();
 	kcov_finish_switch(current);
 	/*

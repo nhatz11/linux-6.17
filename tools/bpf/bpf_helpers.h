@@ -79,6 +79,7 @@ static void (*bpf_ringbuf_discard)(void *data, __u64 flags) = (void *)133;
 #define ___bpf_ctx_cast5(x, a...)    ___bpf_ctx_cast4(a), ctx[4]
 #define ___bpf_ctx_cast6(x, a...)    ___bpf_ctx_cast5(a), ctx[5]
 #define ___bpf_ctx_cast7(x, a...)    ___bpf_ctx_cast6(a), ctx[6]
+#define ___bpf_ctx_cast8(x, a...)    ___bpf_ctx_cast7(a), ctx[7]
 #define ___bpf_ctx_cast(a...)        ___bpf_apply(___bpf_ctx_cast, ___bpf_narg(a))(a)
 
 #define BPF_PROG(name, args...)						\
@@ -95,6 +96,7 @@ typeof(name(0)) name(unsigned long long *ctx)				\
 static __always_inline typeof(name(0))					\
 ____##name(unsigned long long *ctx, ##args)
 static long (*bpf_probe_read_user)(void *dst, __u32 size, const void *unsafe_ptr) = (void *)112;
+static __u32 (*bpf_get_smp_processor_id)(void) = (void *)8;
 static __u64 (*bpf_get_current_pid_tgid)(void) = (void *)14;
 static long (*bpf_get_current_comm)(void *buf, __u32 buf_size) = (void *)16;
 #ifndef NULL

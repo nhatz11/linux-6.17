@@ -22,6 +22,32 @@
 #include <linux/debug_locks.h>
 #include <linux/export.h>
 #include <linux/sched.h>
+#include <linux/sched/clock.h>
+
+/*
+ * cs_enter / cs_exit — helpers called around lock_depth transitions.
+ * cs_enter: called after lock_depth reaches 1 (outermost acquire); records
+ *   the start timestamp so cumulative_cs_time can be updated on release.
+ * cs_exit: called after lock_depth reaches 0 (outermost release); accumulates
+ *   elapsed time into cumulative_cs_time and clears cs_start_ts.
+ * Both are no-ops for nested locks (lock_depth > 1 after enter, > 0 after exit).
+ *
+ * sched_clock() is used instead of ktime_get_ns() because spinlocks fire
+ * before timekeeping is initialized; sched_clock() is safe in any context.
+ */
+static __always_inline void cs_enter(void)
+{
+	if (current->lock_depth == 1)
+		current->cs_start_ts = sched_clock();
+}
+
+static __always_inline void cs_exit(void)
+{
+	if (current->lock_depth == 0 && current->cs_start_ts) {
+		current->cumulative_cs_time += sched_clock() - current->cs_start_ts;
+		current->cs_start_ts = 0;
+	}
+}
 
 #ifdef CONFIG_MMIOWB
 #ifndef arch_mmiowb_state
@@ -136,7 +162,12 @@ BUILD_LOCK_OPS(write, rwlock);
 #ifndef CONFIG_INLINE_SPIN_TRYLOCK
 noinline int __lockfunc _raw_spin_trylock(raw_spinlock_t *lock)
 {
-	return __raw_spin_trylock(lock);
+	int ret = __raw_spin_trylock(lock);
+	if (ret && !in_interrupt()) {
+		current->lock_depth++;
+		cs_enter();
+	}
+	return ret;
 }
 EXPORT_SYMBOL(_raw_spin_trylock);
 #endif
@@ -144,7 +175,13 @@ EXPORT_SYMBOL(_raw_spin_trylock);
 #ifndef CONFIG_INLINE_SPIN_TRYLOCK_BH
 noinline int __lockfunc _raw_spin_trylock_bh(raw_spinlock_t *lock)
 {
-	return __raw_spin_trylock_bh(lock);
+	bool track = !in_interrupt();
+	int ret = __raw_spin_trylock_bh(lock);
+	if (ret && track) {
+		current->lock_depth++;
+		cs_enter();
+	}
+	return ret;
 }
 EXPORT_SYMBOL(_raw_spin_trylock_bh);
 #endif
@@ -153,8 +190,10 @@ EXPORT_SYMBOL(_raw_spin_trylock_bh);
 noinline void __lockfunc _raw_spin_lock(raw_spinlock_t *lock)
 {
 	__raw_spin_lock(lock);
-	if (!in_interrupt())
+	if (!in_interrupt()) {
 		current->lock_depth++;
+		cs_enter();
+	}
 }
 EXPORT_SYMBOL(_raw_spin_lock);
 #endif
@@ -162,12 +201,14 @@ EXPORT_SYMBOL(_raw_spin_lock);
 #ifndef CONFIG_INLINE_SPIN_LOCK_IRQSAVE
 noinline unsigned long __lockfunc _raw_spin_lock_irqsave(raw_spinlock_t *lock)
 {
-        unsigned long flags;
+	unsigned long flags;
 
-        flags = __raw_spin_lock_irqsave(lock);
-        if (!in_interrupt())
-                current->lock_depth++;
-        return flags;
+	flags = __raw_spin_lock_irqsave(lock);
+	if (!in_interrupt()) {
+		current->lock_depth++;
+		cs_enter();
+	}
+	return flags;
 }
 EXPORT_SYMBOL(_raw_spin_lock_irqsave);
 #endif
@@ -176,8 +217,10 @@ EXPORT_SYMBOL(_raw_spin_lock_irqsave);
 noinline void __lockfunc _raw_spin_lock_irq(raw_spinlock_t *lock)
 {
 	__raw_spin_lock_irq(lock);
-	if (!in_interrupt())
-                current->lock_depth++;
+	if (!in_interrupt()) {
+		current->lock_depth++;
+		cs_enter();
+	}
 }
 EXPORT_SYMBOL(_raw_spin_lock_irq);
 #endif
@@ -185,9 +228,12 @@ EXPORT_SYMBOL(_raw_spin_lock_irq);
 #ifndef CONFIG_INLINE_SPIN_LOCK_BH
 noinline void __lockfunc _raw_spin_lock_bh(raw_spinlock_t *lock)
 {
+	bool track = !in_interrupt();
 	__raw_spin_lock_bh(lock);
-        if (!in_interrupt())
-                current->lock_depth++;
+	if (track) {
+		current->lock_depth++;
+		cs_enter();
+	}
 }
 EXPORT_SYMBOL(_raw_spin_lock_bh);
 #endif
@@ -195,8 +241,10 @@ EXPORT_SYMBOL(_raw_spin_lock_bh);
 #ifdef CONFIG_UNINLINE_SPIN_UNLOCK
 noinline void __lockfunc _raw_spin_unlock(raw_spinlock_t *lock)
 {
-	if (!in_interrupt())
+	if (!in_interrupt()) {
 		current->lock_depth--;
+		cs_exit();
+	}
 	__raw_spin_unlock(lock);
 }
 EXPORT_SYMBOL(_raw_spin_unlock);
@@ -205,8 +253,10 @@ EXPORT_SYMBOL(_raw_spin_unlock);
 #ifndef CONFIG_INLINE_SPIN_UNLOCK_IRQRESTORE
 noinline void __lockfunc _raw_spin_unlock_irqrestore(raw_spinlock_t *lock, unsigned long flags)
 {
-        if (!in_interrupt())
-                current->lock_depth--;
+	if (!in_interrupt()) {
+		current->lock_depth--;
+		cs_exit();
+	}
 	__raw_spin_unlock_irqrestore(lock, flags);
 }
 EXPORT_SYMBOL(_raw_spin_unlock_irqrestore);
@@ -215,8 +265,10 @@ EXPORT_SYMBOL(_raw_spin_unlock_irqrestore);
 #ifndef CONFIG_INLINE_SPIN_UNLOCK_IRQ
 noinline void __lockfunc _raw_spin_unlock_irq(raw_spinlock_t *lock)
 {
-        if (!in_interrupt())
-                current->lock_depth--;
+	if (!in_interrupt()) {
+		current->lock_depth--;
+		cs_exit();
+	}
 	__raw_spin_unlock_irq(lock);
 }
 EXPORT_SYMBOL(_raw_spin_unlock_irq);
@@ -225,9 +277,12 @@ EXPORT_SYMBOL(_raw_spin_unlock_irq);
 #ifndef CONFIG_INLINE_SPIN_UNLOCK_BH
 noinline void __lockfunc _raw_spin_unlock_bh(raw_spinlock_t *lock)
 {
-        if (!in_interrupt())
-                current->lock_depth--;
 	__raw_spin_unlock_bh(lock);
+	/* decrement after unlock; cs_exit measures slightly past actual release */
+	if (!in_interrupt()) {
+		current->lock_depth--;
+		cs_exit();
+	}
 }
 EXPORT_SYMBOL(_raw_spin_unlock_bh);
 #endif

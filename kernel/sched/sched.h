@@ -136,6 +136,9 @@ struct lhp_classify_snapshot {
 	enum lhp_class cls;
 	int            lock_depth;
 	int            movable;
+	int            user_waiter;       /* non-zero if rseq wait_counter bits [31:2] set */
+	u64            cumulative_cs_time;     /* ns in kernel spinlock CS (outermost only) */
+	u64            cumulative_active_time; /* ns on-CPU since task was created */
 };
 
 DECLARE_PER_CPU(struct lhp_classify_snapshot, lhp_last_class);

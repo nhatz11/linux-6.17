@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 // NOTE: set this suit your system
-#include "../../vmlinux.h"
+#include "vmlinux.h"
 #include "bpf_helpers.h"
 unsigned long tgidpid = 0;
 unsigned long cgid = 0;
@@ -18,6 +18,63 @@ unsigned long max_exec_slice = 0;
 
 extern const struct rq runqueues __ksym; /* struct type global var. */
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
+
+/* Shadow-mode candidate counters — PERCPU_ARRAY, each CPU accumulates
+ * independently.  Sum per-CPU values in userspace to get totals.
+ *
+ * Index layout:
+ *   0  USER_MOVABLE ticks (lockholder seen at tick, user CS, movable)
+ *   1  USER_NONMOVABLE ticks
+ *   2  KERNEL_MOVABLE ticks
+ *   3  KERNEL_NONMOVABLE ticks
+ *   4  CANDIDATE_TOTAL  (one-shot per task per CPU)
+ *   5  CANDIDATE_USER_MOVABLE
+ *   6  CANDIDATE_USER_NONMOVABLE
+ *   7  CANDIDATE_KERNEL_MOVABLE
+ *   8  CANDIDATE_KERNEL_NONMOVABLE
+ */
+#define CTR_USER_MOVABLE        0
+#define CTR_USER_NONMOVABLE     1
+#define CTR_KERNEL_MOVABLE      2
+#define CTR_KERNEL_NONMOVABLE   3
+#define CTR_CANDIDATE_TOTAL     4
+#define CTR_CAND_USER_MOV       5
+#define CTR_CAND_USER_NMON      6
+#define CTR_CAND_KERN_MOV       7
+#define CTR_CAND_KERN_NMON      8
+#define CTR_MAX                 9
+
+
+struct sched_in_entry {
+    u32 pid;
+    u64 stamp;
+};
+
+/* Per-CPU: tracks which task is current and when it was first seen. */
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, struct sched_in_entry);
+} sched_in_map SEC(".maps");
+
+/* Per-CPU: per-class tick counts and one-shot candidate counts. */
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, CTR_MAX);
+    __type(key, u32);
+    __type(value, u64);
+} lhp_counters SEC(".maps");
+
+/* Per-CPU: pid of the last task recorded as a new candidate.
+ * Used for one-shot deduplication: only count a task as a candidate
+ * once per scheduling epoch on this CPU. */
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, u32);
+} last_candidate_pid SEC(".maps");
 
 //Function used to determine if CPU is idle
 //If the only processes running on a CPU are sched-IDLE, core is considered idle
@@ -55,54 +112,112 @@ return now_time - ref;
 SEC("sched/cfs_sched_tick_end")
 int BPF_PROG(test, struct rq *rq, u64 now, unsigned int idle_cpus,
              int curr_lock_depth, int curr_kernel_lockholder,
-             int curr_user_lockholder, int curr_lockholder)
+             int curr_user_lockholder, int curr_lockholder, int curr_waiter)
 {
     struct task_struct *curr = rq->curr;
 
-    //if we have already decided to trigger IVH - no point in going through this again
-    if (rq->preempt_migrate_locked == 1) {
+    // Gate 1: already decided to migrate this CPU — no double-trigger
+    if (rq->preempt_migrate_locked == 1)
         return 0;
+
+    // Gate 2: more than one non-sched-idle runnable task — contention local, not IVH case
+    if ((rq->cfs.h_nr_runnable - rq->cfs.h_nr_idle) > 1)
+        return 0;
+
+    // Gate 3: idle task
+    if (curr == rq->idle)
+        return 0;
+
+    /* Log spinner at tick time. curr_waiter=1 if wait_depth>0 (kernel qspinlock/OSQ)
+     * or rseq wait_counter bits[31:2] set (userspace spin). Not a gate — just observability. */
+    if (curr_waiter) {
+        u32 _pid = curr->pid;
+        char wfmt[] = "SPINNER: pid=%d\n";
+        bpf_trace_printk(wfmt, sizeof(wfmt), _pid);
     }
 
-    //if there are more - or less! then one non-sched-idle task running, not a good candidate for IVH
-    if ((rq->cfs.h_nr_runnable - rq->cfs.h_nr_idle) > 1) {
-        return 0;
-    }
-
-    //Checking to make sure task isn't idle
-    if (curr == rq->idle) {
-        return 0;
-    }
-
-    //Checking to make sure we aren't moving away from a good core
-    if (rq->cpu_capacity > 900) {
-        return 0;
-    }
-
-    //If there has never been any steal time, there's no reason to move
-    if (rq->last_preemption == 0) {
-        return 0;
-    }
-
-    //If there are no idle cpus in the system - why bother
-    if (idle_cpus == 0) {
-        return 0;
-    }
-
-    //Only tasks that have been running uninterrupted for over one MS are considered for IVH.
-    u64 min_runtime_threshold = 1000000;
-    if (min_runtime_threshold > get_task_runtime(now, rq)) {
-        return 0;
-    }
-
-    //only tasks that are cpu intensive should be considered for IVH
-    int util_percent = (curr->se.avg.util_avg * 100) / (1L << 10);
-    if (util_percent < 60) {
-        return 0;
-    }
-
-    //only proceed if the current task is a lock holder
+    // Gate 4: must be a lock holder — checked once here, not again below
     if (!curr_lockholder)
+        return 0;
+
+    /* ----------------------------------------------------------------
+     * Shadow candidate block — COUNTING ONLY, not an IVH gate.
+     *
+     * We already know curr_lockholder is true (gate 4).  This block
+     * counts how often each class of lockholder appears at tick time,
+     * regardless of whether the IVH gates below allow migration.  That
+     * lets us measure system-wide lockholder frequency independent of
+     * CPU capacity, util, or runtime constraints.
+     *
+     * cbits/movable are computed here and reused by gate 10 below so
+     * we only touch cpus_ptr once.
+     *
+     * Per-tick class counters (CTR_USER/KERNEL_MOVABLE/NONMOVABLE):
+     *   Incremented every tick this path is reached.  Shows frequency
+     *   of each lockholder class across the system.
+     *
+     * One-shot candidate counters (CTR_CANDIDATE_*):
+     *   Incremented only the first time a new pid is seen per CPU per
+     *   scheduling epoch (deduped via last_candidate_pid).  Counts
+     *   unique movable lockholders, not tick frequency.
+     * ---------------------------------------------------------------- */
+    u32 curr_pid = curr->pid;
+    unsigned long cbits = *(curr->cpus_ptr->bits);
+    int movable = cbits && (cbits & (cbits - 1));
+
+    u32 cls_key = curr_user_lockholder
+        ? (movable ? CTR_USER_MOVABLE   : CTR_USER_NONMOVABLE)
+        : (movable ? CTR_KERNEL_MOVABLE : CTR_KERNEL_NONMOVABLE);
+    u64 *cls_cnt = bpf_map_lookup_elem(&lhp_counters, &cls_key);
+    if (cls_cnt)
+        (*cls_cnt)++;
+
+    if (movable) {
+        u32 map_key = 0;
+        u32 *last_pid = bpf_map_lookup_elem(&last_candidate_pid, &map_key);
+        if (last_pid && *last_pid != curr_pid) {
+            *last_pid = curr_pid;
+
+            u32 tot_key = CTR_CANDIDATE_TOTAL;
+            u64 *tot_cnt = bpf_map_lookup_elem(&lhp_counters, &tot_key);
+            if (tot_cnt) (*tot_cnt)++;
+
+            u32 cand_cls_key = curr_user_lockholder
+                ? CTR_CAND_USER_MOV : CTR_CAND_KERN_MOV;
+            u64 *cand_cnt = bpf_map_lookup_elem(&lhp_counters, &cand_cls_key);
+            if (cand_cnt) (*cand_cnt)++;
+
+            u32 _cpu2 = rq->cpu;
+            char cfmt[] = "SHADOW_CAND cpu=%d pid=%d\n";
+            bpf_trace_printk(cfmt, sizeof(cfmt), _cpu2, curr_pid);
+        }
+    }
+    /* end shadow candidate block */
+
+    // Gate 5: not moving away from a healthy core — only act on throttled/preempted CPUs
+    if (rq->cpu_capacity > 900)
+        return 0;
+
+    // Gate 6: must have seen prior preemption — no steal time means no IVH problem
+    if (rq->last_preemption == 0)
+        return 0;
+
+    // Gate 7: must have idle CPUs available as migration targets
+    if (idle_cpus == 0)
+        return 0;
+
+    // Gate 8: task must have been running uninterrupted for >1ms
+    u64 min_runtime_threshold = 1000000;
+    if (min_runtime_threshold > get_task_runtime(now, rq))
+        return 0;
+
+    // Gate 9: must be CPU-intensive (util > 60%)
+    int util_percent = (curr->se.avg.util_avg * 100) / (1L << 10);
+    if (util_percent < 60)
+        return 0;
+
+    // Gate 10: must be movable — a pinned task cannot benefit from migration
+    if (!movable)
         return 0;
 
     u32 _cpu = rq->cpu;
@@ -110,7 +225,6 @@ int BPF_PROG(test, struct rq *rq, u64 now, unsigned int idle_cpus,
     u32 _ul = (u32)curr_user_lockholder;
     char fmt[] = "MY_ivh_atc: lockholder IVH fired cpu=%d lock_depth=%d user=%d\n";
     bpf_trace_printk(fmt, sizeof(fmt), _cpu, _ld, _ul);
-
 
     return 1;
 }
