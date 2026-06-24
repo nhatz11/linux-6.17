@@ -76,6 +76,7 @@ struct {
     __type(value, u32);
 } last_candidate_pid SEC(".maps");
 
+
 //Function used to determine if CPU is idle
 //If the only processes running on a CPU are sched-IDLE, core is considered idle
 static int idle_cpu(struct rq *rq)
@@ -106,127 +107,6 @@ if (ref > now_time)
     return 0;
 
 return now_time - ref;
-}
-
-//Hook to determine whether to initiate IVH — only fires for lock holders
-SEC("sched/cfs_sched_tick_end")
-int BPF_PROG(test, struct rq *rq, u64 now, unsigned int idle_cpus,
-             int curr_lock_depth, int curr_kernel_lockholder,
-             int curr_user_lockholder, int curr_lockholder, int curr_waiter)
-{
-    struct task_struct *curr = rq->curr;
-
-    // Gate 1: already decided to migrate this CPU — no double-trigger
-    if (rq->preempt_migrate_locked == 1)
-        return 0;
-
-    // Gate 2: more than one non-sched-idle runnable task — contention local, not IVH case
-    if ((rq->cfs.h_nr_runnable - rq->cfs.h_nr_idle) > 1)
-        return 0;
-
-    // Gate 3: idle task
-    if (curr == rq->idle)
-        return 0;
-
-    /* Log spinner at tick time. curr_waiter=1 if wait_depth>0 (kernel qspinlock/OSQ)
-     * or rseq wait_counter bits[31:2] set (userspace spin). Not a gate — just observability. */
-    if (curr_waiter) {
-        u32 _pid = curr->pid;
-        char wfmt[] = "SPINNER: pid=%d\n";
-        bpf_trace_printk(wfmt, sizeof(wfmt), _pid);
-    }
-
-    // Gate 4: must be a lock holder — checked once here, not again below
-    if (!curr_lockholder)
-        return 0;
-
-    /* ----------------------------------------------------------------
-     * Shadow candidate block — COUNTING ONLY, not an IVH gate.
-     *
-     * We already know curr_lockholder is true (gate 4).  This block
-     * counts how often each class of lockholder appears at tick time,
-     * regardless of whether the IVH gates below allow migration.  That
-     * lets us measure system-wide lockholder frequency independent of
-     * CPU capacity, util, or runtime constraints.
-     *
-     * cbits/movable are computed here and reused by gate 10 below so
-     * we only touch cpus_ptr once.
-     *
-     * Per-tick class counters (CTR_USER/KERNEL_MOVABLE/NONMOVABLE):
-     *   Incremented every tick this path is reached.  Shows frequency
-     *   of each lockholder class across the system.
-     *
-     * One-shot candidate counters (CTR_CANDIDATE_*):
-     *   Incremented only the first time a new pid is seen per CPU per
-     *   scheduling epoch (deduped via last_candidate_pid).  Counts
-     *   unique movable lockholders, not tick frequency.
-     * ---------------------------------------------------------------- */
-    u32 curr_pid = curr->pid;
-    unsigned long cbits = *(curr->cpus_ptr->bits);
-    int movable = cbits && (cbits & (cbits - 1));
-
-    u32 cls_key = curr_user_lockholder
-        ? (movable ? CTR_USER_MOVABLE   : CTR_USER_NONMOVABLE)
-        : (movable ? CTR_KERNEL_MOVABLE : CTR_KERNEL_NONMOVABLE);
-    u64 *cls_cnt = bpf_map_lookup_elem(&lhp_counters, &cls_key);
-    if (cls_cnt)
-        (*cls_cnt)++;
-
-    if (movable) {
-        u32 map_key = 0;
-        u32 *last_pid = bpf_map_lookup_elem(&last_candidate_pid, &map_key);
-        if (last_pid && *last_pid != curr_pid) {
-            *last_pid = curr_pid;
-
-            u32 tot_key = CTR_CANDIDATE_TOTAL;
-            u64 *tot_cnt = bpf_map_lookup_elem(&lhp_counters, &tot_key);
-            if (tot_cnt) (*tot_cnt)++;
-
-            u32 cand_cls_key = curr_user_lockholder
-                ? CTR_CAND_USER_MOV : CTR_CAND_KERN_MOV;
-            u64 *cand_cnt = bpf_map_lookup_elem(&lhp_counters, &cand_cls_key);
-            if (cand_cnt) (*cand_cnt)++;
-
-            u32 _cpu2 = rq->cpu;
-            char cfmt[] = "SHADOW_CAND cpu=%d pid=%d\n";
-            bpf_trace_printk(cfmt, sizeof(cfmt), _cpu2, curr_pid);
-        }
-    }
-    /* end shadow candidate block */
-
-    // Gate 5: not moving away from a healthy core — only act on throttled/preempted CPUs
-    if (rq->cpu_capacity > 900)
-        return 0;
-
-    // Gate 6: must have seen prior preemption — no steal time means no IVH problem
-    if (rq->last_preemption == 0)
-        return 0;
-
-    // Gate 7: must have idle CPUs available as migration targets
-    if (idle_cpus == 0)
-        return 0;
-
-    // Gate 8: task must have been running uninterrupted for >1ms
-    u64 min_runtime_threshold = 1000000;
-    if (min_runtime_threshold > get_task_runtime(now, rq))
-        return 0;
-
-    // Gate 9: must be CPU-intensive (util > 60%)
-    int util_percent = (curr->se.avg.util_avg * 100) / (1L << 10);
-    if (util_percent < 60)
-        return 0;
-
-    // Gate 10: must be movable — a pinned task cannot benefit from migration
-    if (!movable)
-        return 0;
-
-    u32 _cpu = rq->cpu;
-    u32 _ld = (u32)curr_lock_depth;
-    u32 _ul = (u32)curr_user_lockholder;
-    char fmt[] = "MY_ivh_atc: lockholder IVH fired cpu=%d lock_depth=%d user=%d\n";
-    bpf_trace_printk(fmt, sizeof(fmt), _cpu, _ld, _ul);
-
-    return 1;
 }
 
 //Function to check if a cpu is preempted
@@ -334,6 +214,52 @@ static int process_cpu(u32 iter, void *data)
         return 1;
     }
     return 0;
+}
+
+SEC("sched/cfs_sched_tick_end")
+int BPF_PROG(test, struct rq *rq, u64 now_time, unsigned int num_of_idle,
+             int curr_lock_depth, int curr_kernel_lockholder,
+             int curr_user_lockholder, int curr_lockholder, int curr_waiter)
+{
+    /*
+     * Gate A: task must hold a kernel or userspace spinlock.
+     * Redundant for the lock-acquisition trigger (bpf_sched_lock_acquire
+     * only fires at lock_depth 0→1), but the running kernel still has the
+     * tick path in sched_balance_trigger() which can reach running_migration
+     * with curr_lockholder=0.  Without this gate, migrations fire for every
+     * running task at every tick when cpu_capacity <= 900.
+     */
+    if (!curr_lockholder)
+        return 0;
+
+    /*
+     * Gate B: util_avg >= 60% — only migrate CPU-intensive lockholders.
+     *
+     * JIT workers (Bun, V8, GC threads) have multi-ms wall-clock kernel CSes
+     * because they get preempted mid-spinlock-hold (LHP events visible as
+     * JITWorker/HeapHelper in lhp_cstime output).  Their long-term util_avg
+     * is low because they spend large fractions of time in madvise/mmap/munmap
+     * syscalls.  Migrating them spreads mm->cpu_bitmap, causing TLB flush IPIs
+     * to reach CPUs in IRQ-disabled spinlock slowpaths — the exact deadlock
+     * pattern in the 2026-06-23 crash (CPU#2 Bun Pool 0 IRQ-disabled,
+     * gnome-shell/claude/bash stuck in smp_call_function_many_cond).
+     *
+     * Genuine spinlock-heavy workloads (hackbench, databases) are continuously
+     * CPU-bound and sustain util_avg > 60% within seconds.
+     *
+     * False-negative window: tasks transitioning from idle to CPU-intensive
+     * won't be included until util_avg ramps past 60% (~200-500 ms).
+     * This is acceptable — they have no waiters yet during the ramp-up.
+     *
+     * Threshold mirrors Edward's original IVH and the C gate added to fair.c.
+     */
+    struct task_struct *curr_task = rq->curr;
+    u64 util_avg = curr_task->se.avg.util_avg;
+    int util_percent = (int)((util_avg * 100) >> SCHED_CAPACITY_SHIFT);
+    if (util_percent < 60)
+        return 0;
+
+    return 1;
 }
 
 //Hook to decide on which core to land on
