@@ -76,6 +76,24 @@ struct {
     __type(value, u32);
 } last_candidate_pid SEC(".maps");
 
+/*
+ * Dynamic JIT-worker banlist, populated by the kprobe on do_mprotect_pkey.
+ * Key: thread ID (task->pid).  Value: 1 (present = is a JIT worker).
+ *
+ * Any thread that calls mprotect(PROT_EXEC) is a JIT compiler: it has
+ * written machine code into a writable buffer and is now making it
+ * executable.  No non-JIT path does this to anonymous memory.
+ * This catches every JIT runtime regardless of thread naming convention.
+ */
+#define PROT_EXEC  0x4
+#define JIT_MAP_MAX 4096
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, JIT_MAP_MAX);
+    __type(key, u32);
+    __type(value, u8);
+} jit_tids SEC(".maps");
+
 
 //Function used to determine if CPU is idle
 //If the only processes running on a CPU are sched-IDLE, core is considered idle
@@ -265,19 +283,35 @@ static __always_inline int is_jit_worker(struct task_struct *t)
     return 0;
 }
 
+/*
+ * EXPERIMENT_NO_MOVE: set to 1 to make test3() return -1 (running_migration
+ * fires and BPF decides yes, but no task ever actually moves).
+ * Experiment A = 1, Experiment B/C = 0.
+ *
+ * EXPERIMENT_FIXED_CPU: set to 1 to make test3() return a trivial fixed
+ * target ((rq->cpu + 1) % total_cpus) instead of running the full CPU
+ * search algorithm.  If crashes stop with this set, test3()'s search logic
+ * is producing bad targets.  If crashes continue, migrate_task_to_async_fair
+ * itself is the problem.
+ */
+#define EXPERIMENT_NO_MOVE    0
+#define EXPERIMENT_FIXED_CPU  0
+
 SEC("sched/cfs_sched_tick_end")
 int BPF_PROG(test, struct rq *rq, u64 now_time, unsigned int num_of_idle,
              int curr_lock_depth, int curr_kernel_lockholder,
              int curr_user_lockholder, int curr_lockholder, int curr_waiter)
 {
-    /* Gate A: must be a lock holder. */
     if (!curr_lockholder)
         return 0;
 
-    /* Gate B: never migrate known JIT workers — their mm->cpu_bitmap
-     * spreading is what creates the TLB-IPI deadlock conditions. */
     struct task_struct *curr_task = rq->curr;
     if (is_jit_worker(curr_task))
+        return 0;
+
+    u32 tid = curr_task->pid;
+    u8 *in_jit_map = bpf_map_lookup_elem(&jit_tids, &tid);
+    if (in_jit_map)
         return 0;
 
     return 1;
@@ -287,6 +321,16 @@ int BPF_PROG(test, struct rq *rq, u64 now_time, unsigned int num_of_idle,
 SEC("sched/cfs_select_run_cpu_spin")
 int BPF_PROG(test3, struct rq *rq, struct task_struct *curr, u64 now_time, int average_capacity, int total_cpus)
 {
+#if EXPERIMENT_NO_MOVE
+    return -1; /* Exp A: decision made but no task moves */
+#endif
+#if EXPERIMENT_FIXED_CPU
+    /* Exp B2: bypass test3 search logic entirely — migrate to next CPU.
+     * If this is stable but real test3 crashes, the bug is in CPU selection.
+     * If this also crashes, the bug is in migrate_task_to_async_fair itself. */
+    int next = (rq->cpu + 1) % total_cpus;
+    return next;
+#endif
     int start = 0;
     u32 nr_loops = total_cpus - 1;
     int target_cpu = -1;
@@ -444,4 +488,28 @@ int BPF_PROG(test32, int prev, struct task_struct *curr, struct cpumask *idle_cp
 
     bpf_loop(256, &search_latency, &latency_context, 0);
     return target_cpu;
+}
+
+/*
+ * Kprobe on do_mprotect_pkey — the internal mprotect implementation.
+ * Signature: do_mprotect_pkey(unsigned long start, size_t len,
+ *                              unsigned long prot, int pkey)
+ * On x86-64: rdi=start, rsi=len, rdx=prot, rcx=pkey.
+ *
+ * Any thread requesting PROT_EXEC is a JIT compiler.  Record its TID
+ * in jit_tids so test() can block it from IVH migration.  This catches
+ * every runtime (Bun, Node/V8, JVM, LLVM, gjs, ...) without needing
+ * hardcoded thread names.
+ */
+SEC("kprobe/do_mprotect_pkey")
+int detect_jit(struct pt_regs *ctx)
+{
+    unsigned long prot = ctx->dx; /* rdx = 3rd arg on x86-64 */
+    if (!(prot & PROT_EXEC))
+        return 0;
+
+    u32 tid = (u32)bpf_get_current_pid_tgid();
+    u8 one = 1;
+    bpf_map_update_elem(&jit_tids, &tid, &one, BPF_ANY);
+    return 0;
 }
