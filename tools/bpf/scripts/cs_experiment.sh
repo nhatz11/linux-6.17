@@ -16,8 +16,9 @@ shift || true
 WORKLOAD_CMD=("$@")
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CSTIME_BIN="$SCRIPT_DIR/lhp_cstime"
-WAITTIME_BIN="$SCRIPT_DIR/lhp_waittime"
+TOOLS="$(dirname "$SCRIPT_DIR")"
+CSTIME_BIN="$TOOLS/lhp_cstime"
+WAITTIME_BIN="$TOOLS/lhp_waittime"
 CSTIME_RAW=$(mktemp /tmp/cstime_raw.XXXXXX.txt)
 WAITTIME_RAW=$(mktemp /tmp/waittime_raw.XXXXXX.txt)
 WAITTIME_CORRECTED=$(mktemp /tmp/waittime_corrected.XXXXXX.txt)

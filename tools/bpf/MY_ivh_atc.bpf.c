@@ -77,22 +77,47 @@ struct {
 } last_candidate_pid SEC(".maps");
 
 /*
- * Dynamic JIT-worker banlist, populated by the kprobe on do_mprotect_pkey.
- * Key: thread ID (task->pid).  Value: 1 (present = is a JIT worker).
+ * Dynamic JIT-process banlist, populated by detect_jit kprobe and by
+ * the comm banlist in test().  Key: TGID (process group ID).
  *
- * Any thread that calls mprotect(PROT_EXEC) is a JIT compiler: it has
- * written machine code into a writable buffer and is now making it
- * executable.  No non-JIT path does this to anonymous memory.
- * This catches every JIT runtime regardless of thread naming convention.
+ * Keying by TGID instead of TID is critical: JIT runtimes have many
+ * threads sharing the same mm (e.g. Bun has HeapHelper, JITWorker, AND
+ * a main thread named "claude" + an "HTTP Client" thread).  Migrating
+ * ANY thread in the process spreads mm->cpu_bitmap to new CPUs — so we
+ * must block ALL threads in a JIT process, not just the named JIT ones.
  */
 #define PROT_EXEC  0x4
 #define JIT_MAP_MAX 4096
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, JIT_MAP_MAX);
-    __type(key, u32);
+    __type(key, u32);   /* TGID */
     __type(value, u8);
-} jit_tids SEC(".maps");
+} jit_tgids SEC(".maps");
+
+/*
+ * Per-CPU record of the last accepted migration.  Userspace polls this
+ * every few seconds and writes to /var/log/ivh_migrations.log with fsync.
+ * Using a map instead of bpf_trace_printk avoids routing output through
+ * trace_pipe — a reader process for trace_pipe would itself become an IVH
+ * migration candidate on throttled CPUs, creating a feedback loop that
+ * floods the spinlock path and triggers TLB IPI soft lockups.
+ */
+struct ivh_migration_event {
+    char  comm[16];
+    int   src_cpu;
+    int   dst_cpu;
+    unsigned long mm_bits;
+    u64   timestamp;
+    u64   count;       /* total migrations accepted on this CPU */
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, struct ivh_migration_event);
+} last_migration SEC(".maps");
 
 
 //Function used to determine if CPU is idle
@@ -167,6 +192,10 @@ static int process_cpu(u32 iter, void *data)
     //Current CPU
     int cpu = (iter + ctx->start) % ctx->total_cpus;
 
+    /* Never migrate a task to the CPU it's already on. */
+    if (cpu == ctx->start)
+        return 0;
+
     //cpumask of curr cpu
     const cpumask_t *cpumask = curr->cpus_ptr;
     unsigned long cpumask_bits = *(cpumask->bits);
@@ -174,6 +203,30 @@ static int process_cpu(u32 iter, void *data)
     //is valid cpu for task?
     if (!(cpumask_bits & (1UL << cpu))) {
         return 0;
+    }
+
+    /*
+     * Only migrate user tasks to CPUs already in mm_cpumask.
+     *
+     * IVH migration calls switch_mm_irqs_off() on the destination, which
+     * unconditionally does cpumask_set_cpu(dst, mm_cpumask(mm)).  If that
+     * CPU later enters a raw_spin_lock_irqsave path (IRQs disabled), a
+     * concurrent flush_tlb_mm() sends it a call-function IPI and waits.
+     * The CPU can't respond → on_each_cpu_mask stalls → soft lockup.
+     *
+     * If the destination is already in mm_cpumask, it was already a TLB
+     * flush target before IVH acted — no new risk is introduced.
+     *
+     * Kernel threads (mm == NULL) are exempt: they run in lazy-TLB mode
+     * with a borrowed active_mm and never expand mm_cpumask on migration.
+     *
+     * cpu_bitmap[0] covers CPUs 0–63; sufficient for this 18-vCPU system.
+     */
+    struct mm_struct *mm = curr->mm;
+    if (mm) {
+        unsigned long mm_cpu_bits = mm->cpu_bitmap[0];
+        if (!(mm_cpu_bits & (1UL << cpu)))
+            return 0;
     }
 
     int *target_cpu_ptr = ctx->target_cpu_ptr;
@@ -279,6 +332,11 @@ static __always_inline int is_jit_worker(struct task_struct *t)
     /* "llvm" — llvmpipe shader JIT */
     if (c0 == 'l' && c1 == 'l' && c2 == 'v' && c3 == 'm')
         return 1;
+    /* "snap" — snapd / snap-update-ns; heavy mount-namespace operations
+     * (clone(CLONE_NEWNS), mount, umount) while being migrated at high
+     * rate caused hypervisor hard-resets in the 2026-06-24 crash. */
+    if (c0 == 's' && c1 == 'n' && c2 == 'a' && c3 == 'p')
+        return 1;
 
     return 0;
 }
@@ -306,12 +364,25 @@ int BPF_PROG(test, struct rq *rq, u64 now_time, unsigned int num_of_idle,
         return 0;
 
     struct task_struct *curr_task = rq->curr;
-    if (is_jit_worker(curr_task))
-        return 0;
+    u32 tgid = curr_task->tgid;
 
-    u32 tid = curr_task->pid;
-    u8 *in_jit_map = bpf_map_lookup_elem(&jit_tids, &tid);
-    if (in_jit_map)
+    /*
+     * Comm banlist: fast check for known JIT thread names.  On first hit,
+     * seed jit_tgids with the process TGID so all sibling threads (main
+     * thread, HTTP Client, fs.watch, etc.) sharing the same mm are also
+     * blocked.  BPF_NOEXIST avoids redundant writes on every subsequent
+     * tick — after the first insertion this becomes a no-op.
+     */
+    if (is_jit_worker(curr_task)) {
+        if (!bpf_map_lookup_elem(&jit_tgids, &tgid)) {
+            u8 one = 1;
+            bpf_map_update_elem(&jit_tgids, &tgid, &one, BPF_NOEXIST);
+        }
+        return 0;
+    }
+
+    /* Dynamic map: block any sibling thread in a known JIT process. */
+    if (bpf_map_lookup_elem(&jit_tgids, &tgid))
         return 0;
 
     return 1;
@@ -351,7 +422,25 @@ int BPF_PROG(test3, struct rq *rq, struct task_struct *curr, u64 now_time, int a
         .total_cpus = total_cpus
     };
 
+    unsigned long mm_bits = curr->mm ? curr->mm->cpu_bitmap[0] : 0UL;
+
     bpf_loop(nr_loops, &process_cpu, &task_context, 0);
+
+    if (target_cpu >= 0) {
+        /* Record to map — userspace polls and fsync's; no trace_pipe. */
+        u32 key = 0;
+        struct ivh_migration_event *ev =
+            bpf_map_lookup_elem(&last_migration, &key);
+        if (ev) {
+            __builtin_memcpy(ev->comm, curr->comm, 16);
+            ev->src_cpu   = rq->cpu;
+            ev->dst_cpu   = target_cpu;
+            ev->mm_bits   = mm_bits;
+            ev->timestamp = now_time;
+            ev->count    += 1;
+        }
+    }
+
     return target_cpu;
 }
 
@@ -496,10 +585,9 @@ int BPF_PROG(test32, int prev, struct task_struct *curr, struct cpumask *idle_cp
  *                              unsigned long prot, int pkey)
  * On x86-64: rdi=start, rsi=len, rdx=prot, rcx=pkey.
  *
- * Any thread requesting PROT_EXEC is a JIT compiler.  Record its TID
- * in jit_tids so test() can block it from IVH migration.  This catches
- * every runtime (Bun, Node/V8, JVM, LLVM, gjs, ...) without needing
- * hardcoded thread names.
+ * Any thread requesting PROT_EXEC is a JIT compiler.  Record its TGID
+ * in jit_tgids so all threads sharing the same mm are blocked from IVH
+ * migration.  This catches every runtime without hardcoded thread names.
  */
 SEC("kprobe/do_mprotect_pkey")
 int detect_jit(struct pt_regs *ctx)
@@ -508,8 +596,8 @@ int detect_jit(struct pt_regs *ctx)
     if (!(prot & PROT_EXEC))
         return 0;
 
-    u32 tid = (u32)bpf_get_current_pid_tgid();
+    u32 tgid = (u32)(bpf_get_current_pid_tgid() >> 32);
     u8 one = 1;
-    bpf_map_update_elem(&jit_tids, &tid, &one, BPF_ANY);
+    bpf_map_update_elem(&jit_tgids, &tgid, &one, BPF_NOEXIST);
     return 0;
 }

@@ -37,6 +37,51 @@ enum rseq_cs_flags {
 		(1U << RSEQ_CS_FLAG_NO_RESTART_ON_MIGRATE_BIT),
 };
 
+enum rseq_sched_state_flags {
+	/*
+	 * Task is currently running on a CPU if set.  The kernel sets this
+	 * bit on the return-to-userspace path (rseq_update_cpu_node_id) and
+	 * clears it on preemption (rseq_preempt → rseq_set_sched_state(t,0)).
+	 * Read by any userspace thread with single-copy atomicity semantics.
+	 */
+	RSEQ_SCHED_STATE_FLAG_ON_CPU		= (1U << 0),
+};
+
+/*
+ * struct rseq_sched_state - scheduler visibility state for one thread.
+ *
+ * Allocated by userspace, its address is registered with the kernel via
+ * the sched_state_ptr field of struct rseq.  The kernel updates 'state'
+ * on the return-to-userspace path and on preemption.  Any userspace
+ * thread may read 'state' to determine whether the owning thread is
+ * currently on-CPU.
+ *
+ * The page that contains this structure must be faulted in before
+ * registration; the kernel writes to it with pagefault_disable() in
+ * the preemption path and will silently skip the update if the page is
+ * not present.
+ *
+ * Natural alignment is required; cache-line alignment is recommended.
+ */
+struct rseq_sched_state {
+	/*
+	 * Version of this structure.  Populated (set to 0) by the kernel
+	 * at registration time; read by user-space.
+	 */
+	__u32 version;
+	/*
+	 * Scheduler state bitmask (enum rseq_sched_state_flags).
+	 * Updated by the kernel.  Read by any userspace thread with
+	 * single-copy atomicity semantics.  Aligned on 32-bit.
+	 */
+	__u32 state;
+	/*
+	 * TID of the thread that registered this structure.  Initialized
+	 * by userspace before registration; not modified by the kernel.
+	 */
+	__u32 tid;
+};
+
 enum rseq_cr_flags_bit {
 	RSEQ_CR_FLAG_IN_CRITICAL_SECTION_BIT	= 0,
 	RSEQ_CR_FLAG_KERNEL_REQUEST_SCHED_BIT	= 1,
@@ -242,9 +287,22 @@ struct rseq {
 	__u64 last_wait_overall_ns;
 
 	/*
+	 * Pointer to a userspace-allocated struct rseq_sched_state.
+	 * Initialized by userspace to the address of the rseq_sched_state
+	 * structure before registration.  Set to 0 if the feature is not
+	 * used.  Read by the kernel at rseq registration; stored internally
+	 * as task_struct::rseq_sched_state.
+	 *
+	 * NOTE: adding this field changes offsetof(struct rseq, end) from
+	 * 64 to 72.  Userspace that previously registered with rseq_len=64
+	 * must update to rseq_len=72 (or rseq_len=32 for the ORIG ABI).
+	 */
+	__u64 sched_state_ptr;
+
+	/*
 	 * Flexible array member at end of structure, after last feature field.
-	 * offsetof(struct rseq, end) = 64.
-	 * AT_RSEQ_FEATURE_SIZE will report 64 after a kernel rebuild.
+	 * offsetof(struct rseq, end) = 72.
+	 * AT_RSEQ_FEATURE_SIZE will report 72 after a kernel rebuild.
 	 */
 	char end[];
 } __attribute__((aligned(4 * sizeof(__u64))));

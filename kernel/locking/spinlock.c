@@ -23,6 +23,7 @@
 #include <linux/export.h>
 #include <linux/sched.h>
 #include <linux/sched/clock.h>
+#include <linux/bpf_sched.h>
 
 /*
  * cs_enter / cs_exit — helpers called around lock_depth transitions.
@@ -37,15 +38,21 @@
  */
 static __always_inline void cs_enter(void)
 {
-	if (current->lock_depth == 1)
+	if (current->lock_depth == 1) {
 		current->cs_start_ts = sched_clock();
+		current->cs_wall_start_ts = current->cs_start_ts;
+		bpf_sched_lock_acquire();
+	}
 }
 
 static __always_inline void cs_exit(void)
 {
 	if (current->lock_depth == 0 && current->cs_start_ts) {
-		current->cumulative_cs_time += sched_clock() - current->cs_start_ts;
+		u64 now = sched_clock();
+		current->last_cs_ns = now - current->cs_wall_start_ts;
+		current->cumulative_cs_time += now - current->cs_start_ts;
 		current->cs_start_ts = 0;
+		current->cs_wall_start_ts = 0;
 	}
 }
 

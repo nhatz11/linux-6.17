@@ -65,11 +65,23 @@ static int rseq_ownership;
 /* Allocate a large area for the TLS. */
 #define RSEQ_THREAD_AREA_ALLOC_SIZE	1024
 
+/* Approximation of cache-line size used to align rseq_abi_sched_state. */
+#define CACHELINE_SIZE			128
+
 /* Original struct rseq feature size is 20 bytes. */
 #define ORIG_RSEQ_FEATURE_SIZE		20
 
 /* Original struct rseq allocation size is 32 bytes. */
 #define ORIG_RSEQ_ALLOC_SIZE		32
+
+/*
+ * Per-thread sched_state structure, registered with the kernel via
+ * struct rseq_abi::sched_state_ptr.  Cache-line aligned to avoid false
+ * sharing when multiple threads are monitored simultaneously.
+ */
+static
+__thread struct rseq_abi_sched_state __rseq_abi_sched_state
+	__attribute__((tls_model("initial-exec"), aligned(CACHELINE_SIZE)));
 
 /*
  * Use a union to ensure we allocate a TLS area of 1024 bytes to accomodate an
@@ -86,6 +98,11 @@ __thread union rseq_tls __rseq __attribute__((tls_model("initial-exec"))) = {
 		.cpu_id = RSEQ_ABI_CPU_ID_UNINITIALIZED,
 	},
 };
+
+static pid_t rseq_gettid(void)
+{
+	return syscall(__NR_gettid);
+}
 
 static int sys_rseq(struct rseq_abi *rseq_abi, uint32_t rseq_len,
 		    int flags, uint32_t sig)
@@ -157,9 +174,34 @@ int rseq_register_current_thread(void)
 	int rc;
 
 	if (!rseq_ownership) {
-		/* Treat libc's ownership as a successful registration. */
+		/*
+		 * Glibc owns the rseq registration.  If the kernel supports
+		 * sched_state_ptr (rseq_size >= offsetofend(struct rseq_abi,
+		 * sched_state_ptr)), wire up the per-thread sched_state so
+		 * callers of rseq_get_sched_state() get a valid pointer.
+		 *
+		 * Glibc zeroed the entire rseq area before registration, so
+		 * sched_state_ptr is 0.  We must unregister and re-register to
+		 * let the kernel pick up the new value.
+		 */
+		if (rseq_size >= rseq_offsetofend(struct rseq_abi, sched_state_ptr)) {
+			struct rseq_abi *abi = rseq_get_abi();
+
+			__rseq_abi_sched_state.tid = rseq_gettid();
+			RSEQ_WRITE_ONCE(abi->sched_state_ptr,
+					(uint64_t)(unsigned long)&__rseq_abi_sched_state);
+			/* Unregister so re-registration re-reads sched_state_ptr. */
+			rc = sys_rseq(abi, rseq_size, RSEQ_ABI_FLAG_UNREGISTER, RSEQ_SIG);
+			if (rc)
+				return -1;
+			rc = sys_rseq(abi, rseq_size, 0, RSEQ_SIG);
+			if (rc)
+				return -1;
+		}
 		return 0;
 	}
+	__rseq_abi_sched_state.tid = rseq_gettid();
+	__rseq.abi.sched_state_ptr = (uint64_t)(unsigned long)&__rseq_abi_sched_state;
 	rc = sys_rseq(&__rseq.abi, get_rseq_min_alloc_size(), 0, RSEQ_SIG);
 	if (rc) {
 		/*

@@ -4,7 +4,122 @@
 #include <linux/bpf_verifier.h>
 #include <linux/bpf_sched.h>
 #include <linux/btf_ids.h>
+#include <linux/sched/clock.h>
+#include <linux/syscalls.h>
+#include <linux/sysctl.h>
 #include "sched.h"
+
+/*
+ * Capacity threshold: migrate when cpu_capacity falls below this value.
+ * Scale is SCHED_CAPACITY_SCALE = 1024.  900/1024 ≈ 87.9% — below this
+ * the vCPU is measurably throttled by the hypervisor.  Mirrors Gate 5 in
+ * MY_ivh_atc.bpf.c (rq->cpu_capacity > 900 → skip).
+ */
+#define IVH_CAPACITY_THRESHOLD	900u
+
+/*
+ * Time-left gate: skip migration when this many nanoseconds remain in the
+ * estimated active burst.  Tunable at runtime via sysctl without a rebuild:
+ *   echo 250000 > /proc/sys/kernel/ivh_time_left_threshold_ns
+ * Default 500 μs — wide enough to absorb EWMA noise and the ~10 ms tick
+ * lag in last_preemption, yet short enough to catch most end-of-burst locks.
+ */
+unsigned long ivh_time_left_threshold_ns = 500000UL;
+
+#ifdef CONFIG_SYSCTL
+static const struct ctl_table ivh_sysctls[] = {
+	{
+		.procname	= "ivh_time_left_threshold_ns",
+		.data		= &ivh_time_left_threshold_ns,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+};
+
+static int __init ivh_sysctl_init(void)
+{
+	register_sysctl_init("kernel", ivh_sysctls);
+	return 0;
+}
+late_initcall(ivh_sysctl_init);
+#endif /* CONFIG_SYSCTL */
+
+/**
+ * bpf_sched_lock_acquire - lock-acquisition-driven migration trigger.
+ *
+ * Called from cs_enter() when the outermost kernel spinlock is acquired in
+ * process context (lock_depth == 1).  Applies two gates before firing
+ * running_migration():
+ *
+ *   Gate 1 — capacity:  cpu_capacity <= IVH_CAPACITY_THRESHOLD
+ *             The vCPU is being throttled by the hypervisor.
+ *
+ *   Gate 2 — time-left: (ewma_act_ns - act_sofar) < ivh_time_left_threshold_ns
+ *             We are near the end of the estimated active burst, so
+ *             preemption is imminent and migration is worthwhile.
+ *             ewma_act_ns == 0 means vcap has not yet written a value;
+ *             gate is skipped so IVH fires safely during early startup.
+ *
+ * IRQ safety: running_migration() protects its own lock with irqsave/restore.
+ */
+void bpf_sched_lock_acquire(void)
+{
+	struct rq *rq;
+	u64 ewma, act_sofar;
+
+	if (!bpf_sched_enabled())
+		return;
+
+	rq = this_rq();
+
+	/* Gate 1: vCPU is not throttled — nothing to do */
+	if (rq->cpu_capacity > IVH_CAPACITY_THRESHOLD)
+		return;
+
+	/* Gate 2: enough burst time remains — migration not urgent yet */
+	ewma = rq->ewma_act_ns;
+	if (ewma != 0) {
+		/* sched_clock() - last_preemption ≈ time into current active burst */
+		act_sofar = sched_clock() - rq->last_preemption;
+		if (ewma > act_sofar &&
+		    (ewma - act_sofar) >= ivh_time_left_threshold_ns)
+			return;
+	}
+
+	running_migration(rq);
+}
+EXPORT_SYMBOL_GPL(bpf_sched_lock_acquire);
+
+/**
+ * sys_ivh_cs_enter - userspace lock-acquisition migration trigger.
+ *
+ * Called from pthread_spin_lock() (glibc nptl patch) and NHextend grab_lock()
+ * immediately after acquiring a userspace spinlock — the userspace mirror of
+ * the bpf_sched_lock_acquire() path that fires at kernel _raw_spin_lock().
+ *
+ * Same decision rule as bpf_sched_lock_acquire():
+ *   cpu_capacity <= IVH_CAPACITY_THRESHOLD → trigger running_migration().
+ *
+ * Overhead: ~150 ns syscall overhead on the no-migrate fast path (the
+ * cpu_capacity check returns immediately if the vCPU is healthy).
+ * Zero overhead when IVH is not loaded (bpf_sched_enabled() static key).
+ */
+SYSCALL_DEFINE0(ivh_cs_enter)
+{
+	struct rq *rq;
+
+	if (!bpf_sched_enabled())
+		return 0;
+
+	rq = this_rq();
+
+	if (rq->cpu_capacity > IVH_CAPACITY_THRESHOLD)
+		return 0;
+
+	running_migration(rq);
+	return 0;
+}
 
 DEFINE_STATIC_KEY_FALSE(bpf_sched_enabled_key);
 

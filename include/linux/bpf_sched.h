@@ -16,6 +16,11 @@
 int bpf_sched_verify_prog(struct bpf_verifier_log *vlog,
 			  const struct bpf_prog *prog);
 
+/* Called from the outermost raw_spin_lock acquisition path (process context,
+ * lock_depth == 1) to evaluate and trigger lock-acquisition-driven migration.
+ * Implemented in kernel/sched/bpf_sched.c. */
+void bpf_sched_lock_acquire(void);
+
 DECLARE_STATIC_KEY_FALSE(bpf_sched_enabled_key);
 
 static inline bool bpf_sched_enabled(void)
@@ -49,6 +54,7 @@ static inline bool bpf_sched_enabled(void)
 	return false;
 }
 
+static inline void bpf_sched_lock_acquire(void) {}
 
 #endif /* CONFIG_BPF_SYSCALL */
 

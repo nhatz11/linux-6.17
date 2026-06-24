@@ -1,7 +1,7 @@
 #!/bin/bash
 # demo_spinner.sh — confirm curr_waiter signal (user+kernel spinners)
 set -e
-TOOLS=$(dirname "$(realpath "$0")")
+TOOLS=$(dirname "$(dirname "$(realpath "$0")")")
 EXTEND="/home/nick/extend-sched"
 DEBUGFS_LHP="/sys/kernel/debug/lhp_class"
 TRACE_PIPE="/sys/kernel/debug/tracing/trace"

@@ -16,8 +16,9 @@ shift || true
 WORKLOAD_CMD=("$@")
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-IVH_BIN="$SCRIPT_DIR/MY_ivh_atc"
-MOVABLE_BIN="$SCRIPT_DIR/lhp_movable"
+TOOLS="$(dirname "$SCRIPT_DIR")"
+IVH_BIN="$TOOLS/MY_ivh_atc"
+MOVABLE_BIN="$TOOLS/lhp_movable"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 

@@ -233,7 +233,15 @@ void set_custom_capacity(unsigned long custom_capacity, int cpu) {
         rq->cpu_capacity_custom = custom_capacity;
 }
 
+/* Written by vsched_module via /proc/vact_write; read by bpf_sched_lock_acquire() */
+void set_ewma_act_ns(int cpu, u64 ewma_act_ns)
+{
+        struct rq *rq = cpu_rq(cpu);
+        rq->ewma_act_ns = ewma_act_ns;
+}
+
 EXPORT_SYMBOL(set_custom_capacity);
+EXPORT_SYMBOL(set_ewma_act_ns);
 EXPORT_SYMBOL(get_steal_and_preemptions);
 EXPORT_SYMBOL(get_max_latency);
 EXPORT_SYMBOL(set_avg_latency);

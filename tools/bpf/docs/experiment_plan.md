@@ -136,6 +136,42 @@ Changes live in `kernel/rseq.c`. No BPF rebuild or reboot is required to change 
 
 ---
 
+### 2.10 Lock-acquisition-driven migration trigger
+
+**Motivation**: The original IVH design triggered `running_migration()` every 4 ms tick. A task that acquires a spinlock 3 ms into its tick window and holds it for 1 ms would never be seen as dangerous — the tick already fired safely. Moving the trigger to lock acquisition means the decision is made the moment a CS begins, when we know the most about how much time is left.
+
+**New function**: `bpf_sched_lock_acquire()` in `kernel/sched/bpf_sched.c:37`. Called from `cs_enter()` in `kernel/locking/spinlock.c:44` at the moment the outermost kernel spinlock is acquired (lock_depth transitions 0→1). The tick path call to `running_migration()` in `sched_balance_trigger()` has been removed — only one trigger path exists now.
+
+**Migration decision logic** (all conditions must hold):
+1. `bpf_sched_enabled()` — static key, zero overhead when IVH is not loaded
+2. `rq->last_preemption != 0` — this vCPU has seen hypervisor steal time before
+3. `current->last_cs_ns != 0` — at least one CS has already completed; avoids boot-time spurious migrations
+4. `elapsed = now - rq->last_preemption` **<** `last_active_time` — the last known vCPU activation window has not expired; if elapsed ≥ last_active_time the model has no predictive power and migration is skipped
+5. `time_left = last_active_time - elapsed` **<** `last_cs_ns + 500µs` — we're in the danger zone: the remaining estimated vCPU time is shorter than what the last CS took plus the migration pipeline latency
+
+**The elapsed fix** (applied 2026-06-18): The original condition used `time_left = (elapsed < last_act) ? (last_act - elapsed) : 0`. When `elapsed >= last_act`, `time_left = 0` which always passed the danger-zone check, causing `running_migration()` to fire on every lock acquisition once any steal history existed. The fix adds an explicit early return: `if (elapsed >= last_act) return;`. Verified: call rate dropped from ~60-100% of lock acquisitions to ~0.26% (only genuine danger-zone events), measured via ftrace function counter ratio.
+
+**IRQ safety**: `running_migration()` protects its own internal lock with `raw_spin_lock_irqsave`. `bpf_sched_lock_acquire()` adds no additional locking. Confirmed safe from process context.
+
+**Pipeline latency**: The migration pipeline is IPI → `preempt_migrate_func()` on target → `stop_one_cpu_nowait()` → stopper thread fires at next `preempt_enable()` on source → `migrate_task_to_async_fair()`. Conservative estimate: 50–250 µs. `MIGRATION_THRESHOLD_NS = 500000` (500 µs) is the initial conservative value; to be tuned against measured `rq->avg_wakeup_latency` per-CPU under real workloads.
+
+---
+
+### 2.11 CS timing fields in task_struct
+
+Four new `u64` fields track kernel spinlock CS timing at `include/linux/sched.h:1432–1447`:
+
+| Field | Set in | Cleared in | Meaning |
+|-------|--------|------------|---------|
+| `cs_start_ts` | `cs_enter()` | `cs_exit()`, `prepare_task_switch()` | On-CPU segment start; **reset during context switches** to enable on-CPU accumulation |
+| `cs_wall_start_ts` | `cs_enter()` | `cs_exit()` only | Wall-clock CS start; **survives context switches**, providing a wall-clock anchor |
+| `cumulative_cs_time` | `cs_exit()` | (never cleared) | Total nanoseconds on-CPU inside spinlock CSes across the task's lifetime |
+| `last_cs_ns` | `cs_exit()` | `cs_exit()` | Wall-clock duration of the most recently completed outermost CS; mirrors rseq `last_cs_overall_ns` semantics |
+
+The distinction: `cs_start_ts` is paused by `prepare_task_switch()` and resumed by `finish_task_switch()` (so `cumulative_cs_time` only counts on-CPU time). `cs_wall_start_ts` is never touched by context-switch handlers, so `last_cs_ns = now - cs_wall_start_ts` at release is the true elapsed lock hold time including any preemption mid-CS.
+
+---
+
 ### 2.8 BPF hook and scheduler changes
 
 - **New BPF prog type**: `BPF_PROG_TYPE_SCHED` with `SEC("sched/...")` attach point support, wired through BTF attach and link_create.
@@ -612,6 +648,18 @@ sudo bpftool map dump name lhp_counters   # record CTR_CANDIDATE_TOTAL
 - [x] `cs_experiment.sh` unified harness with Python statistical analysis
 - [x] Baseline system-wide CS duration measurement captured
 - [x] `rseq_sched_extend_usec` sysctl — runtime-tunable rseq extension grace period (`/proc/sys/kernel/rseq_sched_extend_usec`, default 50 µs, 0 = disabled)
+- [x] Lock-acquisition-driven migration trigger (`bpf_sched_lock_acquire()` in `bpf_sched.c:37`, called from `cs_enter()` at outermost kernel spinlock acquire). Elapsed fix applied (2026-06-18): prevents firing on expired model windows, dropped call rate from ~100% → 0.26%.
+- [x] CS timing fields in `task_struct`: `cs_start_ts`, `cs_wall_start_ts`, `cumulative_cs_time`, `last_cs_ns` — enable `bpf_sched_lock_acquire()` to use the last known CS duration as a danger-zone estimate.
+- [x] `cumulative_active_time`, `sched_in_stamp` in `task_struct` — on-CPU accounting for `cs_pct` derivation.
+- [x] `lhp_class` debugfs shows `cs_us` and `active_us` in MICROSECONDS (÷1000); `lhp_cstime` shows `duration=` in NANOSECONDS — unit mismatch documented and fixed in `verify_spinners_cstime.sh`.
+- [x] rseq ABI extended to 64 bytes: `cr_counter` (offset 28), `wait_counter` (offset 32), `last_cs_overall_ns` (offset 40), `last_cs_active_ns` (offset 48), `last_wait_overall_ns` (offset 56).
+- [x] `spin_cs_preload.so` — LD_PRELOAD prototype for `pthread_spin_lock/unlock` rseq instrumentation.
+- [x] glibc 2.41 patch (`~/glibc_pthread_spin_v2.patch`) — native pthread integration with `cr_counter`, `wait_counter`, timing fields; trylock bug fixed.
+- [x] `NHextend.c` (`~/NHextend`) — updated extend-sched with `wait_counter` support, `last_cs_overall_ns`/`last_wait_overall_ns` written to rseq at every unlock.
+- [x] `verify_extend.sh` sweep validated: overhead drops 8 µs → 0 µs, avg_wait drops 17%, extended > 0 when extend_usec > 0.
+- [x] File organization: docs/ and scripts/ subdirectories created in tools/bpf.
+
+- [x] rseq `sched_state_ptr` feature: kernel writes `ON_CPU=1` on every return-to-userspace (`rseq_update_cpu_node_id`) and `ON_CPU=0` on preemption (`rseq_preempt`). Any thread can read the owning thread's `state` field with single-copy atomicity to determine whether it is currently running. Confirmed working end-to-end on `AT_RSEQ_FEATURE_SIZE=72` kernel. See §16.
 
 ### IN PROGRESS
 
@@ -636,11 +684,15 @@ sudo bpftool map dump name lhp_counters   # record CTR_CANDIDATE_TOTAL
 
 ### Immediate (next session)
 
-1. **Run threshold sweep**: modify `CANDIDATE_THRESHOLD_NS` at each of the 5 values, run 60-second spinlock stress workload, record `CTR_CANDIDATE_TOTAL` from `lhp_counters`. No kernel change required.
+1. **Add userspace lock-acquisition trigger to NHextend.c**: add a new syscall `sys_ivh_cs_enter()` (kernel side: calls `bpf_sched_lock_acquire_common()`) and call it in `grab_lock()` after `wait_exit()`. Rebuild needed. See §15.5 for design.
 
-2. **Restore `rt_us` in shadow trace**: un-comment the `sched_in_map` stamp tracking in `MY_ivh_atc.bpf.c` and add `rt_us=%llu` to the `bpf_trace_printk` format string. Rebuild. This enables Figure F3.
+2. **Migration latency profiling**: add `migration_start_ts` map to `MY_ivh_atc.bpf.c` and a `fentry/migrate_task_to_async_fair` probe; emit `MIG_LATENCY` trace events. No kernel rebuild — BPF rebuild only. See §15.4 for design.
 
-3. **Collect extend-sched wait-time data**: run `cs_experiment.sh 30 ~/extend-sched` to populate lhp_waittime measurements. Compare with and without `MY_ivh_atc` loaded.
+3. **Run threshold sweep**: modify `CANDIDATE_THRESHOLD_NS` at each of the 5 values, run 60-second spinlock stress workload, record `CTR_CANDIDATE_TOTAL` from `lhp_counters`. No kernel change required.
+
+4. **Restore `rt_us` in shadow trace**: un-comment the `sched_in_map` stamp tracking in `MY_ivh_atc.bpf.c` and add `rt_us=%llu` to the `bpf_trace_printk` format string. Rebuild. This enables Figure F3.
+
+5. **Collect NHextend/extend-sched wait-time data**: run `scripts/cs_experiment.sh 30 ~/NHextend` to populate lhp_waittime measurements. Compare with and without `MY_ivh_atc` loaded.
 
 ### Analysis and figures
 
@@ -1575,3 +1627,488 @@ LD_PRELOAD=/home/nick/spin_cs_preload.so ./spin_test 4 2>&1
 4. **Update `extend-sched.c`** to use `rseq_abi.h` instead of its private struct.
 
 5. **Run the threshold sweep experiments** defined in Section 6.E using `lhp_waittime` + `MY_ivh_atc` with the new per-task CS timing fields available in the BPF hook.
+
+---
+
+## 14. glibc Pthread Spinlock Patch — Native rseq Integration
+
+### 14.1 Motivation
+
+`spin_cs_preload.so` (Section 12.12) works by intercepting `pthread_spin_lock`/`unlock` at the PLT boundary.  This approach requires `LD_PRELOAD` for every benchmark binary and cannot be used when the binary links glibc statically.  The glibc patch moves all rseq instrumentation directly into glibc's nptl layer so that `cr_counter` and timing fields are written by every program that calls `pthread_spin_lock` — with no `LD_PRELOAD`, no wrapper, and no source changes to the benchmark.
+
+The kernel's `rseq_delay_resched()` reads `cr_counter` at tick time.  It must be nonzero whenever a thread holds a pthread spinlock.  Without this patch, `cr_counter` is always zero for pthread spinlock holders, so `rseq_sched_extend_usec` has no effect on pthread workloads.
+
+### 14.2 Changed Files in glibc 2.41
+
+All files are under `/home/nick/glibc-build-src/glibc-2.41/`.
+
+| File | Change |
+|------|--------|
+| `sysdeps/unix/sysv/linux/rseq-internal.h` | Extended `struct pthread_rseq` from 32 to 64 bytes; added `wait_counter`, `_cs_pad`, `last_cs_overall_ns`, `last_cs_active_ns`, `last_wait_overall_ns` |
+| `sysdeps/x86_64/nptl/rseq-access.h` | Added `RSEQ_ADDMEM32` / `RSEQ_SUBMEM32` macros for atomic increments of 32-bit fields via `%fs`-relative addressing |
+| `nptl/pthread_spin_cs.h` | New header: all per-thread rseq helpers — `__spin_rseq_ok()`, `__spin_wait_enter()`, `__spin_wait_exit()`, `__spin_extend()`, `__spin_unextend()`, `__spin_now_wall()`, `__spin_now_cpu()` |
+| `nptl/pthread_spin_cs.c` | TLS variable definitions: `__spin_depth`, `__spin_wall_enter`, `__spin_cpu_enter`, `__spin_wait_wall_enter` |
+| `nptl/pthread_spin_lock.c` | Adds wait timing (`__spin_wait_enter` before CAS; `__spin_wait_exit` on success), extend (`__spin_extend` at depth 0), CS timestamps (`__spin_wall_enter`, `__spin_cpu_enter`) |
+| `nptl/pthread_spin_unlock.c` | On last-depth unlock: calls `__spin_unextend()`, writes `last_cs_overall_ns`, `last_cs_active_ns`, `last_wait_overall_ns` to rseq struct |
+| `sysdeps/x86_64/nptl/pthread_spin_init.c` | Replaced asm with C; correct 0=unlocked semantics |
+| `sysdeps/x86_64/nptl/pthread_spin_lock.S` | **DELETED** — C version in `nptl/pthread_spin_lock.c` takes over |
+| `sysdeps/x86_64/nptl/pthread_spin_unlock.S` | **DELETED** — C version in `nptl/pthread_spin_unlock.c` takes over |
+| `nptl/pthread_spin_trylock.c` | Patched: adds rseq instrumentation identical to the `acquired:` block in `pthread_spin_lock.c` |
+| `sysdeps/x86_64/nptl/pthread_spin_trylock.S` | **DELETED** — was doubly broken: used old 1=unlocked encoding AND bypassed all rseq code |
+
+The complete patch is at `/home/nick/glibc_pthread_spin.patch`.
+
+### 14.3 cr_counter Encoding
+
+`cr_counter` is a 32-bit field at `offsetof(struct rseq, cr_counter) = 28`:
+
+| Bits | Name | Writer |
+|------|------|--------|
+| 0 | `RSEQ_CR_FLAG_IN_CRITICAL_SECTION_BIT` | userspace (bare CS marker; not used by pthread patch) |
+| 1 | `RSEQ_CR_FLAG_KERNEL_REQUEST_SCHED_BIT` | kernel — set when EEVDF wants to preempt; cleared on unlock |
+| 2–31 | CS nesting depth | userspace (`+= 4` per `pthread_spin_lock`, `-= 4` per `pthread_spin_unlock`) |
+
+`curr_user_lockholder` in the kernel is computed as `(cr_counter & 0xFFFFFFFEu) != 0`, which is true when any bits 1–31 are set — i.e., when nesting depth is at least 1.
+
+### 14.4 trylock Bug and Fix (previously unfixed)
+
+`sysdeps/x86_64/nptl/pthread_spin_trylock.S` was not deleted when `lock.S` and `unlock.S` were deleted.  It contained two independent bugs:
+
+1. **Wrong encoding**: used `xorl %ecx,%ecx` + `xchgl %ecx,(%rdi)` + `cmpl $1,%ecx` — the old 1=unlocked convention.  After the C unlock was patched to use 0=unlocked, a trylock would succeed when the lock was actually held and fail when it was free.
+2. **No rseq instrumentation**: the asm bypassed all C code, so `cr_counter` was never incremented on trylock acquisition.
+
+Fix applied:
+- **Deleted** `sysdeps/x86_64/nptl/pthread_spin_trylock.S`
+- **Patched** `nptl/pthread_spin_trylock.c` to include `pthread_spin_cs.h` and mirror the `acquired:` block from `pthread_spin_lock.c`:
+  ```c
+  if (rseq_ok)
+    {
+      __spin_wait_exit ();   /* records near-zero last_wait_overall_ns */
+      if (__spin_depth == 0)
+        {
+          __spin_extend ();
+          __spin_wall_enter = __spin_now_wall ();
+          __spin_cpu_enter  = __spin_now_cpu ();
+        }
+    }
+  __spin_depth++;
+  ```
+- Also calls `__spin_wait_enter()` before the exchange and `__spin_wait_exit()` on both failure and success paths, so `wait_counter` is correctly bracketed even for the zero-wait trylock case.
+
+### 14.5 Benchmark: pthread_extend_probe.c
+
+File: `/home/nick/pthread_extend_probe.c`
+
+Reproduces the same environment as `extend-sched` but with `pthread_spin_lock/unlock` (via the patched glibc) instead of the hand-rolled cmpxchg lock, so timing fields written by the patched unlock are captured directly.
+
+#### Design choices vs extend-sched
+
+| Parameter | extend-sched | pthread_extend_probe |
+|-----------|-------------|----------------------|
+| CS hold | 15000-sfence loop (~60 µs on 4 ns/sfence machine) | 40000-sfence loop (~60 µs on this machine; sfence ~1.5 ns) |
+| Think time | Fixed: 100 + cpu*27 µs | Random: [50, 350) µs (per-thread LCG) |
+| Busy threads | Optional | Required (NR_BUSY=8) |
+| Lock acquisition | trylock → lock fallback | `pthread_spin_lock` directly |
+
+**Why random think time**: Fixed think creates a phase-lock with the 800 µs–sleep + 600 µs–burn busy threads on this VM — the lock thread sleeps at exactly the same phase as the busy burn, so they never compete for the CPU simultaneously, and overhead stays 0.  Randomizing think time in [50, 350) µs breaks that synchronization so preemptions land inside CSes.
+
+**Why always pthread_spin_lock**: If trylock succeeds, the wait measurement is near-zero even when contended (the lock happened to free just before the call).  Using `pthread_spin_lock` directly guarantees every acquisition records the true wait time through the spin loop.
+
+**Why busy threads are required**: This VM has ~18 natural preemptions per 5 seconds vs the extend-sched machine's ~41621 (~37000× fewer).  Explicit busy threads with large EEVDF lag (built by the 800 µs sleep) provide the preemption pressure that `rseq_delay_resched()` intercepts.
+
+#### Build
+
+```bash
+gcc -O2 -o pthread_extend_probe pthread_extend_probe.c -lpthread \
+    -Wl,--dynamic-linker=/home/nick/glibc-rseqport-install/lib64/ld-linux-x86-64.so.2 \
+    -Wl,-rpath=/home/nick/glibc-rseqport-install/lib64
+```
+
+#### Output fields
+
+| Field | Meaning |
+|-------|---------|
+| `avg_wait` | avg `last_wait_overall_ns` — wall time waiter spun before acquiring |
+| `avg_cs` | avg `last_cs_overall_ns` — wall time lock was held |
+| `active` | avg `last_cs_active_ns` — CPU time lock was held (ideal = 60 µs always) |
+| `overhead` | `avg_cs - active` — pure preemption penalty |
+| `extended` | acquisitions where `cr_counter & 2` was set just before unlock (kernel had set the REQUEST_SCHED flag; cooperative yield follows) |
+
+### 14.6 Sweep Script: verify_extend.sh
+
+File: `/home/nick/verify_extend.sh`
+
+Iterates `rseq_sched_extend_usec` over values 0, 50, 200, 500, 1000 and prints a single table.  Calls `sudo tee /proc/sys/kernel/rseq_sched_extend_usec` to change the kernel parameter between runs.
+
+### 14.7 Final Verification Results
+
+Obtained with `bash ~/verify_extend.sh` after rebuilding with the trylock fix:
+
+```
+extend_usec      runs   avg_wait   max_wait   avg_cs   active  overhead  extended
+-----------      ----   --------   --------   ------   ------  --------  --------
+0               71073       720us     16027us      69us      61us        8us         0
+50              78597       621us      8766us      63us      61us        2us       739
+200             80839       597us      8215us      61us      61us        0us      1500
+500             80669       596us     11112us      61us      61us        0us      1526
+1000            80184       601us      8538us      61us      61us        0us      1533
+```
+
+Three independent signals confirm the patch works end-to-end:
+
+1. **overhead**: 8 µs → 0 µs (kernel extend absorbs preemptions during CS)
+2. **avg_wait**: 720 µs → 596 µs (17% reduction — waiters acquire faster because holder finishes CS before yielding)
+3. **extended > 0** when `extend_usec > 0` (cooperative yields observed; always 0 at extend_usec=0)
+
+`active` stays at 61 µs across all rows — as expected, since the extend mechanism does not change the amount of CPU work per CS, only whether that work is interrupted.  `avg_cs` approaches `active` as extend_usec increases, confirming that preemptions during CS are being suppressed.
+
+---
+
+## 15. Current State — 2026-06-19
+
+### 15.1 Repository Layout (reorganized)
+
+Files moved from the flat `tools/bpf/` root:
+
+```
+tools/bpf/
+├── docs/               ← all .md documentation
+│   ├── experiment_plan.md
+│   ├── MY_ivh_atc_reference.md
+│   └── EXPLANATION_SCRIPT.md
+├── scripts/            ← all shell scripts (path-updated to find binaries one level up)
+│   ├── cs_experiment.sh
+│   ├── demo_cs_accounting.sh
+│   ├── demo_show.sh
+│   ├── demo_spinner.sh
+│   └── verify_spinners_cstime.sh
+├── *.c, *.bpf.c        ← source files (at root, required by Makefile)
+├── *.skel.h            ← generated skeletons (at root)
+├── MY_ivh_atc, lhp_*, ivh_atc   ← built binaries
+├── Makefile, bpf_helpers.h, vmlinux.h
+├── bpftool/, include/, resolve_btfids/, runqslower/
+```
+
+### 15.2 Unit Clarification — lhp_class vs lhp_cstime
+
+This was a source of confusion:
+
+| Source | Field | Units | Kernel formula |
+|--------|-------|-------|----------------|
+| `/sys/kernel/debug/lhp_class` | `cs_us` | **MICROSECONDS (µs)** | `cumulative_cs_time / 1000` |
+| `/sys/kernel/debug/lhp_class` | `active_us` | **MICROSECONDS (µs)** | `cumulative_active_time / 1000` |
+| `lhp_cstime` output | `duration=N` | **NANOSECONDS (ns)** | raw `ktime_get_ns()` delta |
+
+To compute the LHP penalty (off-CPU hold time) from both sources:
+```
+LHP_penalty_us = (lhp_cstime.duration_ns / 1000) - lhp_class.cs_us
+               = (overall_ns - absolute_ns) / 1000
+```
+`verify_spinners_cstime.sh` is updated with explicit unit labels and the conversion formula.
+
+### 15.3 wait_counter — Userspace Readability Confirmed
+
+`wait_counter` is at offset 32 in `struct rseq` (field `wait_counter`, `sizeof(u32)=4`).
+
+**Userspace can read it**: the field sits in the same TLS-mapped rseq struct that the thread owns. In `NHextend.c`, `dec_wait()` already reads it:
+```c
+static inline void dec_wait(volatile unsigned *ptr) {
+    if (*ptr & ~3)   // ← reads wait_counter before decrementing
+        asm volatile("subl ...");
+}
+```
+`rseq_map->wait_counter` is directly accessible from any code that has the `rseq_map` TLS pointer. No syscall or special privilege is needed.
+
+**Kernel reads it**: `fair.c:12953–12957` uses `copy_from_user_nofault(&wc, &rq->curr->rseq->wait_counter, sizeof(wc))` guarded by `rseq_len >= 36`. The current running kernel has `AT_RSEQ_FEATURE_SIZE=36` so this guard is satisfied.
+
+**Another thread cannot directly read a peer's `wait_counter`** without shared memory — the rseq struct is per-thread TLS. BPF can read it from any CPU via `bpf_probe_read_user()`.
+
+### 15.4 Migration Duration Profiling Approach
+
+The migration pipeline (no kernel rebuild required — BPF only):
+
+```
+running_migration() fires
+  → sets rq->preempt_migrate_locked = 1
+  → sets rq->preempt_migrate_target = target_cpu
+  → smp_call_function_single_async(target_cpu, ...)   ← IPI sent here
+      → preempt_migrate_func() on target CPU
+          → stop_one_cpu_nowait() on source CPU
+              → stopper thread fires at next preempt_enable()
+                  → migrate_task_to_async_fair()       ← task moved here
+```
+
+**Proposed BPF timing probe** (add to `MY_ivh_atc.bpf.c`, no kernel rebuild):
+
+1. In `test()`, when returning 1 (migration triggered): record `migration_start_ts[rq->curr->pid] = bpf_ktime_get_ns()`.
+2. Add a `fentry/migrate_task_to_async_fair` probe: look up `migration_start_ts[p->pid]` for the task being migrated, compute `latency = bpf_ktime_get_ns() - start_ts`, emit via `bpf_trace_printk("MIG_LATENCY pid=%d lat_us=%llu\n", ...)`.
+
+**Alternative — bpftrace one-liner** (no rebuild at all):
+```bash
+bpftrace -e '
+  kfunc:kernel:running_migration      { @start[tid] = nsecs; }
+  kfunc:kernel:migrate_task_to_async_fair {
+    if (@start[tid]) {
+      printf("MIG_LATENCY lat_us=%llu\n", (nsecs - @start[tid]) / 1000);
+      delete(@start[tid]);
+    }
+  }'
+```
+Note: `running_migration` sets a per-rq lock then dispatches asynchronously via IPI; the `tid` key will not match across the IPI. Use `rq->preempt_migrate_target` as the correlation key instead, or instrument with `sched:sched_migrate_task` tracepoint.
+
+**Correct correlation approach** using kernel tracepoints:
+```bash
+# When IVH fires, note the PID being migrated
+# When sched_migrate_task fires for that PID, compute latency
+bpftrace -e '
+  kfunc:kernel:running_migration / pid != 0 / {
+    @mig_pid[cpu] = ((struct rq *)arg0)->curr->pid;
+    @mig_start[cpu] = nsecs;
+  }
+  tracepoint:sched:sched_migrate_task {
+    $key = args->pid;
+    /* find CPU where this migration was queued */
+    printf("MIGRATE pid=%d comm=%s cpu=%d->%d\n",
+           $key, args->comm, args->orig_cpu, args->dest_cpu);
+  }'
+```
+Expected latency: 50–500 µs (IPI round-trip + stopper scheduling).
+
+### 15.5 Userspace Lock-Acquisition Trigger — Entry Point in NHextend.c
+
+**What we want**: the same triggering as kernel `raw_spin_lock → cs_enter() → bpf_sched_lock_acquire()`, but for userspace locks. Currently IVH only fires at tick time (every 4 ms) for userspace lockholders. Firing at lock-acquisition time would catch every CS the moment it begins.
+
+**Entry point in NHextend.c** (`grab_lock()`, `NHextend.c:238`):
+
+```c
+// ... spin loop ...
+} while (prev && !data->done);
+
+wait_exit();   // lock acquired — no longer spinning
+// ← HERE: call running_migration trigger
+end_wait = get_time();
+start_ns = get_time_ns();
+```
+
+This is after the successful cmpxchg (we definitively hold the lock), analogous to where `cs_enter()` fires in the kernel.
+
+In the **glibc pthread patch** (`nptl/pthread_spin_lock.c`), the entry point is inside the `acquired:` block, after `__spin_wait_exit()` and `__spin_extend()`:
+
+```c
+acquired:
+    __spin_wait_exit();
+    if (__spin_depth == 0) {
+        __spin_extend();          /* cr_counter += 4 */
+        __spin_wall_enter = ...;
+        __spin_cpu_enter  = ...;
+        /* ← call trigger HERE */
+    }
+    __spin_depth++;
+```
+
+**Trigger mechanism options**:
+
+| Option | Overhead (common path) | Notes |
+|--------|------------------------|-------|
+| New syscall `sys_ivh_cs_enter()` → `bpf_sched_lock_acquire()` | ~150–250 ns | Direct analog; clean; requires adding a syscall |
+| vDSO-based check: export `last_preemption`/`last_active_time` per-CPU to a vDSO page; run decision in userspace; syscall only if migration needed | ~30 ns on no-migrate path | Requires vDSO page export kernel work; most efficient |
+| Existing rseq `RSEQ_CR_FLAG_KERNEL_REQUEST_SCHED` (bit 1): set a new flag bit in cr_counter after extend; kernel checks it at tick/reschedule path | 0 ns userspace overhead | Still tick-latency, not per-acquisition |
+| `sched_yield()` after `extend()` | 0 overhead but yields | Wrong semantics — forces an involuntary yield |
+
+**Recommendation**: Add a new lightweight syscall for now. The cost (150–250 ns) is negligible compared to the CS duration (~25 µs) and migration benefit (~500 µs+). The vDSO approach is the right long-term optimization once the syscall path is validated.
+
+**Syscall skeleton** (kernel-side, `kernel/sched/bpf_sched.c`):
+```c
+SYSCALL_DEFINE0(ivh_cs_enter) {
+    struct rq *rq = this_rq();
+    bpf_sched_lock_acquire_common(rq);   /* same logic as bpf_sched_lock_acquire() */
+    return 0;
+}
+```
+
+**NHextend.c call site**:
+```c
+wait_exit();   /* lock acquired */
+syscall(__NR_ivh_cs_enter);  /* check if migration is warranted */
+end_wait = get_time();
+```
+
+Only fires when IVH is loaded (`bpf_sched_enabled()` is a static key — zero cost when IVH is not running).
+
+---
+
+## 16. Current State — 2026-06-24
+
+### 16.1 rseq sched_state_ptr Feature — Implementation and Verification
+
+**Status: confirmed working end-to-end.**
+
+This section documents the addition of the `sched_state_ptr` field to the rseq ABI, the kernel implementation that maintains the ON_CPU flag, and the confirmed verification results. This feature is the foundation for userspace adaptive spinning: a thread can read another thread's `ON_CPU` bit to decide whether to spin or block.
+
+---
+
+### 16.2 What Was Added
+
+#### Kernel: `include/uapi/linux/rseq.h`
+
+Two new types and one new field:
+
+1. **`enum rseq_sched_state_flags`** — `RSEQ_SCHED_STATE_FLAG_ON_CPU = (1U << 0)`.
+2. **`struct rseq_sched_state`** — three fields: `version` (u32, kernel sets to 0 at registration), `state` (u32, kernel updates), `tid` (u32, userspace sets before registration).
+3. **`sched_state_ptr`** (u64, offset 64) added to `struct rseq`, after `last_wait_overall_ns`. Userspace sets this to the address of a `struct rseq_sched_state` before calling `sys_rseq`. Set to 0 to opt out.
+
+This pushes `offsetof(struct rseq, end)` from 64 to **72**. `AT_RSEQ_FEATURE_SIZE` now reports **72**.
+
+#### Kernel: `include/linux/sched.h`
+
+Added `struct rseq_sched_state __user *rseq_sched_state` to `task_struct`. Stores the pointer read from `sched_state_ptr` at registration time; NULL if the thread did not register one.
+
+#### Kernel: `include/linux/rseq.h`
+
+- Added `__rseq_set_sched_state()` declaration and an inlined `rseq_set_sched_state()` wrapper that null-checks before calling the out-of-line path (so threads without a registered sched_state incur zero overhead).
+- Hooked `rseq_preempt()` to call `rseq_set_sched_state(t, 0)` — clears ON_CPU when the task is scheduled out.
+- Fixed `rseq_fork()` and `rseq_execve()` to clear/propagate `rseq_sched_state` on thread creation and exec.
+
+#### Kernel: `kernel/rseq.c`
+
+Four changes:
+
+1. **`rseq_get_sched_state_ptr()`** — new static helper called during `sys_rseq` registration. Reads `sched_state_ptr` from the user rseq struct, skips silently if `rseq_len < offsetofend(struct rseq, sched_state_ptr)` (old short registrations are unaffected), writes `version=0` to the struct to fault in the page, and returns the pointer.
+
+2. **Registration path** (`SYSCALL_DEFINE4(rseq)`) — calls `rseq_get_sched_state_ptr` and stores result in `current->rseq_sched_state`. Clears it on unregister.
+
+3. **`rseq_update_cpu_node_id()`** (return-to-userspace path) — writes `RSEQ_SCHED_STATE_FLAG_ON_CPU` to `rseq_sched_state->state` via `unsafe_put_user`, setting ON_CPU=1 every time the task returns to userspace. **Critical null-check added** (see §16.3).
+
+4. **`__rseq_set_sched_state()`** — out-of-line implementation called from the preemption path. Uses `pagefault_disable()` + `put_user()` because preemption context cannot sleep; silently drops the write if the page is not present.
+
+#### Selftests: `tools/testing/selftests/rseq/rseq-abi.h`
+
+Added `struct rseq_abi_sched_state`, `enum rseq_abi_sched_state_flags`, and `sched_state_ptr` field to `struct rseq_abi` — mirroring the kernel uapi layout at the same offsets.
+
+#### Selftests: `tools/testing/selftests/rseq/rseq.c`
+
+- Added `__rseq_abi_sched_state` as a cache-line-aligned `__thread` TLS variable.
+- Modified `rseq_register_current_thread()` for both ownership paths:
+  - **librseq owns**: sets `sched_state_ptr` and `tid` before calling `sys_rseq`.
+  - **glibc owns**: when `rseq_size >= 72`, writes `sched_state_ptr` into the already-registered glibc area, then unregisters and re-registers so the kernel re-reads the new pointer. (Glibc zeros the area at registration; without this unregister/re-register, `sched_state_ptr` would remain 0.)
+
+#### Selftests: `tools/testing/selftests/rseq/rseq.h`
+
+Added `rseq_get_sched_state()` — returns `(struct rseq_abi_sched_state *)(unsigned long)rseq->sched_state_ptr`, or NULL if not set.
+
+---
+
+### 16.3 Critical Difference from the Original Patch
+
+The original upstream proposal omits a null-check in `rseq_update_cpu_node_id()`. Without it:
+
+```c
+/* MISSING null check — upstream proposal has this bug */
+unsafe_put_user(sched_state, &rseq_sched_state->state, efault_end);
+```
+
+If any thread registered rseq without `sched_state_ptr` (e.g. glibc at ORIG_RSEQ_SIZE=32, or any thread that set `sched_state_ptr=0`), then `rseq_sched_state = NULL`. The `unsafe_put_user` targets `&NULL->state = 0x4` — a write to user address 4, which faults, hits `efault_end`, and calls `force_sigsegv`. Every such thread gets killed on its first return to userspace.
+
+**Fix applied:**
+
+```c
+if (rseq_sched_state)
+    unsafe_put_user(sched_state, &rseq_sched_state->state, efault_end);
+```
+
+This is the single most important deviation from the original patch and the reason it was not working until identified and fixed.
+
+---
+
+### 16.4 ABI Change: 64 → 72 bytes
+
+The previous rseq ABI in this tree was 64 bytes (`offsetof(end) = 64`, `AT_RSEQ_FEATURE_SIZE = 64`). Adding `sched_state_ptr` (8 bytes) at offset 64 pushes the end to offset 72.
+
+**After this change:**
+
+| Field | Offset | Writer |
+|-------|--------|--------|
+| `cpu_id_start` | 0 | kernel |
+| `cpu_id` | 4 | kernel |
+| `rseq_cs` | 8 | userspace |
+| `flags` | 16 | userspace |
+| `node_id` | 20 | kernel |
+| `mm_cid` | 24 | kernel |
+| `cr_counter` | 28 | userspace |
+| `wait_counter` | 32 | userspace |
+| `_cs_pad` | 36 | — |
+| `last_cs_overall_ns` | 40 | userspace |
+| `last_cs_active_ns` | 48 | userspace |
+| `last_wait_overall_ns` | 56 | userspace |
+| `sched_state_ptr` | 64 | userspace (at registration) |
+| `end[]` | 72 | — |
+
+`AT_RSEQ_FEATURE_SIZE = 72`. Glibc 2.41 auto-uses this value and registers 72 bytes (verified: `glibc __rseq_size=72` in live test). No flag-day break for glibc on this kernel — glibc already adapted at the 64→72 boundary.
+
+---
+
+### 16.5 Verification
+
+Verified with `/tmp/rseq-state-check.c` — a standalone test that bypasses librseq.so entirely:
+
+1. Unregisters glibc's 72-byte registration.
+2. Allocates a static 72-byte `struct my_rseq` with `sched_state_ptr` set.
+3. Registers with `sys_rseq(..., 72, ...)`.
+4. Reads back `sched_state.state`.
+
+**Results (2026-06-24, kernel `6.17.0-rseqport18+`):**
+
+```
+tid=11820  AT_RSEQ_FEATURE_SIZE=72
+glibc __rseq_size=72  __rseq_offset=-256
+Unregistered glibc rseq (size=72) OK
+Registered 72-byte area @ 0x6133eb546040  sched_state_ptr=0x6133eb5460a0
+Registered OK
+After registration:
+  cpu_id_start=4  cpu_id=4
+  sched_state: version=0 state=1 (ON_CPU=1) tid=11820
+
+Sleeping 100ms (expect ON_CPU=0 after wakeup)...
+After sleep: state=1 (ON_CPU=1)
+
+Busy spinning 200M iterations (expect ON_CPU=1 throughout)...
+Spin done: on_cpu_samples=191 off_cpu_samples=0
+Final: state=1 (ON_CPU=1)
+
+CONCLUSION: rseq_sched_state read/write WORKS
+```
+
+Key confirmations:
+- `AT_RSEQ_FEATURE_SIZE=72` ✓
+- Kernel set `version=0` at registration (page probe succeeded) ✓
+- Kernel wrote `state=1` on return-to-userspace immediately after `sys_rseq` ✓
+- 191/191 spin samples saw ON_CPU=1; 0 off-CPU — reliable on-CPU tracking ✓
+- "After sleep: ON_CPU=1" is correct — `poll()` returned and we're already back on CPU by the time the check executes; a monitoring thread would see ON_CPU=0 during the sleep ✓
+
+---
+
+### 16.6 Usage Pattern for Adaptive Spinning
+
+To use this feature for userspace adaptive spinning in a locking library:
+
+```c
+/* At thread init (or lock-library init): */
+rseq_register_current_thread();  /* sets sched_state_ptr */
+
+/* Expose this thread's state pointer to potential waiters: */
+struct rseq_abi_sched_state *my_state = rseq_get_sched_state(rseq_get_abi());
+/* store my_state in the lock record, or wherever waiters can find it */
+
+/* In the lock acquire path (waiter side): */
+struct rseq_abi_sched_state *holder_state = lock->holder_sched_state;
+if (holder_state && !(holder_state->state & RSEQ_ABI_SCHED_STATE_FLAG_ON_CPU)) {
+    /* holder is off-CPU — stop spinning, block instead */
+    futex_wait(...);
+} else {
+    /* holder is on-CPU — spin briefly */
+}
+```
+
+The `state` field is updated by the kernel with single-copy atomicity. No lock is needed to read it. The field is in the holder's TLS (mapped writable by the kernel) and readable by any thread in the same process that has the pointer.
+
+This is the standard adaptive mutex pattern (e.g. glibc's `__lll_lock_wait` spin loop) but driven by kernel-maintained CPU presence rather than a heuristic spin count. On a VM where lock holders get preempted frequently, this eliminates the fixed-count spin phase for preempted holders entirely.

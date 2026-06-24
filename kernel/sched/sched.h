@@ -114,6 +114,7 @@ extern void set_custom_capacity(unsigned long custom_capacity, int cpu);
 extern void get_steal_and_preemptions(int cpunum, u64 *preempt, u64 *steals_time);
 extern void get_max_latency(int cpunum, u64 *max_latency);
 extern void set_avg_latency(int cpunum, u64 avg_latency);
+extern void set_ewma_act_ns(int cpu, u64 ewma_act_ns);
 extern int  get_average_capacity_all(void);
 extern void set_average_capacity_all(int av_capacity);
 extern void reset_max_latency(u64 max_latency);
@@ -1360,6 +1361,7 @@ struct rq {
     u64           clock_preempt;
     unsigned long last_idle_tp;
     u64           last_preemption;
+    u64           ewma_act_ns;     /* EWMA active burst duration in ns; written by vsched_module via set_ewma_act_ns() */
     u64           last_active_time;
 
     /* vSched / vProber data */

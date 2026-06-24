@@ -12864,17 +12864,13 @@ int migrate_task_to_async_fair(void *data)
 	struct task_struct *p = NULL;
 	struct rq_flags rf;
 
-	rq_lock_irq(busiest_rq, &rf);
+	rq_lock_irqsave(busiest_rq, &rf);
 	/*
 	 * Between queueing the stop-work and running it is a hole in which
 	 * CPUs can become inactive. We should not move tasks from or to
 	 * inactive CPUs.
 	 */
 	if (!cpu_active(busiest_cpu))
-		goto out_unlock;
-
-	/* Make sure the requested CPU hasn't gone down in the meantime: */
-	if (unlikely(busiest_cpu != smp_processor_id()))
 		goto out_unlock;
 
 	/* Is there any task to move? */
@@ -12912,7 +12908,7 @@ int migrate_task_to_async_fair(void *data)
 	rcu_read_unlock();
 out_unlock:
 	busiest_rq->preempt_migrate_locked = 0;
-	rq_unlock(busiest_rq, &rf);
+	rq_unlock_irqrestore(busiest_rq, &rf);
 	if (p) {
 		attach_one_task(target_rq, p);
 		target_rq->avg_wakeup_latency =
@@ -12921,7 +12917,6 @@ out_unlock:
 		target_rq->avg_wakeup_latency = (unsigned long)-1UL;
 	}
 	atomic_fetch_andnot(PRMPT_HELD_MASK, prmpt_flags(target_cpu));
-	local_irq_enable();
 	return 0;
 }
 
@@ -12958,6 +12953,7 @@ int running_migration(struct rq *rq)
 #endif
                 int curr_lockholder = curr_kernel_lockholder || curr_user_lockholder;
                 int curr_waiter = (rq->curr->wait_depth > 0) || curr_user_waiter;
+                (void)curr_waiter; /* available to pass to select_run_cpu_spin hook */
 
                 /* classify and snapshot for debugfs */
                 {
@@ -12982,38 +12978,37 @@ int running_migration(struct rq *rq)
                         snap->cumulative_active_time = rq->curr->cumulative_active_time;
                 }
 
-                should_run = bpf_sched_cfs_sched_tick_end(
-                                rq,
-                                now_time,
-#ifdef CONFIG_NO_HZ_COMMON
-                                cpumask_weight(nohz.idle_cpus_mask),
-#else
-                                0,
-#endif
-                                curr_lock_depth,
-                                curr_kernel_lockholder,
-                                curr_user_lockholder,
-                                curr_lockholder,
-                                curr_waiter);
+                /*
+                 * cpu_capacity gate (Gate 1 in bpf_sched_lock_acquire) already
+                 * ensures we only reach here on a throttled vCPU.  The old
+                 * util_avg >= 60% filter was added to block JIT workers whose
+                 * mmap/mprotect/madvise calls spread mm->cpu_bitmap, triggering
+                 * TLB flush IPIs on IRQ-disabled CPUs (soft lockup 2026-06-23).
+                 * That concern is now handled by:
+                 *   - mm_cpumask gate in process_cpu() (BPF): only migrate user
+                 *     tasks to CPUs already in mm->cpu_bitmap, so no new TLB
+                 *     flush targets are ever introduced.
+                 *   - jit_tgids banlist + detect_jit kprobe: JIT processes are
+                 *     excluded from migration entirely regardless of util_avg.
+                 * Removing util_avg allows low-util lockholders (e.g. I/O servers
+                 * that sleep between requests but hold spinlocks during completion)
+                 * to be migrated off throttled vCPUs, which was the original goal.
+                 */
+                should_run = curr_lockholder ? 1 : 0;
         }
-
-        pr_info_ratelimited("ivh: tick_end cpu=%d now=%llu should_run=%d locked=%d\n",
-                            cpu, now_time, should_run,
-                            rq->preempt_migrate_locked);
 
         if (!should_run || rq->preempt_migrate_locked == 1)
                 return 0;
 
         /* helper hook to determine if selection process should be spin-locked or not */
         should_spin_lock = bpf_sched_cfs_should_spinlock(1);
-        pr_info_ratelimited("ivh: spin_decision cpu=%d spin=%d\n",
-                            cpu, should_spin_lock);
 
         nr_ivh += 1;
 
         /* Spinlock pass */
         if (should_spin_lock) {
-                raw_spin_lock(&my_spinlock);
+                unsigned long my_spinlock_flags;
+                raw_spin_lock_irqsave(&my_spinlock, my_spinlock_flags);
 
                 /* Target selection hook */
                 target_cpu = bpf_sched_cfs_select_run_cpu_spin(
@@ -13021,13 +13016,10 @@ int running_migration(struct rq *rq)
                                 average_capacity_all,
                                 num_online_cpus());
 
-                pr_info_ratelimited("ivh: spin_select cpu=%d target=%d\n",
-                                    cpu, target_cpu);
-
                 if (target_cpu != -1)
                         atomic_fetch_or(PRMPT_HELD_MASK, prmpt_flags(target_cpu));
 
-                raw_spin_unlock(&my_spinlock);
+                raw_spin_unlock_irqrestore(&my_spinlock, my_spinlock_flags);
         } else {
                 /* non-spinlock variant to IVH selection (off by default) */
                 int max = -1;
@@ -13045,9 +13037,6 @@ int running_migration(struct rq *rq)
                         cpu_rq = cpu_rq(iterate_cpu);
                         tmpmax = bpf_sched_cfs_select_run_cpu(
                                         rq, cpu_rq, now_time, max);
-
-                        pr_info_ratelimited("ivh: select_run src_cpu=%d cand_cpu=%d tmpmax=%d max=%d\n",
-                                            cpu, iterate_cpu, tmpmax, max);
 
                         if (tmpmax > -1) {
                                 flags = atomic_fetch_or(
@@ -13068,9 +13057,6 @@ int running_migration(struct rq *rq)
         }
 
         nr_ivh -= 1;
-
-        pr_info_ratelimited("ivh: final cpu=%d target_cpu=%d\n",
-                            cpu, target_cpu);
 
         /* found a target cpu, start migration process */
         if (target_cpu != -1) {
@@ -13099,9 +13085,6 @@ void sched_balance_trigger(struct rq *rq)
 	 */
 	if (unlikely(on_null_domain(rq) || !cpu_active(cpu_of(rq))))
 		return;
-
-        if (bpf_sched_enabled())
-		running_migration(rq);
 
 	if (time_after_eq(jiffies, rq->next_balance))
 		raise_softirq(SCHED_SOFTIRQ);

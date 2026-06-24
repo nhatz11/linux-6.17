@@ -1410,6 +1410,12 @@ struct task_struct {
 	 * with respect to preemption.
 	 */
 	unsigned long rseq_event_mask;
+	/*
+	 * Pointer to the userspace rseq_sched_state structure, or NULL if
+	 * the thread did not register one.  Set at rseq registration from
+	 * struct rseq::sched_state_ptr; cleared on unregister and execve.
+	 */
+	struct rseq_sched_state __user *rseq_sched_state;
 # ifdef CONFIG_DEBUG_RSEQ
 	/*
 	 * This is a place holder to save a copy of the rseq fields for
@@ -1429,15 +1435,22 @@ struct task_struct {
 
 	/*
 	 * Kernel spinlock critical-section timing (outermost CS only).
-	 * cs_start_ts: ktime_get_ns() snapshot taken when lock_depth transitions
-	 *   0→1 (outermost acquire).  Reset to 0 on outermost release.
-	 * cumulative_cs_time: total nanoseconds spent inside kernel spinlock CSes,
-	 *   accumulated on each outermost unlock (lock_depth 1→0).
-	 * Invariant: cs_start_ts == 0 iff lock_depth == 0.
+	 * cs_start_ts: sched_clock() snapshot at outermost acquire; reset to 0 in
+	 *   prepare_task_switch() (paused) and reopened in finish_task_switch()
+	 *   (resumed).  Used for on-CPU accumulation into cumulative_cs_time.
+	 * cs_wall_start_ts: sched_clock() snapshot at outermost acquire; never
+	 *   touched by context-switch handlers.  Cleared only at outermost release.
+	 *   Mirrors rseq::last_cs_overall_ns semantics: wall-clock CS duration.
+	 * cumulative_cs_time: total on-CPU nanoseconds inside kernel spinlock CSes.
+	 * last_cs_ns: wall-clock duration of the most recently completed outermost
+	 *   CS (sched_clock() - cs_wall_start_ts at release).  Mirrors
+	 *   rseq::last_cs_overall_ns for kernel spinlocks.
 	 * Updated only in process context (!in_interrupt()) by spinlock.c.
 	 */
 	u64				cs_start_ts;
+	u64				cs_wall_start_ts;
 	u64				cumulative_cs_time;
+	u64				last_cs_ns;
 
 	/*
 	 * On-CPU (active) time accounting.

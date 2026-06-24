@@ -239,6 +239,170 @@ and the `sched_in_map` stamp-tracking code from git history, then rebuild with
 
 ---
 
+## glibc Pthread Spinlock Patch — Userspace cr_counter Coverage
+
+### What was patched
+
+The kernel reads `cr_counter` from the userspace rseq struct at tick time to determine whether the running task is holding a pthread spinlock.  Without instrumentation in glibc, `cr_counter` is always zero for pthread spinlock holders and the `curr_user_lockholder` gate never fires for pthread workloads.
+
+The following files in `/home/nick/glibc-build-src/glibc-2.41/` were patched so that every `pthread_spin_lock` acquisition increments `cr_counter` (via `__spin_extend()`) and every `pthread_spin_unlock` decrements it (via `__spin_unextend()`), plus writes timing fields to the rseq struct.
+
+### Coverage: pthread spinlock functions
+
+| Function | Coverage | Notes |
+|----------|----------|-------|
+| `pthread_spin_lock` | Fully instrumented | wait timing, extend, CS timestamps |
+| `pthread_spin_unlock` | Fully instrumented | unextend, writes last_cs_overall/active/wait_ns |
+| `pthread_spin_trylock` | Fully instrumented | `.S` asm deleted; C version patched with same `acquired:` block as lock.c |
+| `pthread_spin_init` | Replaced with correct C (0=unlocked) | `.S` asm deleted |
+| `pthread_spin_destroy` | No-op; no instrumentation needed | |
+
+### trylock asm was doubly broken
+
+`sysdeps/x86_64/nptl/pthread_spin_trylock.S` used the **old 1=unlocked** convention (`xorl %ecx,%ecx; xchgl %ecx,(%rdi); cmpl $1,%ecx`) and was never deleted when lock.S and unlock.S were deleted.  After the C implementations switched to 0=unlocked, the asm trylock would:
+- Succeed when the lock was held (saw old value 0 = C-unlocked, but compared it as 1 = asm-unlocked → mismatch)
+- Fail when the lock was free (saw old value 1 = C-locked, compared as 0 → mismatch)
+- Also bypass all rseq instrumentation regardless
+
+Fix: deleted the .S file so the C fallback (`nptl/pthread_spin_trylock.c`) takes over, then patched the C file to add the `__spin_extend()` / timestamp / depth tracking on the success path.
+
+### Timing fields written to rseq struct
+
+| Field | Offset | Writer | Meaning |
+|-------|--------|--------|---------|
+| `cr_counter` | 28 | lock/trylock (bits 2–31 = depth), kernel (bit 1) | lockholder depth + resched request |
+| `wait_counter` | 32 | lock/trylock (enter/exit bracket) | nonzero while spinning; observable from another CPU via BPF |
+| `last_cs_overall_ns` | 40 | unlock | wall time the lock was held (CLOCK_MONOTONIC delta) |
+| `last_cs_active_ns` | 48 | unlock | CPU time the lock was held (CLOCK_THREAD_CPUTIME_ID delta) |
+| `last_wait_overall_ns` | 56 | lock/trylock | wall time the caller spun before acquiring |
+
+All fields are in the extended rseq area (`offsetof(struct rseq, cr_counter)` through `offsetof(struct rseq, end)`).  The kernel validates `rseq_len >= 64` for full-feature registrations.
+
+### Verification
+
+`/home/nick/pthread_extend_probe.c` reads these fields directly via `__rseq_offset` and prints per-run timing.  `/home/nick/verify_extend.sh` sweeps `rseq_sched_extend_usec` from 0 to 1000 and produces the following table (obtained 2026-06-18):
+
+```
+extend_usec      runs   avg_wait   max_wait   avg_cs   active  overhead  extended
+-----------      ----   --------   --------   ------   ------  --------  --------
+0               71073       720us     16027us      69us      61us        8us         0
+50              78597       621us      8766us      63us      61us        2us       739
+200             80839       597us      8215us      61us      61us        0us      1500
+500             80669       596us     11112us      61us      61us        0us      1526
+1000            80184       601us      8538us      61us      61us        0us      1533
+```
+
+`overhead` (= cs_overall − cs_active = preemption penalty) drops from 8 µs to 0 µs; `avg_wait` drops 17%; `extended > 0` only when `extend_usec > 0`.  All three signals confirm that `cr_counter` is being written by the patched glibc and read correctly by the kernel.
+
+---
+
+## Lock-acquisition-driven migration trigger
+
+### Why lock-acquisition vs tick
+
+The tick fires every 4 ms. A task that acquires a spinlock 3 ms into its slice and holds it for 1 ms is invisible to the tick — the tick has already fired cleanly. Moving the trigger to lock acquisition catches the CS at the moment it begins, when the remaining vCPU time estimate is freshest.
+
+### bpf_sched_lock_acquire() — kernel/sched/bpf_sched.c:37
+
+Called from `cs_enter()` in `kernel/locking/spinlock.c:44` when `lock_depth` transitions from 0 to 1 (outermost kernel spinlock acquired). The tick-path call to `running_migration()` in `sched_balance_trigger()` has been removed; only this path remains.
+
+```c
+void bpf_sched_lock_acquire(void)
+{
+    struct rq *rq;
+    u64 now, elapsed, last_act, time_left, last_cs;
+
+    if (!bpf_sched_enabled())          // Gate 1: static key — zero cost when IVH unloaded
+        return;
+
+    rq = this_rq();
+
+    if (unlikely(rq->last_preemption == 0))   // Gate 2: no steal history
+        return;
+
+    last_cs = current->last_cs_ns;
+    if (last_cs == 0)                  // Gate 3: no completed CS yet (boot)
+        return;
+
+    now      = sched_clock();
+    elapsed  = now - rq->last_preemption;
+    last_act = rq->last_active_time;
+    if (elapsed >= last_act)           // Gate 4: model window expired — no evidence of imminent steal
+        return;
+
+    time_left = last_act - elapsed;
+    if (time_left >= last_cs + MIGRATION_THRESHOLD_NS)   // Gate 5: safe zone
+        return;
+
+    running_migration(rq);             // danger zone: migrate now
+}
+```
+
+### last_preemption and last_active_time — kernel/sched/cputime.c:268–275
+
+Updated in `steal_account_process_time()` whenever paravirt steal > 1 ms is detected:
+
+```c
+if (steal > 1000000) {
+    if (rq->last_preemption > rq->last_idle_tp)
+        rq->last_active_time = now - rq->last_preemption - steal;
+    else
+        rq->last_active_time = now - rq->last_idle_tp - steal;
+    rq->last_preemption = now;
+}
+```
+
+`last_preemption`: timestamp (sched_clock) of the most recent hypervisor preemption.  
+`last_active_time`: duration the vCPU was continuously active before that preemption.  
+Together they model: "the vCPU ran for `last_active_time` ns, then got stolen at `last_preemption`." Time remaining = `last_active_time - (now - last_preemption)`.
+
+### The elapsed fix (2026-06-18)
+
+Original code: `time_left = (elapsed < last_act) ? (last_act - elapsed) : 0;`
+
+When `elapsed >= last_act`, `time_left = 0`, so `0 < last_cs + 500µs` is always true → `running_migration()` fired on every lock acquisition once any steal history existed. Measured ~60–100% call rate under hackbench with IVH loaded.
+
+Fix: `if (elapsed >= last_act) return;` added before the time_left calculation. The window-expired case gets an early exit because the model cannot predict imminent preemption in a new (potentially long) vCPU slice. Verified: call rate dropped to ~0.26% under the same workload.
+
+### CS timing fields for last_cs_ns — include/linux/sched.h:1432–1447
+
+`last_cs_ns` is a per-task field holding the wall-clock duration of the most recently completed outermost kernel spinlock CS. It provides the "how long will this task need the lock" estimate in `bpf_sched_lock_acquire()`.
+
+Two timestamps cooperate to compute it:
+
+| Field | Context-switch behavior | Purpose |
+|-------|------------------------|---------|
+| `cs_start_ts` | Reset by `prepare_task_switch`, resumed by `finish_task_switch` | On-CPU accumulation into `cumulative_cs_time` |
+| `cs_wall_start_ts` | Never touched by context-switch handlers | Wall-clock anchor; survives preemption mid-CS |
+
+At outermost acquire (`cs_enter()`, `spinlock.c:41–45`):
+```c
+current->cs_start_ts     = sched_clock();
+current->cs_wall_start_ts = current->cs_start_ts;
+bpf_sched_lock_acquire();
+```
+
+At outermost release (`cs_exit()`, `spinlock.c:48–56`):
+```c
+u64 now = sched_clock();
+current->last_cs_ns        = now - current->cs_wall_start_ts;   // wall-clock
+current->cumulative_cs_time += now - current->cs_start_ts;      // on-CPU only
+current->cs_start_ts      = 0;
+current->cs_wall_start_ts = 0;
+```
+
+`last_cs_ns` mirrors `rseq->last_cs_overall_ns` semantics (wall-clock) for kernel spinlocks. `cumulative_cs_time` mirrors `rseq->last_cs_active_ns` semantics (on-CPU only).
+
+### Verification (2026-06-18)
+
+- `bpf_sched_lock_acquire` symbol live in `/proc/kallsyms` ✓
+- ftrace function_graph confirms: `bpf_sched_lock_acquire() { running_migration() { } }` nesting ✓
+- `sched_balance_trigger` function_graph shows only `nohz_balance_exit_idle` + `raise_softirq` inside — zero `running_migration` calls from tick path ✓
+- Under hackbench -g 32 with CPU saturation: 14 `ivh: final cpu=X target_cpu=Y` migrations completed ✓
+- Elapsed fix: call ratio dropped from ~100% → 0.26% of lock acquisitions ✓
+
+---
+
 ## Edward's ivh_atc (reference)
 
 `tools/bpf/ivh_atc.bpf.c` is the 6.1-era reference implementation.

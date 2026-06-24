@@ -30,6 +30,23 @@ static inline void rseq_set_notify_resume(struct task_struct *t)
 }
 
 void __rseq_handle_notify_resume(struct ksignal *sig, struct pt_regs *regs);
+void __rseq_set_sched_state(struct task_struct *t, unsigned int state);
+
+/*
+ * rseq_set_sched_state - update the rseq_sched_state::state field.
+ *
+ * Called from rseq_preempt() (preemption path) to clear ON_CPU, and from
+ * rseq_update_cpu_node_id() (return-to-userspace path) to set ON_CPU.
+ * The fast path is intentionally inlined: if rseq_sched_state is NULL
+ * (thread did not register a sched_state pointer, e.g. glibc rseq_len=32
+ * users) the write is skipped entirely with no function call overhead.
+ */
+static inline void rseq_set_sched_state(struct task_struct *t,
+					unsigned int state)
+{
+	if (t->rseq_sched_state)
+		__rseq_set_sched_state(t, state);
+}
 
 static inline void rseq_handle_notify_resume(struct ksignal *ksig,
 					     struct pt_regs *regs)
@@ -52,6 +69,8 @@ static inline void rseq_preempt(struct task_struct *t)
 {
 	__set_bit(RSEQ_EVENT_PREEMPT_BIT, &t->rseq_event_mask);
 	rseq_set_notify_resume(t);
+	/* Clear ON_CPU so userspace sees the task is off-CPU immediately. */
+	rseq_set_sched_state(t, 0);
 }
 
 /* rseq_migrate() requires preemption to be disabled. */
@@ -72,11 +91,13 @@ static inline void rseq_fork(struct task_struct *t, unsigned long clone_flags)
 		t->rseq_len = 0;
 		t->rseq_sig = 0;
 		t->rseq_event_mask = 0;
+		t->rseq_sched_state = NULL;
 	} else {
 		t->rseq = current->rseq;
 		t->rseq_len = current->rseq_len;
 		t->rseq_sig = current->rseq_sig;
 		t->rseq_event_mask = current->rseq_event_mask;
+		t->rseq_sched_state = current->rseq_sched_state;
 	}
 }
 
@@ -86,6 +107,7 @@ static inline void rseq_execve(struct task_struct *t)
 	t->rseq_len = 0;
 	t->rseq_sig = 0;
 	t->rseq_event_mask = 0;
+	t->rseq_sched_state = NULL;
 }
 
 #else
@@ -99,6 +121,10 @@ static inline void rseq_handle_notify_resume(struct ksignal *ksig,
 }
 static inline void rseq_signal_deliver(struct ksignal *ksig,
 				       struct pt_regs *regs)
+{
+}
+static inline void rseq_set_sched_state(struct task_struct *t,
+					unsigned int state)
 {
 }
 static inline void rseq_preempt(struct task_struct *t)

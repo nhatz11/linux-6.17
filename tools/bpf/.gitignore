@@ -5,3 +5,15 @@ bpf_asm
 bpf_dbg
 bpf_exp.yacc.*
 bpf_jit_disasm
+# Generated BPF artifacts
+MY_ivh_atc
+MY_ivh_atc.skel.h
+ivh_atc
+ivh_atc.skel.h
+lhp_cstime
+lhp_cstime.skel.h
+lhp_movable
+lhp_movable.skel.h
+lhp_waittime
+lhp_waittime.skel.h
+vmlinux.h
