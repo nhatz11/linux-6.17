@@ -216,47 +216,68 @@ static int process_cpu(u32 iter, void *data)
     return 0;
 }
 
+/*
+ * JIT-worker comm banlist — do not migrate these thread classes.
+ *
+ * These runtimes interleave spinlock-protected kernel work with heavy
+ * mmap/mprotect/madvise calls (JIT code emission, GC, shader compilation).
+ * IVH migration spreads their mm->cpu_bitmap; future TLB shootdowns then
+ * target CPUs that may be in IRQ-disabled spinlock slowpaths, producing
+ * the TLB-IPI deadlock seen in the 2026-06-23 soft lockup.
+ *
+ * Checked via task->comm (char[16], always present, no CO-RE needed):
+ *   "Bun Pool"   Bun thread pool workers (pool 0–N)
+ *   "JITWorker"  JavaScriptCore JIT compiler threads
+ *   "HeapHelper" JSC GC / heap helper threads
+ *   "JS Helper"  gjs / gnome-shell SpiderMonkey helpers
+ *   "gjs"        GNOME JavaScript runtime (SpiderMonkey)
+ *   "llvmpipe-"  Mesa llvmpipe shader JIT (LLVM)
+ *
+ * comm comparisons use the minimum prefix that is unique across all thread
+ * names on this system (verified via ps -eLo comm survey 2026-06-23).
+ */
+static __always_inline int is_jit_worker(struct task_struct *t)
+{
+    char c0 = t->comm[0];
+    char c1 = t->comm[1];
+    char c2 = t->comm[2];
+    char c3 = t->comm[3];
+
+    /* "Bun " — Bun Pool 0..N */
+    if (c0 == 'B' && c1 == 'u' && c2 == 'n' && c3 == ' ')
+        return 1;
+    /* "JITW" — JITWorker */
+    if (c0 == 'J' && c1 == 'I' && c2 == 'T' && c3 == 'W')
+        return 1;
+    /* "Heap" — HeapHelper */
+    if (c0 == 'H' && c1 == 'e' && c2 == 'a' && c3 == 'p')
+        return 1;
+    /* "JS H" — JS Helper */
+    if (c0 == 'J' && c1 == 'S' && c2 == ' ' && c3 == 'H')
+        return 1;
+    /* "gjs\0" — GNOME JS runtime */
+    if (c0 == 'g' && c1 == 'j' && c2 == 's' && c3 == '\0')
+        return 1;
+    /* "llvm" — llvmpipe shader JIT */
+    if (c0 == 'l' && c1 == 'l' && c2 == 'v' && c3 == 'm')
+        return 1;
+
+    return 0;
+}
+
 SEC("sched/cfs_sched_tick_end")
 int BPF_PROG(test, struct rq *rq, u64 now_time, unsigned int num_of_idle,
              int curr_lock_depth, int curr_kernel_lockholder,
              int curr_user_lockholder, int curr_lockholder, int curr_waiter)
 {
-    /*
-     * Gate A: task must hold a kernel or userspace spinlock.
-     * Redundant for the lock-acquisition trigger (bpf_sched_lock_acquire
-     * only fires at lock_depth 0→1), but the running kernel still has the
-     * tick path in sched_balance_trigger() which can reach running_migration
-     * with curr_lockholder=0.  Without this gate, migrations fire for every
-     * running task at every tick when cpu_capacity <= 900.
-     */
+    /* Gate A: must be a lock holder. */
     if (!curr_lockholder)
         return 0;
 
-    /*
-     * Gate B: util_avg >= 60% — only migrate CPU-intensive lockholders.
-     *
-     * JIT workers (Bun, V8, GC threads) have multi-ms wall-clock kernel CSes
-     * because they get preempted mid-spinlock-hold (LHP events visible as
-     * JITWorker/HeapHelper in lhp_cstime output).  Their long-term util_avg
-     * is low because they spend large fractions of time in madvise/mmap/munmap
-     * syscalls.  Migrating them spreads mm->cpu_bitmap, causing TLB flush IPIs
-     * to reach CPUs in IRQ-disabled spinlock slowpaths — the exact deadlock
-     * pattern in the 2026-06-23 crash (CPU#2 Bun Pool 0 IRQ-disabled,
-     * gnome-shell/claude/bash stuck in smp_call_function_many_cond).
-     *
-     * Genuine spinlock-heavy workloads (hackbench, databases) are continuously
-     * CPU-bound and sustain util_avg > 60% within seconds.
-     *
-     * False-negative window: tasks transitioning from idle to CPU-intensive
-     * won't be included until util_avg ramps past 60% (~200-500 ms).
-     * This is acceptable — they have no waiters yet during the ramp-up.
-     *
-     * Threshold mirrors Edward's original IVH and the C gate added to fair.c.
-     */
+    /* Gate B: never migrate known JIT workers — their mm->cpu_bitmap
+     * spreading is what creates the TLB-IPI deadlock conditions. */
     struct task_struct *curr_task = rq->curr;
-    u64 util_avg = curr_task->se.avg.util_avg;
-    int util_percent = (int)((util_avg * 100) >> SCHED_CAPACITY_SHIFT);
-    if (util_percent < 60)
+    if (is_jit_worker(curr_task))
         return 0;
 
     return 1;
