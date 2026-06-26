@@ -16,10 +16,21 @@
 int bpf_sched_verify_prog(struct bpf_verifier_log *vlog,
 			  const struct bpf_prog *prog);
 
-/* Called from the outermost raw_spin_lock acquisition path (process context,
- * lock_depth == 1) to evaluate and trigger lock-acquisition-driven migration.
- * Implemented in kernel/sched/bpf_sched.c. */
-void bpf_sched_lock_acquire(void);
+/*
+ * Called from _raw_spin_lock*() BEFORE __raw_spin_lock*() — i.e., before
+ * preemption is disabled and before any MCS node is allocated.  If the current
+ * vCPU is in the IVH danger zone and a better target CPU is available, the
+ * calling task migrates itself synchronously (set_cpus_allowed_ptr + schedule())
+ * so that the subsequent lock acquisition happens on a good CPU.
+ * Implemented in kernel/sched/fair.c.
+ */
+void bpf_sched_pre_lock_migrate(void);
+
+/* Capacity threshold shared between bpf_sched.c and fair.c */
+#define IVH_CAPACITY_THRESHOLD	900u
+
+/* Runtime-tunable time-left gate (ns); defined in bpf_sched.c */
+extern unsigned long ivh_time_left_threshold_ns;
 
 DECLARE_STATIC_KEY_FALSE(bpf_sched_enabled_key);
 
@@ -53,8 +64,6 @@ static inline bool bpf_sched_enabled(void)
 {
 	return false;
 }
-
-static inline void bpf_sched_lock_acquire(void) {}
 
 #endif /* CONFIG_BPF_SYSCALL */
 

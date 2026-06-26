@@ -12922,82 +12922,118 @@ out_unlock:
 
 //ivh start
 
+/**
+ * bpf_sched_pre_lock_migrate - synchronous self-migration before spinlock acquire.
+ *
+ * Called from ivh_pre_lock() in spinlock.c, BEFORE __raw_spin_lock*() disables
+ * preemption and before any qspinlock MCS node is allocated.  If the current
+ * vCPU is in the IVH danger zone and a better target CPU is found via the BPF
+ * selection hook, the calling task migrates itself synchronously:
+ *   set_cpus_allowed_ptr(current, {target}) → schedule() → restore mask.
+ *
+ * After schedule() returns the task is running on target_cpu and proceeds to
+ * acquire the lock there — no MCS node has been touched on any CPU yet.
+ *
+ * Must only be called with lock_depth == 0 and preemptible() == true.
+ */
+void bpf_sched_pre_lock_migrate(void)
+{
+	struct rq *rq;
+	u64 ewma, act_sofar;
+	int target_cpu;
+	cpumask_var_t saved_mask;
+	unsigned long flags;
+
+	rq = this_rq();
+
+	/* Gate 1: vCPU not throttled */
+	if (rq->cpu_capacity > IVH_CAPACITY_THRESHOLD)
+		return;
+
+	/* Gate 2: enough burst time remains — migration not urgent */
+	ewma = rq->ewma_act_ns;
+	if (ewma != 0) {
+		act_sofar = sched_clock() - rq->last_preemption;
+		if (ewma > act_sofar &&
+		    (ewma - act_sofar) >= ivh_time_left_threshold_ns)
+			return;
+	}
+
+	/* Gate 3: task must be movable (more than one allowed CPU) */
+	if (cpumask_weight(current->cpus_ptr) <= 1)
+		return;
+
+	/* Gate 4: no async migration already pending on this CPU */
+	if (rq->preempt_migrate_locked)
+		return;
+
+	/*
+	 * Block recursive IVH calls from any spinlock acquired inside this
+	 * function.  my_spinlock, the slab allocator (alloc_cpumask_var),
+	 * set_cpus_allowed_ptr, and schedule() all take raw spinlocks
+	 * internally.  Without this guard each of those calls would reach
+	 * ivh_pre_lock() with lock_depth still 0 and re-enter this function,
+	 * causing a stack overflow on the very first IVH-enabled spinlock.
+	 * Decrement on every exit path so the actual lock acquisition after
+	 * we return still sees lock_depth == 0 and cs_enter() fires correctly.
+	 */
+	current->lock_depth++;
+
+	/* Select target CPU via BPF hook (spin-locked to prevent double-selection) */
+	raw_spin_lock_irqsave(&my_spinlock, flags);
+	target_cpu = bpf_sched_cfs_select_run_cpu_spin(
+			rq, current, sched_clock(),
+			average_capacity_all, num_online_cpus());
+	if (target_cpu != -1)
+		atomic_fetch_or(PRMPT_HELD_MASK, prmpt_flags(target_cpu));
+	raw_spin_unlock_irqrestore(&my_spinlock, flags);
+
+	if (target_cpu < 0 || target_cpu == smp_processor_id()) {
+		if (target_cpu >= 0)
+			atomic_fetch_andnot(PRMPT_HELD_MASK, prmpt_flags(target_cpu));
+		current->lock_depth--;
+		return;
+	}
+
+	/*
+	 * Synchronous self-migration: temporarily restrict cpus_mask to
+	 * {target_cpu} and call schedule().  The scheduler sees that current
+	 * is no longer allowed on this CPU and migrates it.  When schedule()
+	 * returns we are running on target_cpu.  Restore original mask so the
+	 * task's permanent affinity is unchanged.
+	 *
+	 * Use cpumask_var_t (heap via GFP_KERNEL) to avoid a 1024-byte
+	 * stack frame on NR_CPUS=8192/CPUMASK_OFFSTACK=y builds.
+	 * GFP_KERNEL is safe: we are in process context (in_task) with
+	 * preemption enabled and lock_depth == 1 (our temporary guard).
+	 */
+	if (!alloc_cpumask_var(&saved_mask, GFP_KERNEL)) {
+		atomic_fetch_andnot(PRMPT_HELD_MASK, prmpt_flags(target_cpu));
+		current->lock_depth--;
+		return;
+	}
+	cpumask_copy(saved_mask, &current->cpus_mask);
+	if (set_cpus_allowed_ptr(current, cpumask_of(target_cpu)) == 0)
+		schedule();
+	set_cpus_allowed_ptr(current, saved_mask);
+	free_cpumask_var(saved_mask);
+
+	/* Release the target CPU selection hold */
+	atomic_fetch_andnot(PRMPT_HELD_MASK, prmpt_flags(target_cpu));
+	current->lock_depth--;
+}
+EXPORT_SYMBOL_GPL(bpf_sched_pre_lock_migrate);
+
 int running_migration(struct rq *rq)
 {
         u64 now_time = sched_clock();
-        int should_run = 0;
         int cpu = cpu_of(rq);
         int target_cpu = -1;
         int iterate_cpu;
         struct task_struct *curr_tsk = rq->curr;
         int should_spin_lock;
 
-
-        {
-                int curr_lock_depth = rq->curr->lock_depth;
-                int curr_kernel_lockholder = (curr_lock_depth > 0);
-                int curr_user_lockholder = 0;
-                int curr_user_waiter = 0;
-#ifdef CONFIG_RSEQ
-                if (rq->curr->rseq && rq->curr->rseq_len >= 32) {
-                        u32 cr;
-                        if (!copy_from_user_nofault(&cr, &rq->curr->rseq->cr_counter, sizeof(cr)))
-                                curr_user_lockholder = (cr & 0xFFFFFFFEu) != 0;
-                }
-                /* wait_counter at offset 32; guard rseq_len >= 36 mirrors cr_counter pattern */
-                if (rq->curr->rseq && rq->curr->rseq_len >= 36) {
-                        u32 wc;
-                        if (!copy_from_user_nofault(&wc, &rq->curr->rseq->wait_counter, sizeof(wc)))
-                                curr_user_waiter = (wc & ~3u) != 0; /* bits [31:2] = nesting depth */
-                }
-#endif
-                int curr_lockholder = curr_kernel_lockholder || curr_user_lockholder;
-                int curr_waiter = (rq->curr->wait_depth > 0) || curr_user_waiter;
-                (void)curr_waiter; /* available to pass to select_run_cpu_spin hook */
-
-                /* classify and snapshot for debugfs */
-                {
-                        int movable = cpumask_weight(rq->curr->cpus_ptr) > 1;
-                        enum lhp_class cls;
-
-                        if (!curr_lockholder)
-                                cls = LHP_NOT_LOCKHOLDER;
-                        else if (curr_user_lockholder)
-                                cls = movable ? LHP_USER_MOVABLE : LHP_USER_NONMOVABLE;
-                        else
-                                cls = movable ? LHP_KERNEL_MOVABLE : LHP_KERNEL_NONMOVABLE;
-
-                        struct lhp_classify_snapshot *snap = this_cpu_ptr(&lhp_last_class);
-                        snap->pid        = rq->curr->pid;
-                        memcpy(snap->comm, rq->curr->comm, TASK_COMM_LEN);
-                        snap->cls        = cls;
-                        snap->lock_depth   = curr_lock_depth;
-                        snap->movable      = movable;
-                        snap->user_waiter  = curr_user_waiter;
-                        snap->cumulative_cs_time     = rq->curr->cumulative_cs_time;
-                        snap->cumulative_active_time = rq->curr->cumulative_active_time;
-                }
-
-                /*
-                 * cpu_capacity gate (Gate 1 in bpf_sched_lock_acquire) already
-                 * ensures we only reach here on a throttled vCPU.  The old
-                 * util_avg >= 60% filter was added to block JIT workers whose
-                 * mmap/mprotect/madvise calls spread mm->cpu_bitmap, triggering
-                 * TLB flush IPIs on IRQ-disabled CPUs (soft lockup 2026-06-23).
-                 * That concern is now handled by:
-                 *   - mm_cpumask gate in process_cpu() (BPF): only migrate user
-                 *     tasks to CPUs already in mm->cpu_bitmap, so no new TLB
-                 *     flush targets are ever introduced.
-                 *   - jit_tgids banlist + detect_jit kprobe: JIT processes are
-                 *     excluded from migration entirely regardless of util_avg.
-                 * Removing util_avg allows low-util lockholders (e.g. I/O servers
-                 * that sleep between requests but hold spinlocks during completion)
-                 * to be migrated off throttled vCPUs, which was the original goal.
-                 */
-                should_run = curr_lockholder ? 1 : 0;
-        }
-
-        if (!should_run || rq->preempt_migrate_locked == 1)
+        if (rq->preempt_migrate_locked == 1)
                 return 0;
 
         /* helper hook to determine if selection process should be spin-locked or not */

@@ -36,12 +36,27 @@
  * sched_clock() is used instead of ktime_get_ns() because spinlocks fire
  * before timekeeping is initialized; sched_clock() is safe in any context.
  */
+/*
+ * ivh_pre_lock — IVH gate + synchronous self-migration, called BEFORE
+ * __raw_spin_lock*() so that no MCS node has been allocated yet and
+ * preemption is still enabled.  A no-op when IVH is not loaded (static key).
+ * Must not be called from trylock paths (they don't block) or when already
+ * holding a spinlock (lock_depth > 0 means preemption is already off).
+ */
+static __always_inline void ivh_pre_lock(void)
+{
+	if (!bpf_sched_enabled())
+		return;
+	if (!in_task() || !preemptible() || current->lock_depth > 0)
+		return;
+	bpf_sched_pre_lock_migrate();
+}
+
 static __always_inline void cs_enter(void)
 {
 	if (current->lock_depth == 1) {
 		current->cs_start_ts = sched_clock();
 		current->cs_wall_start_ts = current->cs_start_ts;
-		bpf_sched_lock_acquire();
 	}
 }
 
@@ -196,6 +211,7 @@ EXPORT_SYMBOL(_raw_spin_trylock_bh);
 #ifndef CONFIG_INLINE_SPIN_LOCK
 noinline void __lockfunc _raw_spin_lock(raw_spinlock_t *lock)
 {
+	ivh_pre_lock();
 	__raw_spin_lock(lock);
 	if (!in_interrupt()) {
 		current->lock_depth++;
@@ -210,6 +226,7 @@ noinline unsigned long __lockfunc _raw_spin_lock_irqsave(raw_spinlock_t *lock)
 {
 	unsigned long flags;
 
+	ivh_pre_lock();
 	flags = __raw_spin_lock_irqsave(lock);
 	if (!in_interrupt()) {
 		current->lock_depth++;
@@ -223,6 +240,7 @@ EXPORT_SYMBOL(_raw_spin_lock_irqsave);
 #ifndef CONFIG_INLINE_SPIN_LOCK_IRQ
 noinline void __lockfunc _raw_spin_lock_irq(raw_spinlock_t *lock)
 {
+	ivh_pre_lock();
 	__raw_spin_lock_irq(lock);
 	if (!in_interrupt()) {
 		current->lock_depth++;
@@ -236,6 +254,7 @@ EXPORT_SYMBOL(_raw_spin_lock_irq);
 noinline void __lockfunc _raw_spin_lock_bh(raw_spinlock_t *lock)
 {
 	bool track = !in_interrupt();
+	ivh_pre_lock();
 	__raw_spin_lock_bh(lock);
 	if (track) {
 		current->lock_depth++;

@@ -173,12 +173,9 @@ struct task_ctx {
     struct task_struct *curr;          /* task that is to be moved */
     int *target_cpu_ptr;               /* result - where should the task be moved? */
     u64 now;
-    u64 *last_preempt_time_ptr;        /* pointer to track best preemption time */
     int start;                         /* starting CPU */
-    int has_seen_sched_idle;           /* sched_idle task flag */
-    u64 rq_last_preempt;               /* last preemption time of source runqueue */
-    int *found_sched_idle_ptr;         /* indicator if we found a sched_idle CPU */
-    int *best_capacity_ptr;            /* best CPU capacity found */
+    u64 rq_last_preempt;               /* last_preemption of source rq (age reference) */
+    int *found_active_worker_ptr;      /* Tier 1: found a pure-compute vCPU */
     int average_capacity;              /* system average capacity */
     int total_cpus;                    /* total number of CPUs in system */
 };
@@ -201,89 +198,84 @@ static int process_cpu(u32 iter, void *data)
     unsigned long cpumask_bits = *(cpumask->bits);
 
     //is valid cpu for task?
-    if (!(cpumask_bits & (1UL << cpu))) {
+    if (!(cpumask_bits & (1UL << cpu)))
         return 0;
-    }
-
-    /*
-     * Only migrate user tasks to CPUs already in mm_cpumask.
-     *
-     * IVH migration calls switch_mm_irqs_off() on the destination, which
-     * unconditionally does cpumask_set_cpu(dst, mm_cpumask(mm)).  If that
-     * CPU later enters a raw_spin_lock_irqsave path (IRQs disabled), a
-     * concurrent flush_tlb_mm() sends it a call-function IPI and waits.
-     * The CPU can't respond → on_each_cpu_mask stalls → soft lockup.
-     *
-     * If the destination is already in mm_cpumask, it was already a TLB
-     * flush target before IVH acted — no new risk is introduced.
-     *
-     * Kernel threads (mm == NULL) are exempt: they run in lazy-TLB mode
-     * with a borrowed active_mm and never expand mm_cpumask on migration.
-     *
-     * cpu_bitmap[0] covers CPUs 0–63; sufficient for this 18-vCPU system.
-     */
-    struct mm_struct *mm = curr->mm;
-    if (mm) {
-        unsigned long mm_cpu_bits = mm->cpu_bitmap[0];
-        if (!(mm_cpu_bits & (1UL << cpu)))
-            return 0;
-    }
 
     int *target_cpu_ptr = ctx->target_cpu_ptr;
-    u64 *last_preempt_time_ptr = ctx->last_preempt_time_ptr;
 
     //RQ for current cpu
     struct rq *select_rq = bpf_per_cpu_ptr(&runqueues, cpu);
 
     //if RQ invalid, return
-    if (!select_rq) {
+    if (!select_rq)
         return 0;
-    }
 
     //has this cpu been selected by other IVH threads?
-    int is_locked = select_rq->prmpt_flags.counter & (1 << (2));
-    if (is_locked) {
+    if (select_rq->prmpt_flags.counter & (1 << 2))
         return 0;
-    }
 
-    //if there are non-sched-idle tasks running at my destination - why should I move there?
-    if ((select_rq->cfs.h_nr_runnable - select_rq->cfs.h_nr_idle) > 0) {
+    /* Skip lockholders: vCPU is inside a CS; adding more work hurts. */
+    if (select_rq->curr->lock_depth > 0)
         return 0;
-    }
 
-    //is a SCHED IDLE cpu
-    if (select_rq->nr_running > 0 && select_rq->curr->policy == 5) {
-        //Sched IDLE cpus are the best targets!
-        *(ctx->found_sched_idle_ptr) = 1;
-
-        u64 time_since_heartbeat = is_cpu_preempted(select_rq, ctx->now);
-
-        //if cpu is preempted - we don't want it
-        if (!time_since_heartbeat) {
-            return 0;
-        }
-
-        //if target core has been active longer then current core - don't move
-        if (select_rq->last_preemption <= ctx->rq_last_preempt) {
-            return 0;
-        }
-
-        //we're looking for the core that has been active for the least amount of time
-        if (time_since_heartbeat < select_rq->last_preemption && select_rq->cpu_capacity > 500) {
-            *last_preempt_time_ptr = select_rq->last_preemption;
-            *target_cpu_ptr = (int)(cpu);
-        }
+    /*
+     * Skip spinners: already queued in an MCS waiter list.
+     * - lock free:  spinner already judged this vCPU safe for itself —
+     *               migrating here risks thrashing.
+     * - lock held:  migrated task joins queue behind existing waiter,
+     *               the waiter preemption problem.
+     */
+    if (select_rq->curr->wait_depth > 0)
         return 0;
-    // if the system has a previous valid sched_idle cpu and it's not this one - shouldn't bother
-    } else if (*(ctx->found_sched_idle_ptr) && *target_cpu_ptr != -1) {
-        return 0;
-    }
 
-    //select a core with "good enough" capacity
-    if (select_rq->cpu_capacity > ctx->average_capacity || select_rq->cpu_capacity > 500) {
+    /* Skip if capacity is too low to be useful. */
+    if (select_rq->cpu_capacity <= 500 &&
+        select_rq->cpu_capacity <= ctx->average_capacity)
+        return 0;
+
+    /* Skip if the vCPU heartbeat is stale — hypervisor has already preempted it. */
+    u64 time_since_heartbeat = is_cpu_preempted(select_rq, ctx->now);
+    if (!time_since_heartbeat)
+        return 0;
+
+    /* Skip if target vCPU started its active burst earlier than us — it has
+     * less remaining burst time and is closer to being preempted. */
+    if (select_rq->last_preemption <= ctx->rq_last_preempt)
+        return 0;
+
+    /*
+     * Skip if this vCPU has already used up its typical active window.
+     *
+     * ref = the later of last_preemption and last_idle_tp, whichever
+     * happened more recently marks the true start of this vCPU's current
+     * active run.  target_active = now - ref = how long the vCPU has been
+     * continuously active since then (the "? :" is: if now > ref, subtract;
+     * otherwise clamp to 0 to avoid wrapping on an uninitialized ref).
+     *
+     * ewma_act_ns is the exponentially weighted average of how long this
+     * vCPU runs before the hypervisor preempts it.  If target_active has
+     * already reached that budget, preemption is overdue — migrating there
+     * would put the task on a vCPU that is about to be yanked away.
+     */
+    u64 ref = select_rq->last_idle_tp > select_rq->last_preemption
+              ? select_rq->last_idle_tp : select_rq->last_preemption;
+    u64 target_active = ctx->now > ref ? ctx->now - ref : 0;
+    if (select_rq->ewma_act_ns > 0 && target_active >= select_rq->ewma_act_ns)
+        return 0;
+
+    if (!idle_cpu(select_rq)) {
+        /* Tier 1: active worker — computing, no lock involvement.
+         * No hypervisor vCPU wake-up cost. Stop search immediately. */
         *target_cpu_ptr = (int)(cpu);
+        *(ctx->found_active_worker_ptr) = 1;
         return 1;
     }
+
+    /* Tier 2: idle vCPU — safe fallback, hypervisor wake-up required.
+     * Keep searching for a Tier 1 active worker. */
+    if (!*(ctx->found_active_worker_ptr))
+        *target_cpu_ptr = (int)(cpu);
+
     return 0;
 }
 
@@ -402,22 +394,39 @@ int BPF_PROG(test3, struct rq *rq, struct task_struct *curr, u64 now_time, int a
     int next = (rq->cpu + 1) % total_cpus;
     return next;
 #endif
+    /*
+     * JIT banlist: block migration of JIT worker threads and all siblings
+     * sharing the same mm.  Mirrors the identical check in test() (tick path).
+     *
+     * Without this, the pre-lock path bypasses the tick-time banlist — the
+     * 2026-06-25 overnight crash was caused by HeapHelper being migrated
+     * across all 16 CPUs via this path, expanding mm->cpu_bitmap to 0xffff.
+     * Subsequent JIT TLB flushes sent IPIs to all 16 CPUs; several were in
+     * IRQ-disabled spinlock sections and couldn't respond → soft lockup.
+     */
+    u32 tgid = curr->tgid;
+    if (is_jit_worker(curr)) {
+        if (!bpf_map_lookup_elem(&jit_tgids, &tgid)) {
+            u8 one = 1;
+            bpf_map_update_elem(&jit_tgids, &tgid, &one, BPF_NOEXIST);
+        }
+        return -1;
+    }
+    if (bpf_map_lookup_elem(&jit_tgids, &tgid))
+        return -1;
+
     int start = 0;
     u32 nr_loops = total_cpus - 1;
     int target_cpu = -1;
-    u64 last_preempt_time = 0xFFFFFFFFFFFFFFFFULL; // Using max u64 value
-    int best_capacity = rq->cpu_capacity;
-    int found_sched_idle = 0;
+    int found_active_worker = 0;
 
     struct task_ctx task_context = {
         .curr = curr,
         .target_cpu_ptr = &target_cpu,
         .now = now_time,
-        .last_preempt_time_ptr = &last_preempt_time,
         .start = rq->cpu,
         .rq_last_preempt = rq->last_preemption,
-        .found_sched_idle_ptr = &found_sched_idle,
-        .best_capacity_ptr = &best_capacity,
+        .found_active_worker_ptr = &found_active_worker,
         .average_capacity = average_capacity,
         .total_cpus = total_cpus
     };
