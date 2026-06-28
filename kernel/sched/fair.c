@@ -62,6 +62,21 @@
 int nr_ivh;
 static DEFINE_RAW_SPINLOCK(my_spinlock);
 
+/*
+ * IVH debug counters — readable during a hang via:
+ *   sudo bpftrace -e 'BEGIN { printf("in_sched=%d trylock_miss=%d migrations=%d\n",
+ *       *(int32*)kaddr("ivh_in_schedule"),
+ *       *(int32*)kaddr("ivh_trylock_misses"),
+ *       *(int32*)kaddr("ivh_migrations_done")); exit(); }'
+ * or: cat /proc/ivh_debug
+ */
+atomic_t ivh_in_schedule    = ATOMIC_INIT(0); /* threads inside schedule() */
+atomic_t ivh_trylock_misses  = ATOMIC_INIT(0); /* trylock contention skips  */
+atomic_t ivh_migrations_done = ATOMIC_INIT(0); /* completed migrations      */
+EXPORT_SYMBOL_GPL(ivh_in_schedule);
+EXPORT_SYMBOL_GPL(ivh_trylock_misses);
+EXPORT_SYMBOL_GPL(ivh_migrations_done);
+
 /* average capacity across CPUs, defined in core.c */
 extern int average_capacity_all;
 
@@ -12941,10 +12956,12 @@ void bpf_sched_pre_lock_migrate(void)
 	struct rq *rq;
 	u64 ewma, act_sofar;
 	int target_cpu;
+	int src_cpu;
 	cpumask_var_t saved_mask;
 	unsigned long flags;
 
 	rq = this_rq();
+	src_cpu = rq->cpu;
 
 	/* Gate 1: vCPU not throttled */
 	if (rq->cpu_capacity > IVH_CAPACITY_THRESHOLD)
@@ -12963,10 +12980,6 @@ void bpf_sched_pre_lock_migrate(void)
 	if (cpumask_weight(current->cpus_ptr) <= 1)
 		return;
 
-	/* Gate 4: no async migration already pending on this CPU */
-	if (rq->preempt_migrate_locked)
-		return;
-
 	/*
 	 * Block recursive IVH calls from any spinlock acquired inside this
 	 * function.  my_spinlock, the slab allocator (alloc_cpumask_var),
@@ -12979,7 +12992,11 @@ void bpf_sched_pre_lock_migrate(void)
 	 */
 	current->lock_depth++;
 
-	/* Select target CPU via BPF hook (spin-locked to prevent double-selection) */
+	/*
+	 * Select target CPU via BPF hook.  Use trylock: if another thread is
+	 * already selecting, skip migration for this CS rather than spinning
+	 * with IRQs disabled.  The caller will retry on the next lock attempt.
+	 */
 	raw_spin_lock_irqsave(&my_spinlock, flags);
 	target_cpu = bpf_sched_cfs_select_run_cpu_spin(
 			rq, current, sched_clock(),
@@ -12987,6 +13004,10 @@ void bpf_sched_pre_lock_migrate(void)
 	if (target_cpu != -1)
 		atomic_fetch_or(PRMPT_HELD_MASK, prmpt_flags(target_cpu));
 	raw_spin_unlock_irqrestore(&my_spinlock, flags);
+
+	trace_printk("ivh_selected: pid=%d comm=%s src=%d dst=%d cap=%lu avg_cap=%d\n",
+		     current->pid, current->comm, src_cpu, target_cpu,
+		     rq->cpu_capacity, average_capacity_all);
 
 	if (target_cpu < 0 || target_cpu == smp_processor_id()) {
 		if (target_cpu >= 0)
@@ -13013,103 +13034,53 @@ void bpf_sched_pre_lock_migrate(void)
 		return;
 	}
 	cpumask_copy(saved_mask, &current->cpus_mask);
+
+	trace_printk("ivh_pre_sched: pid=%d comm=%s src=%d dst=%d in_sched=%d\n",
+		     current->pid, current->comm, src_cpu, target_cpu,
+		     atomic_read(&ivh_in_schedule));
+	atomic_inc(&ivh_in_schedule);
+
 	if (set_cpus_allowed_ptr(current, cpumask_of(target_cpu)) == 0)
 		schedule();
+
+	atomic_dec(&ivh_in_schedule);
+	trace_printk("ivh_post_sched: pid=%d comm=%s landed_cpu=%d dst_was=%d\n",
+		     current->pid, current->comm, smp_processor_id(), target_cpu);
+
 	set_cpus_allowed_ptr(current, saved_mask);
 	free_cpumask_var(saved_mask);
 
+	atomic_inc(&ivh_migrations_done);
 	/* Release the target CPU selection hold */
 	atomic_fetch_andnot(PRMPT_HELD_MASK, prmpt_flags(target_cpu));
 	current->lock_depth--;
 }
 EXPORT_SYMBOL_GPL(bpf_sched_pre_lock_migrate);
 
-int running_migration(struct rq *rq)
+/* /proc/ivh_debug — snapshot all IVH counters for hang diagnosis */
+static int ivh_debug_show(struct seq_file *m, void *v)
 {
-        u64 now_time = sched_clock();
-        int cpu = cpu_of(rq);
-        int target_cpu = -1;
-        int iterate_cpu;
-        struct task_struct *curr_tsk = rq->curr;
-        int should_spin_lock;
-
-        if (rq->preempt_migrate_locked == 1)
-                return 0;
-
-        /* helper hook to determine if selection process should be spin-locked or not */
-        should_spin_lock = bpf_sched_cfs_should_spinlock(1);
-
-        nr_ivh += 1;
-
-        /* Spinlock pass */
-        if (should_spin_lock) {
-                unsigned long my_spinlock_flags;
-                raw_spin_lock_irqsave(&my_spinlock, my_spinlock_flags);
-
-                /* Target selection hook */
-                target_cpu = bpf_sched_cfs_select_run_cpu_spin(
-                                rq, curr_tsk, now_time,
-                                average_capacity_all,
-                                num_online_cpus());
-
-                if (target_cpu != -1)
-                        atomic_fetch_or(PRMPT_HELD_MASK, prmpt_flags(target_cpu));
-
-                raw_spin_unlock_irqrestore(&my_spinlock, my_spinlock_flags);
-        } else {
-                /* non-spinlock variant to IVH selection (off by default) */
-                int max = -1;
-                int tmpmax = -1;
-                int flags;
-
-                for_each_cpu_wrap(iterate_cpu, &curr_tsk->cpus_mask, cpu) {
-                        struct rq *cpu_rq;
-
-                        if (!idle_cpu(iterate_cpu))
-                                continue;
-                        if (iterate_cpu == cpu)
-                                continue;
-
-                        cpu_rq = cpu_rq(iterate_cpu);
-                        tmpmax = bpf_sched_cfs_select_run_cpu(
-                                        rq, cpu_rq, now_time, max);
-
-                        if (tmpmax > -1) {
-                                flags = atomic_fetch_or(
-                                                PRMPT_HELD_MASK,
-                                                prmpt_flags(iterate_cpu));
-                                if (flags & PRMPT_HELD_MASK)
-                                        continue;
-
-                                max = tmpmax;
-                                if (target_cpu != -1)
-                                        atomic_fetch_andnot(
-                                                PRMPT_HELD_MASK,
-                                                prmpt_flags(target_cpu));
-
-                                target_cpu = iterate_cpu;
-                        }
-                }
-        }
-
-        nr_ivh -= 1;
-
-        /* found a target cpu, start migration process */
-        if (target_cpu != -1) {
-                struct rq *targ_rq = cpu_rq(target_cpu);
-
-                rq->preempt_migrate_locked = 1;
-                rq->preempt_migrate_target = target_cpu;
-                targ_rq->preempt_migrate.info = rq;
-                targ_rq->wakeup_stamp = sched_clock();
-
-                /* send IPI */
-                smp_call_function_single_async(target_cpu, &targ_rq->preempt_migrate);
-                return 1;
-        }
-
-        return 0;
+	seq_printf(m, "ivh_in_schedule:    %d\n", atomic_read(&ivh_in_schedule));
+	seq_printf(m, "ivh_trylock_misses: %d\n", atomic_read(&ivh_trylock_misses));
+	seq_printf(m, "ivh_migrations_done:%d\n", atomic_read(&ivh_migrations_done));
+	seq_printf(m, "\n");
+	seq_printf(m, "# If in_schedule > 0 during a hang:\n");
+	seq_printf(m, "#   threads are stuck in schedule() waiting for vCPU on target\n");
+	seq_printf(m, "# If in_schedule == 0 and trylock_misses is high:\n");
+	seq_printf(m, "#   trylock contention is frequent (expected under burst load)\n");
+	seq_printf(m, "# If migrations_done == 0:\n");
+	seq_printf(m, "#   IVH gates are blocking all migrations — check cpu_capacity\n");
+	return 0;
 }
+DEFINE_PROC_SHOW_ATTRIBUTE(ivh_debug);
+
+static int __init ivh_debug_proc_init(void)
+{
+	proc_create("ivh_debug", 0444, NULL, &ivh_debug_proc_ops);
+	return 0;
+}
+late_initcall(ivh_debug_proc_init);
+
 /*
  * Trigger the SCHED_SOFTIRQ if it is time to do periodic load balancing.
  */

@@ -120,7 +120,6 @@ extern void set_average_capacity_all(int av_capacity);
 extern void reset_max_latency(u64 max_latency);
 extern int  is_cpu_preempted(int cpunum);
 extern int  migrate_task_to_async_fair(void *data);
-extern int  running_migration(struct rq *rq);
 
 /* lhp tick-time lockholder classification */
 enum lhp_class {

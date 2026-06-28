@@ -47,6 +47,8 @@ static __always_inline void ivh_pre_lock(void)
 {
 	if (!bpf_sched_enabled())
 		return;
+	if (!(current->flags & PF_IVH_ELIGIBLE))
+		return;
 	if (!in_task() || !preemptible() || current->lock_depth > 0)
 		return;
 	bpf_sched_pre_lock_migrate();

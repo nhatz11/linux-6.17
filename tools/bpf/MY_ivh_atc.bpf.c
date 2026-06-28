@@ -177,6 +177,7 @@ struct task_ctx {
     u64 rq_last_preempt;               /* last_preemption of source rq (age reference) */
     int *found_active_worker_ptr;      /* Tier 1: found a pure-compute vCPU */
     int average_capacity;              /* system average capacity */
+    int source_capacity;               /* cpu_capacity of the source vCPU */
     int total_cpus;                    /* total number of CPUs in system */
 };
 
@@ -228,9 +229,18 @@ static int process_cpu(u32 iter, void *data)
     if (select_rq->curr->wait_depth > 0)
         return 0;
 
-    /* Skip if capacity is too low to be useful. */
-    if (select_rq->cpu_capacity <= 500 &&
-        select_rq->cpu_capacity <= ctx->average_capacity)
+    /*
+     * "Good enough" gate (EDWARDS-style): only migrate to a vCPU that is
+     * either above the system average or above the 50% floor (500/1024).
+     * Also requires the target to be strictly better than the source —
+     * lateral migrations to equally-throttled vCPUs waste a schedule()
+     * call and stall under uniform host contention (e.g. all CPUs stolen).
+     */
+    if (!(select_rq->cpu_capacity > ctx->average_capacity ||
+          select_rq->cpu_capacity > 500))
+        return 0;
+
+    if (select_rq->cpu_capacity <= ctx->source_capacity)
         return 0;
 
     /* Skip if the vCPU heartbeat is stale — hypervisor has already preempted it. */
@@ -428,6 +438,7 @@ int BPF_PROG(test3, struct rq *rq, struct task_struct *curr, u64 now_time, int a
         .rq_last_preempt = rq->last_preemption,
         .found_active_worker_ptr = &found_active_worker,
         .average_capacity = average_capacity,
+        .source_capacity = rq->cpu_capacity,
         .total_cpus = total_cpus
     };
 
