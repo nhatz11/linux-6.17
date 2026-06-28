@@ -51,6 +51,8 @@ SYSCALL_DEFINE0(ivh_cs_enter)
 {
 	if (!bpf_sched_enabled())
 		return 0;
+	if (!(current->flags & PF_IVH_ELIGIBLE))
+		return 0;
 
 	bpf_sched_pre_lock_migrate();
 	return 0;
