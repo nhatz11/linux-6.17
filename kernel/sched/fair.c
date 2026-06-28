@@ -12964,7 +12964,7 @@ void bpf_sched_pre_lock_migrate(void)
 	src_cpu = rq->cpu;
 
 	/* Gate 1: vCPU not throttled */
-	if (rq->cpu_capacity > IVH_CAPACITY_THRESHOLD)
+	if (rq->cpu_capacity > ivh_capacity_threshold)
 		return;
 
 	/* Gate 2: enough burst time remains — migration not urgent */

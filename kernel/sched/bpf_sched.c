@@ -10,6 +10,16 @@
 #include "sched.h"
 
 /*
+ * Capacity gate: trigger IVH only when the source vCPU is at or below this
+ * fraction of full capacity (scale 0–1024).  Default 512 = 50%: migrate only
+ * from severely stolen vCPUs where the gain is unambiguous and a clearly
+ * better target is more likely to exist.  Raising toward 900 makes IVH more
+ * aggressive (fires at ~12% steal) but risks pool exhaustion under heavy load.
+ *   echo 512 > /proc/sys/kernel/ivh_capacity_threshold
+ */
+unsigned long ivh_capacity_threshold = 512UL;
+
+/*
  * Time-left gate: skip migration when this many nanoseconds remain in the
  * estimated active burst.  Tunable at runtime via sysctl without a rebuild:
  *   echo 250000 > /proc/sys/kernel/ivh_time_left_threshold_ns
@@ -20,6 +30,13 @@ unsigned long ivh_time_left_threshold_ns = 500000UL;
 
 #ifdef CONFIG_SYSCTL
 static const struct ctl_table ivh_sysctls[] = {
+	{
+		.procname	= "ivh_capacity_threshold",
+		.data		= &ivh_capacity_threshold,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
 	{
 		.procname	= "ivh_time_left_threshold_ns",
 		.data		= &ivh_time_left_threshold_ns,

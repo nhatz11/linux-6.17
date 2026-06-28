@@ -26,8 +26,12 @@ int bpf_sched_verify_prog(struct bpf_verifier_log *vlog,
  */
 void bpf_sched_pre_lock_migrate(void);
 
-/* Capacity threshold shared between bpf_sched.c and fair.c */
-#define IVH_CAPACITY_THRESHOLD	900u
+/* Runtime-tunable capacity gate; defined in bpf_sched.c.
+ * Gate 1 fires when rq->cpu_capacity <= this value (scale: 0–1024).
+ * Default 512 = 50% capacity = trigger only on severely stolen vCPUs.
+ *   echo 512 > /proc/sys/kernel/ivh_capacity_threshold
+ */
+extern unsigned long ivh_capacity_threshold;
 
 /* Runtime-tunable time-left gate (ns); defined in bpf_sched.c */
 extern unsigned long ivh_time_left_threshold_ns;
