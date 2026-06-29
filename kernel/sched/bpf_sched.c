@@ -28,6 +28,26 @@ unsigned long ivh_capacity_threshold = 512UL;
  */
 unsigned long ivh_time_left_threshold_ns = 500000UL;
 
+/*
+ * Migration watchdog timeout (ns): if schedule() does not return within this
+ * window after set_cpus_allowed_ptr({target}), the target vCPU is assumed
+ * stolen and the original affinity is restored so the thread can run on any
+ * healthy CPU instead of waiting indefinitely.
+ * Default 500 µs (~8× the typical 65 µs migration RTT).
+ * Set to 0 to disable the watchdog (not recommended under steal).
+ *   echo 500000 > /proc/sys/kernel/ivh_migration_timeout_ns
+ */
+unsigned long ivh_migration_timeout_ns = 500000UL;
+
+/*
+ * Concurrency cap: maximum number of threads allowed inside schedule()
+ * simultaneously during IVH migration.  Prevents pool exhaustion under
+ * heavy steal where many threads pass the gates at once.
+ * Default 3.  Set to 0 to disable the cap.
+ *   echo 3 > /proc/sys/kernel/ivh_max_concurrent
+ */
+unsigned long ivh_max_concurrent = 3UL;
+
 #ifdef CONFIG_SYSCTL
 static const struct ctl_table ivh_sysctls[] = {
 	{
@@ -40,6 +60,20 @@ static const struct ctl_table ivh_sysctls[] = {
 	{
 		.procname	= "ivh_time_left_threshold_ns",
 		.data		= &ivh_time_left_threshold_ns,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_migration_timeout_ns",
+		.data		= &ivh_migration_timeout_ns,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_max_concurrent",
+		.data		= &ivh_max_concurrent,
 		.maxlen		= sizeof(unsigned long),
 		.mode		= 0644,
 		.proc_handler	= proc_doulongvec_minmax,

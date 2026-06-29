@@ -73,6 +73,7 @@ static DEFINE_RAW_SPINLOCK(my_spinlock);
 atomic_t ivh_in_schedule    = ATOMIC_INIT(0); /* threads inside schedule() */
 atomic_t ivh_trylock_misses  = ATOMIC_INIT(0); /* trylock contention skips  */
 atomic_t ivh_migrations_done = ATOMIC_INIT(0); /* completed migrations      */
+atomic_t ivh_timeout_count   = ATOMIC_INIT(0); /* watchdog fired (target stolen mid-migrate) */
 EXPORT_SYMBOL_GPL(ivh_in_schedule);
 EXPORT_SYMBOL_GPL(ivh_trylock_misses);
 EXPORT_SYMBOL_GPL(ivh_migrations_done);
@@ -12937,6 +12938,102 @@ out_unlock:
 
 //ivh start
 
+/*
+ * Per-migration watchdog: armed on src_cpu before schedule(); fires on src_cpu
+ * (HRTIMER_MODE_REL_PINNED keeps it here even after the task migrates away).
+ * If schedule() hasn't returned within ivh_migration_timeout_ns, the target
+ * vCPU is assumed stolen and the original affinity is restored so the task
+ * can run on any healthy CPU instead of waiting indefinitely.
+ */
+struct ivh_migration_wd {
+	struct hrtimer     timer;
+	struct task_struct *task;
+	cpumask_var_t      rescue_mask; /* saved_mask minus target_cpu */
+	atomic_t           done;        /* 1 once schedule() returned or timer fired */
+};
+
+/*
+ * ivh_rescue_stuck_task - directly pull a task out of a stolen CPU's runqueue.
+ *
+ * set_cpus_allowed_ptr() internally queues stop work on the task's current CPU.
+ * If that CPU is stolen by the hypervisor the stop work never executes, so the
+ * task stays stuck even after the watchdog fires.
+ *
+ * Instead, we use the same deactivate_task/attach_one_task pattern that
+ * migrate_task_to_async_fair() uses, but operating FROM the healthy src_cpu
+ * rather than from inside the stolen CPU's stop callback.  The stolen CPU's
+ * runqueue lock is a spinlock in shared memory — any CPU can acquire it.
+ */
+static void ivh_rescue_stuck_task(struct task_struct *p,
+				   const struct cpumask *new_mask)
+{
+	struct rq *src_rq, *dst_rq;
+	struct rq_flags rf;
+	int cpu, dest_cpu = -1;
+
+	for_each_cpu_and(cpu, new_mask, cpu_active_mask) {
+		if (!is_cpu_preempted(cpu)) {
+			dest_cpu = cpu;
+			break;
+		}
+	}
+	if (dest_cpu < 0) {
+		/*
+		 * All CPUs in the rescue mask appear stolen.  Don't force the
+		 * task onto another stolen runqueue — just widen its affinity
+		 * back to rescue_mask so the scheduler can migrate it naturally
+		 * when any of those CPUs comes back.  Without this the task
+		 * stays permanently pinned to cpumask_of(target_cpu) and can
+		 * never escape even after steal ends.
+		 */
+		struct rq_flags rf;
+		struct rq *rq = task_rq_lock(p, &rf);
+		do_set_cpus_allowed(p, new_mask);
+		task_rq_unlock(rq, p, &rf);
+		return;
+	}
+
+	dst_rq = cpu_rq(dest_cpu);
+
+	/* Lock stolen CPU's rq from this CPU — shared spinlock, no CPU needed */
+	src_rq = task_rq_lock(p, &rf);
+
+	/* Only rescue runnable-but-not-running tasks */
+	if (task_current(src_rq, p) || !task_on_rq_queued(p) || src_rq == dst_rq) {
+		task_rq_unlock(src_rq, p, &rf);
+		return;
+	}
+
+	update_rq_clock(src_rq);
+
+	/* Update allowed CPUs first, then dequeue and move — mirrors detach_task() */
+	do_set_cpus_allowed(p, new_mask);
+	deactivate_task(src_rq, p, DEQUEUE_NOCLOCK);
+	set_task_cpu(p, dest_cpu);
+
+	task_rq_unlock(src_rq, p, &rf);
+
+	/* Enqueue on the healthy CPU — attach_one_task() handles its own locking */
+	attach_one_task(dst_rq, p);
+}
+
+static enum hrtimer_restart ivh_migration_watchdog(struct hrtimer *timer)
+{
+	struct ivh_migration_wd *wd =
+		container_of(timer, struct ivh_migration_wd, timer);
+
+	if (atomic_cmpxchg(&wd->done, 0, 1) == 0) {
+		atomic_inc(&ivh_timeout_count);
+		/*
+		 * Directly pull the task from the stolen CPU's runqueue.
+		 * Cannot use set_cpus_allowed_ptr() here: it queues stop work
+		 * on the stolen CPU which never executes while the vCPU is dark.
+		 */
+		ivh_rescue_stuck_task(wd->task, wd->rescue_mask);
+	}
+	return HRTIMER_NORESTART;
+}
+
 /**
  * bpf_sched_pre_lock_migrate - synchronous self-migration before spinlock acquire.
  *
@@ -12978,6 +13075,10 @@ void bpf_sched_pre_lock_migrate(void)
 
 	/* Gate 3: task must be movable (more than one allowed CPU) */
 	if (cpumask_weight(current->cpus_ptr) <= 1)
+		return;
+
+	/* Gate 4: concurrency cap — don't pile threads into schedule() */
+	if ((unsigned long)atomic_read(&ivh_in_schedule) >= ivh_max_concurrent)
 		return;
 
 	/*
@@ -13035,6 +13136,50 @@ void bpf_sched_pre_lock_migrate(void)
 	}
 	cpumask_copy(saved_mask, &current->cpus_mask);
 
+	/*
+	 * Layer 1 — borrowed from preempt_migrate_func(): check target health
+	 * immediately before committing.  is_cpu_preempted() returns non-zero
+	 * if target's clock_preempt heartbeat is >1.5 ms stale, meaning the
+	 * hypervisor has been stealing it long enough to make migration risky.
+	 * Abort rather than pin ourselves to a CPU that may never get time.
+	 */
+	if (is_cpu_preempted(target_cpu)) {
+		atomic_fetch_andnot(PRMPT_HELD_MASK, prmpt_flags(target_cpu));
+		current->lock_depth--;
+		free_cpumask_var(saved_mask);
+		return;
+	}
+
+	/*
+	 * Layer 2 — hrtimer watchdog (not pinned).  If schedule() has not
+	 * returned within ivh_migration_timeout_ns, the target was stolen
+	 * between the Layer-1 check and schedule().  The callback widens
+	 * affinity back to rescue_mask so the task can escape.
+	 *
+	 * Intentionally NOT pinned: the source vCPU is stolen (that is why
+	 * we are migrating), so a PINNED timer would silently sit dark on
+	 * that CPU and never fire.  An unpinned timer lets the kernel move
+	 * it to whichever CPU is actually running.
+	 */
+	struct ivh_migration_wd wd;
+	bool wd_armed = false;
+
+	if (ivh_migration_timeout_ns && alloc_cpumask_var(&wd.rescue_mask, GFP_KERNEL)) {
+		/* Rescue mask = original CPUs minus the now-suspected target. */
+		cpumask_andnot(wd.rescue_mask, saved_mask, cpumask_of(target_cpu));
+		if (cpumask_empty(wd.rescue_mask))
+			cpumask_copy(wd.rescue_mask, saved_mask);
+
+		atomic_set(&wd.done, 0);
+		wd.task = current;
+		hrtimer_setup_on_stack(&wd.timer, ivh_migration_watchdog,
+				       CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+		hrtimer_start(&wd.timer,
+			      ns_to_ktime(ivh_migration_timeout_ns),
+			      HRTIMER_MODE_REL);
+		wd_armed = true;
+	}
+
 	trace_printk("ivh_pre_sched: pid=%d comm=%s src=%d dst=%d in_sched=%d\n",
 		     current->pid, current->comm, src_cpu, target_cpu,
 		     atomic_read(&ivh_in_schedule));
@@ -13044,6 +13189,15 @@ void bpf_sched_pre_lock_migrate(void)
 		schedule();
 
 	atomic_dec(&ivh_in_schedule);
+
+	if (wd_armed) {
+		/* Signal the watchdog we finished, then wait for any in-flight callback. */
+		atomic_cmpxchg(&wd.done, 0, 1);
+		hrtimer_cancel(&wd.timer);
+		destroy_hrtimer_on_stack(&wd.timer);
+		free_cpumask_var(wd.rescue_mask);
+	}
+
 	trace_printk("ivh_post_sched: pid=%d comm=%s landed_cpu=%d dst_was=%d\n",
 		     current->pid, current->comm, smp_processor_id(), target_cpu);
 
@@ -13063,9 +13217,13 @@ static int ivh_debug_show(struct seq_file *m, void *v)
 	seq_printf(m, "ivh_in_schedule:    %d\n", atomic_read(&ivh_in_schedule));
 	seq_printf(m, "ivh_trylock_misses: %d\n", atomic_read(&ivh_trylock_misses));
 	seq_printf(m, "ivh_migrations_done:%d\n", atomic_read(&ivh_migrations_done));
+	seq_printf(m, "ivh_timeout_count:  %d\n", atomic_read(&ivh_timeout_count));
 	seq_printf(m, "\n");
 	seq_printf(m, "# If in_schedule > 0 during a hang:\n");
 	seq_printf(m, "#   threads are stuck in schedule() waiting for vCPU on target\n");
+	seq_printf(m, "# If timeout_count is rising:\n");
+	seq_printf(m, "#   watchdog fired: targets were stolen mid-migration\n");
+	seq_printf(m, "#   lower ivh_capacity_threshold or raise ivh_migration_timeout_ns\n");
 	seq_printf(m, "# If in_schedule == 0 and trylock_misses is high:\n");
 	seq_printf(m, "#   trylock contention is frequent (expected under burst load)\n");
 	seq_printf(m, "# If migrations_done == 0:\n");

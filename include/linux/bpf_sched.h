@@ -36,6 +36,16 @@ extern unsigned long ivh_capacity_threshold;
 /* Runtime-tunable time-left gate (ns); defined in bpf_sched.c */
 extern unsigned long ivh_time_left_threshold_ns;
 
+/* Runtime-tunable migration watchdog timeout (ns); defined in bpf_sched.c.
+ * If schedule() does not return within this window the original affinity is
+ * restored from hrtimer context so the thread escapes a stolen target vCPU.
+ * Set to 0 to disable.  Default 500 µs.
+ */
+extern unsigned long ivh_migration_timeout_ns;
+
+/* Concurrency cap: max threads allowed in schedule() during IVH migration. */
+extern unsigned long ivh_max_concurrent;
+
 DECLARE_STATIC_KEY_FALSE(bpf_sched_enabled_key);
 
 static inline bool bpf_sched_enabled(void)
