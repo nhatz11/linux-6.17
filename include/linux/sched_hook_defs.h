@@ -3,7 +3,7 @@ BPF_SCHED_HOOK(int, 0, cfs_check_preempt_tick, struct sched_entity *curr, unsign
 BPF_SCHED_HOOK(int, 0, cfs_check_preempt_wakeup, struct task_struct *curr, struct task_struct *p)
 BPF_SCHED_HOOK(int, 0, cfs_wakeup_preempt_entity, struct sched_entity *curr, struct sched_entity *se)
 BPF_SCHED_HOOK(int, 0, cfs_vcpu_capacity, void)
-BPF_SCHED_HOOK(int, 0, cfs_sched_tick_end,struct rq *rq,u64 now_time,unsigned int num_of_idle)
+BPF_SCHED_HOOK(int, 0, cfs_sched_tick_end,struct rq *rq,u64 now_time,unsigned int num_of_idle,int curr_lock_depth,int curr_kernel_lockholder,int curr_user_lockholder,int curr_lockholder,int curr_waiter)
 BPF_SCHED_HOOK(int, 0, cfs_get_polling_amount,struct rq *rq)
 BPF_SCHED_HOOK(int, 0, cfs_select_run_cpu_spin,struct rq *rq,struct task_struct *curr,u64 now_time,int average_capacity,int total_cpus)
 BPF_SCHED_HOOK(int, 0, cfs_select_run_cpu,struct rq *rq, struct rq *select_rq,u64 now_time,int max)

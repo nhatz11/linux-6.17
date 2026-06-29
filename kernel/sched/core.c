@@ -67,6 +67,10 @@
 #include <linux/wait_api.h>
 #include <linux/workqueue_api.h>
 #include <linux/livepatch_sched.h>
+#include <linux/debugfs.h>
+#include <linux/seq_file.h>
+#include <asm/paravirt.h>
+
 
 #ifdef CONFIG_PREEMPT_DYNAMIC
 # ifdef CONFIG_GENERIC_IRQ_ENTRY
@@ -187,7 +191,11 @@ int average_capacity_all = 0;
 void get_steal_and_preemptions(int cpunum,u64* preempt,u64* steals_time){
         struct rq *rq = cpu_rq(cpunum);
         *preempt= rq->preemptions;
-        *steals_time= paravirt_steal_clock(cpunum);;
+#ifdef CONFIG_PARAVIRT
+        *steals_time= paravirt_steal_clock(cpunum);
+#else
+        *steals_time= 0;
+#endif
 }
 //get average capacity of all cores in the system, set by vCapacity, used by the bpf hooks
 int get_average_capacity_all(void){
@@ -225,13 +233,71 @@ void set_custom_capacity(unsigned long custom_capacity, int cpu) {
         rq->cpu_capacity_custom = custom_capacity;
 }
 
+/* Written by vsched_module via /proc/vact_write; read by bpf_sched_lock_acquire() */
+void set_ewma_act_ns(int cpu, u64 ewma_act_ns)
+{
+        struct rq *rq = cpu_rq(cpu);
+        rq->ewma_act_ns = ewma_act_ns;
+}
+
 EXPORT_SYMBOL(set_custom_capacity);
+EXPORT_SYMBOL(set_ewma_act_ns);
 EXPORT_SYMBOL(get_steal_and_preemptions);
 EXPORT_SYMBOL(get_max_latency);
 EXPORT_SYMBOL(set_avg_latency);
 EXPORT_SYMBOL(reset_max_latency);
 EXPORT_SYMBOL(get_average_capacity_all);
 EXPORT_SYMBOL(set_average_capacity_all);
+
+/* lhp tick-time lockholder classification — per-CPU snapshot */
+DEFINE_PER_CPU(struct lhp_classify_snapshot, lhp_last_class);
+EXPORT_PER_CPU_SYMBOL(lhp_last_class);
+
+static const char * const lhp_class_names[] = {
+	[LHP_NOT_LOCKHOLDER]    = "NOT_LOCKHOLDER",
+	[LHP_USER_MOVABLE]      = "USER_MOVABLE",
+	[LHP_USER_NONMOVABLE]   = "USER_NONMOVABLE",
+	[LHP_KERNEL_MOVABLE]    = "KERNEL_MOVABLE",
+	[LHP_KERNEL_NONMOVABLE] = "KERNEL_NONMOVABLE",
+};
+
+static int lhp_class_show(struct seq_file *m, void *v)
+{
+	int cpu;
+
+	for_each_possible_cpu(cpu) {
+		struct lhp_classify_snapshot snap = *per_cpu_ptr(&lhp_last_class, cpu);
+		const char *name = (snap.cls < ARRAY_SIZE(lhp_class_names))
+			? lhp_class_names[snap.cls] : "unknown";
+
+		seq_printf(m, "cpu=%-3d pid=%-6d comm=%-16s class=%-20s lock_depth=%-3d movable=%d user_waiter=%d cs_us=%-12llu active_us=%-12llu cs_pct=%llu\n",
+			   cpu, snap.pid, snap.comm, name, snap.lock_depth, snap.movable, snap.user_waiter,
+			   snap.cumulative_cs_time / 1000,
+			   snap.cumulative_active_time / 1000,
+			   snap.cumulative_active_time ?
+				snap.cumulative_cs_time * 100 / snap.cumulative_active_time : 0);
+	}
+	return 0;
+}
+
+static int lhp_class_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, lhp_class_show, NULL);
+}
+
+static const struct file_operations lhp_class_fops = {
+	.open    = lhp_class_open,
+	.read    = seq_read,
+	.llseek  = seq_lseek,
+	.release = single_release,
+};
+
+static int __init lhp_class_debugfs_init(void)
+{
+	debugfs_create_file("lhp_class", 0444, NULL, NULL, &lhp_class_fops);
+	return 0;
+}
+late_initcall(lhp_class_debugfs_init);
 
 __read_mostly int scheduler_running;
 
@@ -926,6 +992,7 @@ static enum hrtimer_restart hrtick(struct hrtimer *timer)
 	struct rq_flags rf;
 
 	WARN_ON_ONCE(cpu_of(rq) != smp_processor_id());
+	rseq_delay_resched_tick();
 
 	rq_lock(rq, &rf);
 	update_rq_clock(rq);
@@ -977,6 +1044,16 @@ void hrtick_start(struct rq *rq, u64 delay)
 		__hrtick_restart(rq);
 	else
 		smp_call_function_single_async(cpu_of(rq), &rq->hrtick_csd);
+}
+
+void hrtick_local_start(u64 delay)
+{
+	struct rq *rq = this_rq();
+	struct rq_flags rf;
+
+	rq_lock(rq, &rf);
+	hrtick_start(rq, delay);
+	rq_unlock(rq, &rf);
 }
 
 static void hrtick_rq_init(struct rq *rq)
@@ -1367,6 +1444,41 @@ static void nohz_csd_func(void *info)
 }
 
 #endif /* CONFIG_NO_HZ_COMMON */
+
+static noinline int __cpuidle custom_idle_poll(int cpu)
+{
+	int counter = 0;
+	int spin_len = bpf_sched_cfs_spin_len(1);
+
+	while (!tif_need_resched()) {
+		cpu_relax();
+		if (counter > spin_len)
+			break;
+		if (is_cpu_preempted(cpu))
+			break;
+		if (idle_cpu(cpu))
+			break;
+		counter++;
+	}
+	return 1;
+}
+
+static void preempt_migrate_func(void *info)
+{
+	struct rq *rq = info;
+
+	if (!is_cpu_preempted(rq->cpu)) {
+		rq->broadcast_migrate = sched_clock();
+		stop_one_cpu_nowait(rq->cpu,
+				    migrate_task_to_async_fair, rq,
+				    &rq->preempt_migrate_work);
+		custom_idle_poll(rq->cpu);
+	} else {
+		rq->preempt_migrate_locked = 0;
+		atomic_fetch_andnot(PRMPT_HELD_MASK,
+				    prmpt_flags(smp_processor_id()));
+	}
+}
 
 #ifdef CONFIG_NO_HZ_FULL
 static inline bool __need_bw_check(struct rq *rq, struct task_struct *p)
@@ -4529,6 +4641,12 @@ int wake_up_state(struct task_struct *p, unsigned int state)
 static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
 {
 	p->on_rq			= 0;
+	p->lock_depth			= 0;
+	p->wait_depth			= 0;
+	p->cs_start_ts			= 0;
+	p->cumulative_cs_time		= 0;
+	p->sched_in_stamp		= 0;
+	p->cumulative_active_time	= 0;
 
 	p->se.on_rq			= 0;
 	p->se.exec_start		= 0;
@@ -5156,6 +5274,13 @@ static inline void finish_lock_switch(struct rq *rq)
 	 */
 	spin_acquire(&__rq_lockp(rq)->dep_map, 0, 0, _THIS_IP_);
 	__balance_callbacks(rq);
+	/*
+	 * The rq lock was acquired by prev in __schedule() but is released
+	 * here on behalf of current (next).  Balance the lock_depth counter
+	 * that raw_spin_rq_unlock_irq() will decrement so that current's
+	 * count stays correct.
+	 */
+	current->lock_depth++;
 	raw_spin_rq_unlock_irq(rq);
 }
 
@@ -5212,6 +5337,32 @@ prepare_task_switch(struct rq *rq, struct task_struct *prev,
 	kmap_local_sched_out();
 	prepare_task(next);
 	prepare_arch_switch(next);
+	/*
+	 * The rq lock was acquired by prev and will be released by next in
+	 * finish_lock_switch().  Undo prev's lock_depth increment here so
+	 * that when prev resumes it does not carry a phantom +1.
+	 */
+
+	/*
+	 * Pause the outermost-CS clock before going off-CPU.  cs_start_ts
+	 * must NOT tick while the task is preempted: off-CPU time is not
+	 * CS time.  We accumulate the on-CPU portion now and clear the stamp;
+	 * finish_task_switch will reopen it if the task still holds locks.
+	 * This must happen before lock_depth-- so the check below sees the
+	 * full (rq-lock-inclusive) depth.
+	 */
+	if (prev->cs_start_ts) {
+		prev->cumulative_cs_time += sched_clock() - prev->cs_start_ts;
+		prev->cs_start_ts = 0;
+	}
+
+	prev->lock_depth--;
+
+	/* Accumulate on-CPU time for the task being switched out. */
+	if (prev->sched_in_stamp) {
+		prev->cumulative_active_time += sched_clock() - prev->sched_in_stamp;
+		prev->sched_in_stamp = 0;
+	}
 }
 
 /**
@@ -5275,6 +5426,15 @@ static struct rq *finish_task_switch(struct task_struct *prev)
 	finish_task(prev);
 	tick_nohz_task_switch();
 	finish_lock_switch(rq);
+	/*
+	 * rq->lock is now released.  lock_depth here reflects only real user
+	 * spinlocks (the rq-lock +1/-1 in finish_lock_switch/raw_spin_rq_unlock
+	 * cancels out).  If the task was preempted mid-CS, reopen the CS clock
+	 * so cumulative_cs_time resumes counting from schedule-in.
+	 */
+	if (current->lock_depth > 0)
+		current->cs_start_ts = sched_clock();
+	current->sched_in_stamp = sched_clock();
 	finish_arch_post_lock_switch();
 	kcov_finish_switch(current);
 	/*
@@ -6967,6 +7127,9 @@ pick_again:
 picked:
 	clear_tsk_need_resched(prev);
 	clear_preempt_need_resched();
+#if defined(CONFIG_RSEQ) && defined(CONFIG_SCHED_HRTICK)
+	prev->rseq_sched_delay = 0;
+#endif
 keep_resched:
 	rq->last_seen_need_resched_ns = 0;
 
@@ -8858,6 +9021,7 @@ void __init sched_init(void)
 
 		INIT_CSD(&rq->nohz_csd, nohz_csd_func, rq);
 #endif
+		INIT_CSD(&rq->preempt_migrate, preempt_migrate_func, rq);
 #ifdef CONFIG_HOTPLUG_CPU
 		rcuwait_init(&rq->hotplug_wait);
 #endif

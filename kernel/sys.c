@@ -2805,6 +2805,21 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 	case PR_FUTEX_HASH:
 		error = futex_hash_prctl(arg2, arg3, arg4);
 		break;
+	case PR_SET_IVH_ELIGIBLE:
+		if (arg3 || arg4 || arg5)
+			return -EINVAL;
+		if (arg2 == 1)
+			current->flags |= PF_IVH_ELIGIBLE;
+		else if (arg2 == 0)
+			current->flags &= ~PF_IVH_ELIGIBLE;
+		else
+			return -EINVAL;
+		break;
+	case PR_GET_IVH_ELIGIBLE:
+		if (arg2 || arg3 || arg4 || arg5)
+			return -EINVAL;
+		error = !!(current->flags & PF_IVH_ELIGIBLE);
+		break;
 	default:
 		trace_task_prctl_unknown(option, arg2, arg3, arg4, arg5);
 		error = -EINVAL;

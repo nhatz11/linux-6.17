@@ -37,6 +37,63 @@ enum rseq_cs_flags {
 		(1U << RSEQ_CS_FLAG_NO_RESTART_ON_MIGRATE_BIT),
 };
 
+enum rseq_sched_state_flags {
+	/*
+	 * Task is currently running on a CPU if set.  The kernel sets this
+	 * bit on the return-to-userspace path (rseq_update_cpu_node_id) and
+	 * clears it on preemption (rseq_preempt → rseq_set_sched_state(t,0)).
+	 * Read by any userspace thread with single-copy atomicity semantics.
+	 */
+	RSEQ_SCHED_STATE_FLAG_ON_CPU		= (1U << 0),
+};
+
+/*
+ * struct rseq_sched_state - scheduler visibility state for one thread.
+ *
+ * Allocated by userspace, its address is registered with the kernel via
+ * the sched_state_ptr field of struct rseq.  The kernel updates 'state'
+ * on the return-to-userspace path and on preemption.  Any userspace
+ * thread may read 'state' to determine whether the owning thread is
+ * currently on-CPU.
+ *
+ * The page that contains this structure must be faulted in before
+ * registration; the kernel writes to it with pagefault_disable() in
+ * the preemption path and will silently skip the update if the page is
+ * not present.
+ *
+ * Natural alignment is required; cache-line alignment is recommended.
+ */
+struct rseq_sched_state {
+	/*
+	 * Version of this structure.  Populated (set to 0) by the kernel
+	 * at registration time; read by user-space.
+	 */
+	__u32 version;
+	/*
+	 * Scheduler state bitmask (enum rseq_sched_state_flags).
+	 * Updated by the kernel.  Read by any userspace thread with
+	 * single-copy atomicity semantics.  Aligned on 32-bit.
+	 */
+	__u32 state;
+	/*
+	 * TID of the thread that registered this structure.  Initialized
+	 * by userspace before registration; not modified by the kernel.
+	 */
+	__u32 tid;
+};
+
+enum rseq_cr_flags_bit {
+	RSEQ_CR_FLAG_IN_CRITICAL_SECTION_BIT	= 0,
+	RSEQ_CR_FLAG_KERNEL_REQUEST_SCHED_BIT	= 1,
+};
+
+enum rseq_cr_flags {
+	RSEQ_CR_FLAG_KERNEL_REQUEST_SCHED =
+		(1U << RSEQ_CR_FLAG_KERNEL_REQUEST_SCHED_BIT),
+};
+
+#define RSEQ_CR_FLAG_IN_CRITICAL_SECTION_MASK	(~0U >> 1)
+
 /*
  * struct rseq_cs is aligned on 4 * 8 bytes to ensure it is always
  * contained within a single cache-line. It is usually declared as
@@ -149,7 +206,103 @@ struct rseq {
 	__u32 mm_cid;
 
 	/*
+	 * cr_counter: user space sets any bit to indicate it is in a
+	 * critical section. Bit 1 is reserved for the kernel to request
+	 * that the task yield (RSEQ_CR_FLAG_KERNEL_REQUEST_SCHED).
+	 * Any non-zero value in bits [31:1] means in critical section.
+	 */
+	__u32 cr_counter;
+
+	/*
+	 * wait_counter: user space increments (by 4, same encoding as
+	 * cr_counter bits [31:2]) to indicate it is in a spin/wait region
+	 * waiting to acquire a lock. Bits [1:0] are reserved.
+	 * Non-zero bits [31:2] mean the thread is currently spinning/waiting.
+	 * Distinct from cr_counter: cr_counter tracks holding; wait_counter
+	 * tracks waiting.
+	 */
+	__u32 wait_counter;
+
+	/*
+	 * _cs_pad: explicit alignment padding so the u64 CS timing fields
+	 * below begin on an 8-byte boundary (wait_counter ends at offset 36;
+	 * next 8-byte boundary is offset 40).  Reserved for future use.
+	 */
+	__u32 _cs_pad;
+
+	/*
+	 * last_cs_overall_ns: written by user space at the moment a spinlock
+	 * or rseq-tracked critical section is released.  Contains the wall-
+	 * clock duration of the most recently completed CS in nanoseconds:
+	 *
+	 *   last_cs_overall_ns = unlock_ts(CLOCK_MONOTONIC)
+	 *                      - lock_ts(CLOCK_MONOTONIC)
+	 *
+	 * "CS" means from successful lock acquisition to the moment of unlock.
+	 * Written by the locking library (LD_PRELOAD or glibc pthread), not
+	 * by the kernel.  Zero until the first CS completes.
+	 */
+	__u64 last_cs_overall_ns;
+
+	/*
+	 * last_cs_active_ns: written by user space at unlock alongside
+	 * last_cs_overall_ns.  Contains the on-CPU (active) duration of the
+	 * most recently completed CS in nanoseconds:
+	 *
+	 *   last_cs_active_ns = unlock_ts(CLOCK_THREAD_CPUTIME_ID)
+	 *                     - lock_ts(CLOCK_THREAD_CPUTIME_ID)
+	 *
+	 * CLOCK_THREAD_CPUTIME_ID does not advance while the thread is off-CPU,
+	 * so last_cs_overall_ns - last_cs_active_ns gives the off-CPU time
+	 * accumulated while the lock was held.
+	 * Written by the locking library, not by the kernel.
+	 */
+	__u64 last_cs_active_ns;
+
+	/*
+	 * last_wait_overall_ns: written by user space at unlock alongside the
+	 * CS timing fields.  Contains the wall-clock duration from the moment
+	 * the locking library first attempted to acquire the lock (before any
+	 * spinning) to the moment the lock was successfully acquired:
+	 *
+	 *   last_wait_overall_ns = lock_acquired_ts(CLOCK_MONOTONIC)
+	 *                        - lock_attempt_ts(CLOCK_MONOTONIC)
+	 *
+	 * When the lock is acquired without contention this value is the
+	 * latency of the first CAS; under contention it includes all spinning
+	 * time.  Together with last_cs_overall_ns it gives the full lock-cycle
+	 * wall time: last_wait_overall_ns + last_cs_overall_ns.
+	 *
+	 * Note: last_wait_active_ns is intentionally omitted from the ABI.
+	 * Spinning is CPU-bound so wait_active ≈ wait_overall in the common
+	 * case, and adding a second wait u64 would push sizeof to 96 bytes,
+	 * which increases the chance of spanning two cache lines under the
+	 * current 32-byte alignment.  The locking library may track it
+	 * internally.
+	 *
+	 * This field fills the 8 bytes of alignment padding that existed
+	 * between last_cs_active_ns and the struct boundary, so sizeof remains
+	 * 64 bytes.
+	 */
+	__u64 last_wait_overall_ns;
+
+	/*
+	 * Pointer to a userspace-allocated struct rseq_sched_state.
+	 * Initialized by userspace to the address of the rseq_sched_state
+	 * structure before registration.  Set to 0 if the feature is not
+	 * used.  Read by the kernel at rseq registration; stored internally
+	 * as task_struct::rseq_sched_state.
+	 *
+	 * NOTE: adding this field changes offsetof(struct rseq, end) from
+	 * 64 to 72.  Userspace that previously registered with rseq_len=64
+	 * must update to rseq_len=72 (or rseq_len=32 for the ORIG ABI).
+	 */
+	__u64 sched_state_ptr;
+
+	/*
 	 * Flexible array member at end of structure, after last feature field.
+	 * offsetof(struct rseq, end) = 72.
+	 * AT_RSEQ_FEATURE_SIZE will report 72 after a kernel rebuild.
 	 */
 	char end[];
 } __attribute__((aligned(4 * sizeof(__u64))));

@@ -114,12 +114,37 @@ extern void set_custom_capacity(unsigned long custom_capacity, int cpu);
 extern void get_steal_and_preemptions(int cpunum, u64 *preempt, u64 *steals_time);
 extern void get_max_latency(int cpunum, u64 *max_latency);
 extern void set_avg_latency(int cpunum, u64 avg_latency);
+extern void set_ewma_act_ns(int cpu, u64 ewma_act_ns);
 extern int  get_average_capacity_all(void);
 extern void set_average_capacity_all(int av_capacity);
 extern void reset_max_latency(u64 max_latency);
+extern int  is_cpu_preempted(int cpunum);
+extern int  migrate_task_to_async_fair(void *data);
 
+/* lhp tick-time lockholder classification */
+enum lhp_class {
+	LHP_NOT_LOCKHOLDER    = 0,
+	LHP_USER_MOVABLE      = 1,
+	LHP_USER_NONMOVABLE   = 2,
+	LHP_KERNEL_MOVABLE    = 3,
+	LHP_KERNEL_NONMOVABLE = 4,
+};
+
+struct lhp_classify_snapshot {
+	pid_t          pid;
+	char           comm[TASK_COMM_LEN];
+	enum lhp_class cls;
+	int            lock_depth;
+	int            movable;
+	int            user_waiter;       /* non-zero if rseq wait_counter bits [31:2] set */
+	u64            cumulative_cs_time;     /* ns in kernel spinlock CS (outermost only) */
+	u64            cumulative_active_time; /* ns on-CPU since task was created */
+};
+
+DECLARE_PER_CPU(struct lhp_classify_snapshot, lhp_last_class);
 
 #define prmpt_flags(cpu) (&cpu_rq(cpu)->prmpt_flags)
+#define PRMPT_HELD_MASK   BIT(2)
 
 
 /*
@@ -1335,6 +1360,8 @@ struct rq {
     u64           clock_preempt;
     unsigned long last_idle_tp;
     u64           last_preemption;
+    u64           ewma_act_ns;     /* EWMA active burst duration in ns; written by vsched_module via set_ewma_act_ns() */
+    u64           last_active_time;
 
     /* vSched / vProber data */
     unsigned long           cpu_capacity_custom;
@@ -1346,6 +1373,9 @@ struct rq {
 
     struct __call_single_data preempt_migrate;
     u64                       wakeup_stamp;
+    struct cpu_stop_work      preempt_migrate_work;
+    unsigned long             avg_wakeup_latency;
+    unsigned long             broadcast_migrate;
 
 };
 

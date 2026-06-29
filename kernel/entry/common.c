@@ -19,6 +19,8 @@ void __weak arch_do_signal_or_restart(struct pt_regs *regs) { }
 __always_inline unsigned long exit_to_user_mode_loop(struct pt_regs *regs,
 						     unsigned long ti_work)
 {
+	unsigned long ignore_mask = 0;
+
 	/*
 	 * Before returning to user space ensure that all pending work
 	 * items have been completed.
@@ -27,8 +29,16 @@ __always_inline unsigned long exit_to_user_mode_loop(struct pt_regs *regs,
 
 		local_irq_enable_exit_to_user(ti_work);
 
-		if (ti_work & (_TIF_NEED_RESCHED | _TIF_NEED_RESCHED_LAZY))
+		if (ti_work & _TIF_NEED_RESCHED) {
 			schedule();
+		} else if (ti_work & _TIF_NEED_RESCHED_LAZY) {
+			if (rseq_delay_resched()) {
+				trace_printk("Avoid scheduling\n");
+				ignore_mask |= _TIF_NEED_RESCHED_LAZY;
+			} else {
+				schedule();
+			}
+		}
 
 		if (ti_work & _TIF_UPROBE)
 			uprobe_notify_resume(regs);
@@ -56,10 +66,11 @@ __always_inline unsigned long exit_to_user_mode_loop(struct pt_regs *regs,
 		tick_nohz_user_enter_prepare();
 
 		ti_work = read_thread_flags();
+		ti_work &= ~ignore_mask;
 	}
 
 	/* Return the latest work state for arch_exit_to_user_mode() */
-	return ti_work;
+	return ti_work | ignore_mask;
 }
 
 noinstr void irqentry_enter_from_user_mode(struct pt_regs *regs)

@@ -37,6 +37,39 @@ enum rseq_abi_cs_flags {
 		(1U << RSEQ_ABI_CS_FLAG_NO_RESTART_ON_MIGRATE_BIT),
 };
 
+enum rseq_abi_sched_state_flags {
+	/*
+	 * Task is currently running on a CPU if bit is set.
+	 */
+	RSEQ_ABI_SCHED_STATE_FLAG_ON_CPU	= (1U << 0),
+};
+
+/*
+ * struct rseq_abi_sched_state - per-thread scheduler visibility state.
+ *
+ * Allocated by userspace (typically as TLS), its address is registered
+ * with the kernel via the sched_state_ptr field of struct rseq_abi.
+ * Cache-line alignment is recommended to avoid false sharing.
+ */
+struct rseq_abi_sched_state {
+	/*
+	 * Version of this structure.  Populated (set to 0) by the kernel
+	 * at rseq registration time.
+	 */
+	__u32 version;
+	/*
+	 * Scheduler state bitmask (enum rseq_abi_sched_state_flags).
+	 * Updated by the kernel.  May be read by any userspace thread
+	 * with single-copy atomicity semantics.
+	 */
+	__u32 state;
+	/*
+	 * TID of the owning thread.  Initialized by userspace before
+	 * registration; not modified by the kernel.
+	 */
+	__u32 tid;
+};
+
 /*
  * struct rseq_abi_cs is aligned on 4 * 8 bytes to ensure it is always
  * contained within a single cache-line. It is usually declared as
@@ -165,7 +198,62 @@ struct rseq_abi {
 	__u32 mm_cid;
 
 	/*
+	 * The following fields are local extensions present in this tree
+	 * (linux-6.17 vSched/IVH port) and are not part of upstream Linux.
+	 * They occupy offsets 28–63 to match the kernel's struct rseq layout.
+	 */
+
+	/*
+	 * cr_counter: userspace sets bits [31:2] to encode spinlock nesting
+	 * depth.  Bit 0 is the bare rseq-entry marker.  Bit 1 is set by the
+	 * kernel to request a cooperative yield.  Offsets 28–31.
+	 */
+	__u32 cr_counter;
+
+	/*
+	 * wait_counter: userspace increments (by 4) while spinning on a lock.
+	 * Non-zero bits [31:2] mean the thread is waiting to acquire a lock.
+	 * Offsets 32–35.
+	 */
+	__u32 wait_counter;
+
+	/*
+	 * _cs_pad: alignment padding so the u64 timing fields below start at
+	 * an 8-byte boundary (offset 40).  Offsets 36–39.
+	 */
+	__u32 _cs_pad;
+
+	/*
+	 * last_cs_overall_ns: wall-clock duration (ns) of the most recently
+	 * completed critical section.  Written by the locking library at
+	 * unlock.  Offsets 40–47.
+	 */
+	__u64 last_cs_overall_ns;
+
+	/*
+	 * last_cs_active_ns: on-CPU duration (ns) of the most recently
+	 * completed critical section (CLOCK_THREAD_CPUTIME_ID).  Offsets 48–55.
+	 */
+	__u64 last_cs_active_ns;
+
+	/*
+	 * last_wait_overall_ns: wall-clock wait duration (ns) from first lock
+	 * attempt to successful acquisition.  Offsets 56–63.
+	 */
+	__u64 last_wait_overall_ns;
+
+	/*
+	 * sched_state_ptr: pointer to a userspace-allocated
+	 * struct rseq_abi_sched_state.  Initialized by userspace before
+	 * registration; set to 0 to opt out of the feature.  Read by the
+	 * kernel at rseq registration (offset 64, matching the kernel's
+	 * struct rseq layout for this tree).
+	 */
+	__u64 sched_state_ptr;
+
+	/*
 	 * Flexible array member at end of structure, after last feature field.
+	 * offsetof(struct rseq_abi, end) = 72.
 	 */
 	char end[];
 } __attribute__((aligned(4 * sizeof(__u64))));

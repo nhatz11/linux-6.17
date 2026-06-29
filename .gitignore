@@ -8,6 +8,13 @@
 # command after changing this file, to see if there are
 # any tracked files which get ignored after the change.
 #
+# Local session / benchmark artifacts
+clients/
+build.log
+preemptions
+outdated_session.md
+activate.sh
+setup.sh
 # Normal rules (sorted alphabetically)
 #
 .*

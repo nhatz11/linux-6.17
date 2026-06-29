@@ -523,6 +523,15 @@ static enum bpf_tramp_prog_type bpf_attach_type_to_tramp(struct bpf_prog *prog)
 			return BPF_TRAMP_FEXIT;
 		else
 			return BPF_TRAMP_MODIFY_RETURN;
+	case BPF_SCHED:
+		/*
+		 * vsched: SCHED programs attach via the same BTF trampoline as
+		 * LSM/MODIFY_RETURN. Without this case, the default below would
+		 * return BPF_TRAMP_REPLACE (the freplace/EXT path), which expects
+		 * a target prog and would mis-route SCHED link/unlink through
+		 * extension_prog handling. Treat SCHED like MODIFY_RETURN.
+		 */
+		return BPF_TRAMP_MODIFY_RETURN;
 	default:
 		return BPF_TRAMP_REPLACE;
 	}

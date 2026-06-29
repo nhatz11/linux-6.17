@@ -53,7 +53,9 @@ return now_time - ref;
 
 //Hook to determine whether to initiate IVH
 SEC("sched/cfs_sched_tick_end")
-int test(struct rq *rq, u64 now, unsigned int idle_cpus)
+int BPF_PROG(test, struct rq *rq, u64 now, unsigned int idle_cpus,
+             int curr_lock_depth, int curr_kernel_lockholder,
+             int curr_user_lockholder, int curr_lockholder)
 {
     struct task_struct *curr = rq->curr;
     
@@ -62,8 +64,8 @@ int test(struct rq *rq, u64 now, unsigned int idle_cpus)
         return 0;
     }
 
-    //if there are more - or less! then one sched idle task running, not a good candidate for IVH
-    if (rq->cfs.h_nr_runnable > 1) {
+    //if there are more - or less! then one non-sched-idle task running, not a good candidate for IVH
+    if ((rq->cfs.h_nr_runnable - rq->cfs.h_nr_idle) > 1) {
         return 0;
     }
 
@@ -71,7 +73,7 @@ int test(struct rq *rq, u64 now, unsigned int idle_cpus)
     if (curr == rq->idle) {
         return 0;
     }
-    
+
     //Checking to make sure we aren't moving away from a good core
     if (rq->cpu_capacity > 900) {
         return 0;
@@ -92,9 +94,9 @@ int test(struct rq *rq, u64 now, unsigned int idle_cpus)
     if (min_runtime_threshold > get_task_runtime(now, rq)) {
         return 0;
     }
-    
+
     //only tasks that are cpu intensive should be considered for IVH
-    int util_percent = (curr->se.avg.util_avg * 100) / (1L << 10); 
+    int util_percent = (curr->se.avg.util_avg * 100) / (1L << 10);
     if (util_percent < 60) {
         return 0;
     }
@@ -168,8 +170,8 @@ static int process_cpu(u32 iter, void *data)
         return 0;
     }
 
-    //if there are(non sched idle) tasks running at my destination - why should I move there?
-    if (select_rq->cfs.h_nr_runnable > 0) {
+    //if there are non-sched-idle tasks running at my destination - why should I move there?
+    if ((select_rq->cfs.h_nr_runnable - select_rq->cfs.h_nr_idle) > 0) {
         return 0;
     }
 
@@ -211,7 +213,7 @@ static int process_cpu(u32 iter, void *data)
 
 //Hook to decide on which core to land on
 SEC("sched/cfs_select_run_cpu_spin")
-int test3(struct rq *rq, struct task_struct *curr, u64 now_time, int average_capacity, int total_cpus)
+int BPF_PROG(test3, struct rq *rq, struct task_struct *curr, u64 now_time, int average_capacity, int total_cpus)
 {
     int start = 0;
     u32 nr_loops = total_cpus - 1;
@@ -329,7 +331,7 @@ static int search_latency(u32 iter, void *data)
 }
 
 SEC("sched/cfs_latency_select")
-int test32(int prev, struct task_struct *curr, struct cpumask *idle_cpus, 
+int BPF_PROG(test32, int prev, struct task_struct *curr, struct cpumask *idle_cpus,
              int average_capacity, int total_cpus)
 {
     int start = 0;

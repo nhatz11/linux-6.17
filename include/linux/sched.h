@@ -993,6 +993,9 @@ struct task_struct {
 #ifdef CONFIG_RT_MUTEXES
 	unsigned			sched_rt_mutex:1;
 #endif
+#if defined(CONFIG_RSEQ) && defined(CONFIG_SCHED_HRTICK)
+	unsigned			rseq_sched_delay:1;
+#endif
 
 	/* Bit to tell TOMOYO we're in execve(): */
 	unsigned			in_execve:1;
@@ -1407,6 +1410,12 @@ struct task_struct {
 	 * with respect to preemption.
 	 */
 	unsigned long rseq_event_mask;
+	/*
+	 * Pointer to the userspace rseq_sched_state structure, or NULL if
+	 * the thread did not register one.  Set at rseq registration from
+	 * struct rseq::sched_state_ptr; cleared on unregister and execve.
+	 */
+	struct rseq_sched_state __user *rseq_sched_state;
 # ifdef CONFIG_DEBUG_RSEQ
 	/*
 	 * This is a place holder to save a copy of the rseq fields for
@@ -1417,6 +1426,41 @@ struct task_struct {
 	char				rseq_fields[sizeof(struct rseq)];
 # endif
 #endif
+
+	int				lock_depth;	/* kernel spinlocks held in process context */
+	/* Incremented on entry to a contended qspinlock or OSQ slowpath,
+	 * decremented when spinning ends (lock acquired or bail to sleep).
+	 * > 0: task is currently spinning/waiting; == 0: not spinning. */
+	int				wait_depth;
+
+	/*
+	 * Kernel spinlock critical-section timing (outermost CS only).
+	 * cs_start_ts: sched_clock() snapshot at outermost acquire; reset to 0 in
+	 *   prepare_task_switch() (paused) and reopened in finish_task_switch()
+	 *   (resumed).  Used for on-CPU accumulation into cumulative_cs_time.
+	 * cs_wall_start_ts: sched_clock() snapshot at outermost acquire; never
+	 *   touched by context-switch handlers.  Cleared only at outermost release.
+	 *   Mirrors rseq::last_cs_overall_ns semantics: wall-clock CS duration.
+	 * cumulative_cs_time: total on-CPU nanoseconds inside kernel spinlock CSes.
+	 * last_cs_ns: wall-clock duration of the most recently completed outermost
+	 *   CS (sched_clock() - cs_wall_start_ts at release).  Mirrors
+	 *   rseq::last_cs_overall_ns for kernel spinlocks.
+	 * Updated only in process context (!in_interrupt()) by spinlock.c.
+	 */
+	u64				cs_start_ts;
+	u64				cs_wall_start_ts;
+	u64				cumulative_cs_time;
+	u64				last_cs_ns;
+
+	/*
+	 * On-CPU (active) time accounting.
+	 * sched_in_stamp: ktime_get_ns() recorded in finish_task_switch() when
+	 *   this task is scheduled in.  0 when the task is off-CPU.
+	 * cumulative_active_time: total nanoseconds on CPU, accumulated in
+	 *   prepare_task_switch() on each schedule-out.
+	 */
+	u64				sched_in_stamp;
+	u64				cumulative_active_time;
 
 #ifdef CONFIG_SCHED_MM_CID
 	int				mm_cid;		/* Current cid in mm */
@@ -1745,7 +1789,7 @@ extern struct pid *cad_pid;
 						 * I am cleaning dirty pages from some other bdi. */
 #define PF_KTHREAD		0x00200000	/* I am a kernel thread */
 #define PF_RANDOMIZE		0x00400000	/* Randomize virtual address space */
-#define PF__HOLE__00800000	0x00800000
+#define PF_IVH_ELIGIBLE		0x00800000	/* opted in to IVH pre-lock self-migration */
 #define PF__HOLE__01000000	0x01000000
 #define PF__HOLE__02000000	0x02000000
 #define PF_NO_SETAFFINITY	0x04000000	/* Userland is not allowed to meddle with cpus_mask */
@@ -1921,6 +1965,22 @@ union thread_union {
 #endif
 	unsigned long stack[THREAD_SIZE/sizeof(long)];
 };
+
+#if defined(CONFIG_RSEQ) && defined(CONFIG_SCHED_HRTICK)
+extern bool rseq_delay_resched(void);
+extern void rseq_delay_resched_fini(unsigned long ti_work);
+extern void rseq_delay_resched_tick(void);
+#else
+static inline bool rseq_delay_resched(void) { return false; }
+static inline void rseq_delay_resched_fini(unsigned long ti_work) { }
+static inline void rseq_delay_resched_tick(void) { }
+#endif
+
+#ifdef CONFIG_SCHED_HRTICK
+extern void hrtick_local_start(u64 delay);
+#else
+static inline void hrtick_local_start(u64 delay) { }
+#endif
 
 #ifndef CONFIG_THREAD_INFO_IN_TASK
 extern struct thread_info init_thread_info;

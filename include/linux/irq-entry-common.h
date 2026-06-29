@@ -225,6 +225,7 @@ static __always_inline void exit_to_user_mode_prepare(struct pt_regs *regs)
 		ti_work = exit_to_user_mode_loop(regs, ti_work);
 
 	arch_exit_to_user_mode_prepare(regs, ti_work);
+	rseq_delay_resched_fini(ti_work);
 
 	/* Ensure that kernel state is sane for a return to userspace */
 	kmap_assert_nomap();

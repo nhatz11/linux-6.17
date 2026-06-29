@@ -20,6 +20,7 @@
 #include <linux/hardirq.h>
 #include <linux/mutex.h>
 #include <linux/prefetch.h>
+#include <linux/sched.h>
 #include <asm/byteorder.h>
 #include <asm/qspinlock.h>
 #include <trace/events/lock.h>
@@ -193,8 +194,15 @@ void __lockfunc queued_spin_lock_slowpath(struct qspinlock *lock, u32 val)
 	 * clear_pending_set_locked() implementations imply full
 	 * barriers.
 	 */
-	if (val & _Q_LOCKED_MASK)
+	if (val & _Q_LOCKED_MASK) {
+		/* pending-bit holder spinning for owner to release */
+		if (!in_interrupt())
+			current->wait_depth++;
 		smp_cond_load_acquire(&lock->locked, !VAL);
+		/* owner released; we acquire below — spinning done */
+		if (!in_interrupt())
+			current->wait_depth--;
+	}
 
 	/*
 	 * take ownership and clear the pending bit.
@@ -212,6 +220,15 @@ void __lockfunc queued_spin_lock_slowpath(struct qspinlock *lock, u32 val)
 queue:
 	lockevent_inc(lock_slowpath);
 pv_queue:
+	/*
+	 * Native path: queue: falls through here.
+	 * PV path (CONFIG_PARAVIRT_SPINLOCKS): jumps here directly via
+	 * pv_enabled() -> goto pv_queue, bypassing the pending-bit section.
+	 * Either way this is the MCS queue slowpath entry; mark as waiting.
+	 * Balanced by decrement at release:.
+	 */
+	if (!in_interrupt())
+		current->wait_depth++;
 	node = this_cpu_ptr(&qnodes[0].mcs);
 	idx = node->count++;
 	tail = encode_tail(smp_processor_id(), idx);
@@ -372,7 +389,9 @@ locked:
 
 release:
 	trace_contention_end(lock, 0);
-
+	/* lock acquired; MCS queue spinning done */
+	if (!in_interrupt())
+		current->wait_depth--;
 	/*
 	 * release the node
 	 */
