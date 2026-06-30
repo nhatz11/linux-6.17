@@ -153,20 +153,15 @@ return now_time - ref;
 }
 
 //Function to check if a cpu is preempted
-//returns amount of time between heartbeat mechanism and current time
+//Returns 1 if the vCPU heartbeat is stale >1.5ms (hypervisor is stealing it),
+//0 if the heartbeat is fresh (CPU is running normally).
+//Matches the threshold used by the kernel's is_cpu_preempted() in cputime.c.
 static int is_cpu_preempted(struct rq *rq, u64 now_time)
 {
-    u64 time_diff = now_time - rq->clock_preempt;
-
-    if (rq->clock_preempt > now_time) {
+    if (rq->clock_preempt > now_time)
         return 0;
-    }
 
-    if (time_diff < 300000) {
-        return 0;
-    }
-
-    return time_diff;
+    return now_time - rq->clock_preempt > 300000ULL;
 }
 
 struct task_ctx {
@@ -244,8 +239,7 @@ static int process_cpu(u32 iter, void *data)
         return 0;
 
     /* Skip if the vCPU heartbeat is stale — hypervisor has already preempted it. */
-    u64 time_since_heartbeat = is_cpu_preempted(select_rq, ctx->now);
-    if (!time_since_heartbeat)
+    if (is_cpu_preempted(select_rq, ctx->now))
         return 0;
 
     /* Skip if target vCPU started its active burst earlier than us — it has
