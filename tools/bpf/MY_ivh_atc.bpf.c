@@ -164,16 +164,72 @@ static int is_cpu_preempted(struct rq *rq, u64 now_time)
     return now_time - rq->clock_preempt > 300000ULL;
 }
 
+/*
+ * Per-CPU counters: why did process_cpu() reject a candidate, or how did it
+ * accept one?  EXPERIMENT: hackbench gate-rejection profiling, 2026-07-01.
+ * Read after a run with: bpftool map dump name reject_reasons
+ */
+#define REJ_CPUMASK       0  /* not in task's own cpus_ptr */
+#define REJ_CLAIMED       1  /* already claimed by another IVH thread this tick */
+#define REJ_LOCKHOLDER    2  /* target's curr is inside a critical section */
+#define REJ_SPINNER       3  /* target's curr is already an MCS waiter */
+#define REJ_CAPACITY_LOW  4  /* fails EDWARDS-style capacity gate */
+#define REJ_NOT_BETTER    5  /* target capacity <= source capacity */
+#define REJ_PREEMPTED     6  /* target heartbeat stale (hypervisor stole it) */
+#define REJ_BURST_ORDER   7  /* target's active burst started earlier than ours */
+#define REJ_BURST_BUDGET  8  /* target has used up its typical active window */
+#define ACC_TIER1_ACTIVE  9  /* accepted: active (non-idle) worker */
+#define ACC_TIER2_IDLE    10 /* accepted (fallback record): idle vCPU */
+#define REJ_MAX           11
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, REJ_MAX);
+    __type(key, u32);
+    __type(value, u64);
+} reject_reasons SEC(".maps");
+
+static __always_inline void bump_reason(u32 reason)
+{
+    u64 *val = bpf_map_lookup_elem(&reject_reasons, &reason);
+    if (val)
+        (*val)++;
+}
+
+/*
+ * Compile-time gate toggles for process_cpu(), EXPERIMENT: hackbench
+ * leave-one-out gate sweep, 2026-07-01.  Set to 0 to disable a gate.
+ * (CPUMASK and CLAIMED are not toggleable: CPUMASK is a hard correctness
+ * requirement, CLAIMED prevents two IVH threads racing onto the same
+ * target — neither is a tunable policy decision.)
+ */
+#define GATE_LOCKHOLDER    1
+#define GATE_SPINNER    0
+#define GATE_CAPACITY_LOW    1
+#define GATE_NOT_BETTER    0
+#define GATE_PREEMPTED    0
+#define GATE_BURST_ORDER    1
+#define GATE_BURST_BUDGET    0
+
+/*
+ * Destination capacity floor, 2026-07-02 gate-combo experiment: require
+ * a migration target to be well above ivh_capacity_threshold (currently
+ * tuned to 512 as the *source* trigger ceiling), not just "average or
+ * >500". With a strict floor here, dest > 850 > source (<=512) always
+ * holds, so GATE_NOT_BETTER is provably redundant and left off.
+ */
+#define IVH_CAP_FLOOR    850
+
 struct task_ctx {
     struct task_struct *curr;          /* task that is to be moved */
     int *target_cpu_ptr;               /* result - where should the task be moved? */
     u64 now;
     int start;                         /* starting CPU */
     u64 rq_last_preempt;               /* last_preemption of source rq (age reference) */
-    int *found_active_worker_ptr;      /* Tier 1: found a pure-compute vCPU */
-    int average_capacity;              /* system average capacity */
     int source_capacity;               /* cpu_capacity of the source vCPU */
     int total_cpus;                    /* total number of CPUs in system */
+    int average_capacity;              /* system average capacity, for EDWARDS-style gate */
+    int *found_active_worker_ptr;      /* 1 once a Tier 1 (active worker) target is found */
 };
 
 static int process_cpu(u32 iter, void *data)
@@ -194,8 +250,10 @@ static int process_cpu(u32 iter, void *data)
     unsigned long cpumask_bits = *(cpumask->bits);
 
     //is valid cpu for task?
-    if (!(cpumask_bits & (1UL << cpu)))
+    if (!(cpumask_bits & (1UL << cpu))) {
+        bump_reason(REJ_CPUMASK);
         return 0;
+    }
 
     int *target_cpu_ptr = ctx->target_cpu_ptr;
 
@@ -207,13 +265,20 @@ static int process_cpu(u32 iter, void *data)
         return 0;
 
     //has this cpu been selected by other IVH threads?
-    if (select_rq->prmpt_flags.counter & (1 << 2))
+    if (select_rq->prmpt_flags.counter & (1 << 2)) {
+        bump_reason(REJ_CLAIMED);
         return 0;
+    }
 
+#if GATE_LOCKHOLDER
     /* Skip lockholders: vCPU is inside a CS; adding more work hurts. */
-    if (select_rq->curr->lock_depth > 0)
+    if (select_rq->curr->lock_depth > 0) {
+        bump_reason(REJ_LOCKHOLDER);
         return 0;
+    }
+#endif
 
+#if GATE_SPINNER
     /*
      * Skip spinners: already queued in an MCS waiter list.
      * - lock free:  spinner already judged this vCPU safe for itself —
@@ -221,32 +286,49 @@ static int process_cpu(u32 iter, void *data)
      * - lock held:  migrated task joins queue behind existing waiter,
      *               the waiter preemption problem.
      */
-    if (select_rq->curr->wait_depth > 0)
+    if (select_rq->curr->wait_depth > 0) {
+        bump_reason(REJ_SPINNER);
         return 0;
+    }
+#endif
 
-    /*
-     * "Good enough" gate (EDWARDS-style): only migrate to a vCPU that is
-     * either above the system average or above the 50% floor (500/1024).
-     * Also requires the target to be strictly better than the source —
-     * lateral migrations to equally-throttled vCPUs waste a schedule()
-     * call and stall under uniform host contention (e.g. all CPUs stolen).
-     */
-    if (!(select_rq->cpu_capacity > ctx->average_capacity ||
-          select_rq->cpu_capacity > 500))
+#if GATE_CAPACITY_LOW
+    /* Strict floor: only migrate to a vCPU well above the source trigger
+     * ceiling — see IVH_CAP_FLOOR comment above. */
+    if (select_rq->cpu_capacity <= IVH_CAP_FLOOR) {
+        bump_reason(REJ_CAPACITY_LOW);
         return 0;
+    }
+#endif
 
-    if (select_rq->cpu_capacity <= ctx->source_capacity)
+#if GATE_NOT_BETTER
+    /* Target must be strictly better than the source — lateral migrations
+     * to equally-throttled vCPUs waste a schedule() call and stall under
+     * uniform host contention (e.g. all CPUs stolen). */
+    if (select_rq->cpu_capacity <= ctx->source_capacity) {
+        bump_reason(REJ_NOT_BETTER);
         return 0;
+    }
+#endif
 
+#if GATE_PREEMPTED
     /* Skip if the vCPU heartbeat is stale — hypervisor has already preempted it. */
-    if (is_cpu_preempted(select_rq, ctx->now))
+    if (is_cpu_preempted(select_rq, ctx->now)) {
+        bump_reason(REJ_PREEMPTED);
         return 0;
+    }
+#endif
 
+#if GATE_BURST_ORDER
     /* Skip if target vCPU started its active burst earlier than us — it has
      * less remaining burst time and is closer to being preempted. */
-    if (select_rq->last_preemption <= ctx->rq_last_preempt)
+    if (select_rq->last_preemption <= ctx->rq_last_preempt) {
+        bump_reason(REJ_BURST_ORDER);
         return 0;
+    }
+#endif
 
+#if GATE_BURST_BUDGET
     /*
      * Skip if this vCPU has already used up its typical active window.
      *
@@ -261,15 +343,21 @@ static int process_cpu(u32 iter, void *data)
      * already reached that budget, preemption is overdue — migrating there
      * would put the task on a vCPU that is about to be yanked away.
      */
-    u64 ref = select_rq->last_idle_tp > select_rq->last_preemption
-              ? select_rq->last_idle_tp : select_rq->last_preemption;
-    u64 target_active = ctx->now > ref ? ctx->now - ref : 0;
-    if (select_rq->ewma_act_ns > 0 && target_active >= select_rq->ewma_act_ns)
-        return 0;
+    {
+        u64 ref = select_rq->last_idle_tp > select_rq->last_preemption
+                  ? select_rq->last_idle_tp : select_rq->last_preemption;
+        u64 target_active = ctx->now > ref ? ctx->now - ref : 0;
+        if (select_rq->ewma_act_ns > 0 && target_active >= select_rq->ewma_act_ns) {
+            bump_reason(REJ_BURST_BUDGET);
+            return 0;
+        }
+    }
+#endif
 
     if (!idle_cpu(select_rq)) {
         /* Tier 1: active worker — computing, no lock involvement.
          * No hypervisor vCPU wake-up cost. Stop search immediately. */
+        bump_reason(ACC_TIER1_ACTIVE);
         *target_cpu_ptr = (int)(cpu);
         *(ctx->found_active_worker_ptr) = 1;
         return 1;
@@ -277,8 +365,10 @@ static int process_cpu(u32 iter, void *data)
 
     /* Tier 2: idle vCPU — safe fallback, hypervisor wake-up required.
      * Keep searching for a Tier 1 active worker. */
-    if (!*(ctx->found_active_worker_ptr))
+    if (!*(ctx->found_active_worker_ptr)) {
+        bump_reason(ACC_TIER2_IDLE);
         *target_cpu_ptr = (int)(cpu);
+    }
 
     return 0;
 }
@@ -422,6 +512,7 @@ int BPF_PROG(test3, struct rq *rq, struct task_struct *curr, u64 now_time, int a
     int start = 0;
     u32 nr_loops = total_cpus - 1;
     int target_cpu = -1;
+
     int found_active_worker = 0;
 
     struct task_ctx task_context = {
@@ -430,10 +521,10 @@ int BPF_PROG(test3, struct rq *rq, struct task_struct *curr, u64 now_time, int a
         .now = now_time,
         .start = rq->cpu,
         .rq_last_preempt = rq->last_preemption,
-        .found_active_worker_ptr = &found_active_worker,
-        .average_capacity = average_capacity,
         .source_capacity = rq->cpu_capacity,
-        .total_cpus = total_cpus
+        .total_cpus = total_cpus,
+        .average_capacity = average_capacity,
+        .found_active_worker_ptr = &found_active_worker
     };
 
     unsigned long mm_bits = curr->mm ? curr->mm->cpu_bitmap[0] : 0UL;

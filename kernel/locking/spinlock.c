@@ -51,6 +51,29 @@ static __always_inline void ivh_pre_lock(void)
 		return;
 	if (!in_task() || !preemptible() || current->lock_depth > 0)
 		return;
+	/*
+	 * Only migrate a genuinely runnable task. A caller may already have
+	 * done set_current_state(TASK_INTERRUPTIBLE|...) as part of an outer
+	 * prepare-to-wait sequence (freezer, futex, sigtimedwait, hrtimer,
+	 * wait_event_freezable, ...) and merely be taking this spinlock as
+	 * bookkeeping before its own schedule(). Injecting
+	 * set_cpus_allowed_ptr() + schedule() here would consume that sleep
+	 * state and dequeue the task on a wakeup nobody will ever send IVH's
+	 * way — a lost wakeup (on_rq=0, __state!=TASK_RUNNING, stuck
+	 * indefinitely). Skipping is always safe: IVH is best-effort and
+	 * retries on the task's next lock acquisition while it's running.
+	 */
+	if (READ_ONCE(current->__state) != TASK_RUNNING)
+		return;
+	/*
+	 * Per-vCPU evaluation cooldown — see ivh_eval_cooldown_ok() in fair.c.
+	 * Cuts redundant full evaluations under high lock-call-volume
+	 * workloads (hackbench) without discriminating by which lock or how
+	 * long it's held: the thing being gated (vCPU health) is a property
+	 * of this CPU, not of this specific lock acquisition.
+	 */
+	if (!ivh_eval_cooldown_ok())
+		return;
 	bpf_sched_pre_lock_migrate();
 }
 

@@ -120,6 +120,7 @@ extern void set_average_capacity_all(int av_capacity);
 extern void reset_max_latency(u64 max_latency);
 extern int  is_cpu_preempted(int cpunum);
 extern int  migrate_task_to_async_fair(void *data);
+extern void ivh_scan_stuck_waiters(void); /* EXPERIMENT: bare-schedule() hang diagnosis, 2026-06-30 */
 
 /* lhp tick-time lockholder classification */
 enum lhp_class {
@@ -1362,6 +1363,7 @@ struct rq {
     u64           last_preemption;
     u64           ewma_act_ns;     /* EWMA active burst duration in ns; written by vsched_module via set_ewma_act_ns() */
     u64           last_active_time;
+    u64           ivh_last_eval_ns; /* sched_clock() of last full IVH pre-lock evaluation on this vCPU */
 
     /* vSched / vProber data */
     unsigned long           cpu_capacity_custom;

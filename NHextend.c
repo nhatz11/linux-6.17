@@ -32,7 +32,7 @@ static inline void tracefs_print_init(void *inst) { }
 #endif
 static inline void ivh_cs_enter(void)
 {
-	//syscall(__NR_ivh_cs_enter);
+	syscall(__NR_ivh_cs_enter);
 }
 
 /* Updated version of rseq structure with cr_counter, wait_counter, and timing fields */

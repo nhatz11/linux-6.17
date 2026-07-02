@@ -48,6 +48,26 @@ unsigned long ivh_migration_timeout_ns = 500000UL;
  */
 unsigned long ivh_max_concurrent = 3UL;
 
+/*
+ * schedule_timeout_interruptible duration (ms) for IVH migration.
+ * If the target vCPU does not schedule the migrating thread within this
+ * window, affinity is restored and the thread proceeds normally.
+ * Default 1 ms.  Raise if healthy CPUs are not scheduling within 1ms.
+ *   echo 5 > /proc/sys/kernel/ivh_sched_timeout_ms
+ */
+unsigned long ivh_sched_timeout_ms = 1UL;
+
+/*
+ * Per-vCPU evaluation cooldown (ns): minimum spacing between full IVH
+ * pre-lock evaluations on the same vCPU, regardless of which thread or
+ * lock triggers ivh_pre_lock(). Collapses redundant re-evaluation of an
+ * unchanged vCPU-health answer under high spin_lock() call volume
+ * (e.g. hackbench). Set 0 to disable (evaluate on every eligible call,
+ * pre-cooldown behavior).
+ *   echo 50000 > /proc/sys/kernel/ivh_eval_cooldown_ns
+ */
+unsigned long ivh_eval_cooldown_ns = 50000UL;
+
 #ifdef CONFIG_SYSCTL
 static const struct ctl_table ivh_sysctls[] = {
 	{
@@ -74,6 +94,20 @@ static const struct ctl_table ivh_sysctls[] = {
 	{
 		.procname	= "ivh_max_concurrent",
 		.data		= &ivh_max_concurrent,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_sched_timeout_ms",
+		.data		= &ivh_sched_timeout_ms,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_eval_cooldown_ns",
+		.data		= &ivh_eval_cooldown_ns,
 		.maxlen		= sizeof(unsigned long),
 		.mode		= 0644,
 		.proc_handler	= proc_doulongvec_minmax,
