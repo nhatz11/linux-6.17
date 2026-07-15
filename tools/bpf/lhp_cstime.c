@@ -19,7 +19,11 @@ struct cs_event {
 	char comm[16];
 	unsigned long long duration_ns;
 	unsigned int cs_type;
+	unsigned int host_preempted;
 };
+
+static unsigned long long kern_cs_count;
+static unsigned long long kern_cs_host_preempted;
 
 static void sig_handler(int sig) { done = 1; }
 
@@ -42,8 +46,16 @@ static int handle_event(void *ctx, void *data, size_t size)
 {
 	struct cs_event *e = data;
 	const char *type = e->cs_type == 0 ? "userspace" : "kernel";
-	printf("pid %d (%s) cpu %d [%s] duration=%llu ns\n",
-	       e->pid, e->comm, e->cpu, type, e->duration_ns);
+
+	if (e->cs_type == 1) {
+		kern_cs_count++;
+		if (e->host_preempted)
+			kern_cs_host_preempted++;
+	}
+
+	printf("pid %d (%s) cpu %d [%s] duration=%llu ns%s\n",
+	       e->pid, e->comm, e->cpu, type, e->duration_ns,
+	       (e->cs_type == 1 && e->host_preempted) ? "  HOST-PREEMPTED" : "");
 	return 0;
 }
 
@@ -105,6 +117,10 @@ int main(void)
 		}
 		err = 0;
 	}
+
+	printf("\nKernel CS host-preempted (PF_IVH_ELIGIBLE tasks only): %llu / %llu (%.4f%%)\n",
+	       kern_cs_host_preempted, kern_cs_count,
+	       kern_cs_count ? 100.0 * kern_cs_host_preempted / kern_cs_count : 0.0);
 
 cleanup:
 	ring_buffer__free(rb);

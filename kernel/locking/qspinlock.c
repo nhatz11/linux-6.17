@@ -21,6 +21,8 @@
 #include <linux/mutex.h>
 #include <linux/prefetch.h>
 #include <linux/sched.h>
+#include <linux/rcupdate.h>
+#include <linux/bpf_sched.h>
 #include <asm/byteorder.h>
 #include <asm/qspinlock.h>
 #include <trace/events/lock.h>
@@ -107,6 +109,94 @@ static __always_inline u32  __pv_wait_head_or_lock(struct qspinlock *lock,
 
 #endif /* _GEN_PV_LOCK_SLOWPATH */
 
+/*
+ * 2026-07-06 freeze fix: virt_spin_lock()'s test-and-set retry loop runs
+ * with preempt_disable() held and, on this VM (CONFIG_PARAVIRT_SPINLOCKS
+ * off), has no PV backoff at all -- it just spins. That's fine on its own,
+ * but it becomes a permanent, VM-wide-cascading deadlock when a locus (c)
+ * migration (kernel/sched/fair.c, bpf_sched_post_lock_migrate()) lands its
+ * confirmed holder T on a CPU whose current occupant W is spinning here on
+ * the SAME lock (or a transitively chained one): preempt_count>0 is a hard,
+ * priority-blind veto on preemption under every preemption model, so W can
+ * only stop by acquiring the lock -- which T holds -- and T can only
+ * release it by running -- which requires the CPU W is monopolizing.
+ * Confirmed as the cause of a real VM freeze this session.
+ *
+ * Fix: let W yield here, at a point where the lock has NOT been acquired
+ * yet (this is still the attempt, not the hold) -- so migrating W to a
+ * different CPU mid-loop is harmless, and letting some other task run here
+ * is exactly the desirable outcome when a resched has been requested.
+ *
+ * preempt_count() == 1 proves the ONLY disable in effect is the spin_lock
+ * API's own (queued_spin_lock_slowpath doesn't run this loop from inside
+ * any nested lock -- every nested acquisition adds +1 -- nor from hardirq
+ * or softirq context -- those add their own offsets -- nor under an
+ * explicit outer preempt_disable()). !irqs_disabled() additionally excludes
+ * _irqsave callers. Neither proves anything about RCU: this kernel has
+ * CONFIG_PREEMPT_RCU=y, where __rcu_read_lock() does NOT touch
+ * preempt_count, so a voluntary schedule() here could still fire from
+ * inside an RCU read-side critical section, which is illegal. Handled by
+ * ordering: preempt_enable() first -- under this VM's preempt=lazy config
+ * that call itself does an INVOLUNTARY preempt_schedule() if the hard
+ * resched bit is set, which IS legal inside preemptible-RCU readers -- and
+ * only falling back to an explicit (voluntary) schedule() when
+ * !rcu_preempt_depth() confirms there's no RCU reader to violate.
+ *
+ * TIF_NEED_RESCHED_LAZY is checked alongside need_resched() (which only
+ * tests TIF_NEED_RESCHED) because this VM's preempt=lazy config routes
+ * ordinary same-class (CFS) wakeup preemption through the lazy bit alone;
+ * missing it would mean this loop only reacts once the periodic tick
+ * escalates lazy to hard, up to ~1 tick (CONFIG_HZ=250) late. Falls back to
+ * testing TIF_NEED_RESCHED again on configs without a distinct lazy bit
+ * (linux/thread_info.h aliases TIF_NEED_RESCHED_LAZY to TIF_NEED_RESCHED
+ * there), so this is safe on any config, not just this one.
+ */
+static __always_inline bool ivh_virt_spin_lock(struct qspinlock *lock)
+{
+	int val;
+
+	if (!static_branch_likely(&virt_spin_lock_key))
+		return false;
+
+	for (;;) {
+		val = atomic_read(&lock->val);
+		if (!val && (atomic_try_cmpxchg(&lock->val, &val, _Q_LOCKED_VAL)))
+			break;
+		cpu_relax();
+
+		if (!READ_ONCE(ivh_spin_yield_enabled))
+			continue;
+		/*
+		 * Cheapest possible reject first: this deadlock class only
+		 * exists while an IVH migration is actually in flight (a
+		 * confirmed holder asleep in stop_one_cpu(), possibly about
+		 * to land behind this exact spinner). ivh_in_schedule is
+		 * incremented right before that call and decremented right
+		 * after it returns, system-wide, across both loci. When it
+		 * reads 0, no migrated holder anywhere can be waiting on this
+		 * CPU, so skipping the rest of this loop's checks costs
+		 * nothing in safety -- migrations are rare (tens per run, not
+		 * millions), so this collapses the tax on ordinary contention
+		 * to one unlocked read, and the moment a migration starts,
+		 * every spinner re-tests this on its very next iteration.
+		 */
+		if (!atomic_read(&ivh_in_schedule))
+			continue;
+		if (preempt_count() != 1 || irqs_disabled())
+			continue;
+		if (!need_resched() && !tif_test_bit(TIF_NEED_RESCHED_LAZY))
+			continue;
+
+		preempt_enable();
+		if ((need_resched() || tif_test_bit(TIF_NEED_RESCHED_LAZY)) &&
+		    !rcu_preempt_depth())
+			schedule();	/* TASK_RUNNING: pure yield, no lost-wakeup risk */
+		preempt_disable();
+	}
+
+	return true;
+}
+
 /**
  * queued_spin_lock_slowpath - acquire the queued spinlock
  * @lock: Pointer to queued spinlock structure
@@ -139,8 +229,43 @@ void __lockfunc queued_spin_lock_slowpath(struct qspinlock *lock, u32 val)
 	if (pv_enabled())
 		goto pv_queue;
 
-	if (virt_spin_lock(lock))
-		return;
+	{
+		/*
+		 * On this build (CONFIG_PARAVIRT=y, CONFIG_PARAVIRT_SPINLOCKS
+		 * not set, running under a hypervisor), virt_spin_lock_key is
+		 * enabled at boot by native_pv_lock_init() and never disabled
+		 * (kvm_spinlock_init(), the code that would normally clear it,
+		 * only exists under CONFIG_PARAVIRT_SPINLOCKS). That means
+		 * EVERY contended acquisition on this system takes this path,
+		 * not the pending-bit or MCS queue paths below -- confirmed
+		 * live 2026-07-03: kprobing queued_spin_lock_slowpath entry
+		 * showed 2.67M+ real contended entries in a 9s window under
+		 * hackbench, while ivh_hotlock_note_waiter_enter() (instrumented
+		 * only in the pending-bit/MCS paths at the time) was called
+		 * zero times -- the exact same class of bug as the original
+		 * queued_spin_is_contended() finding: a real signal wired into
+		 * a code path this environment structurally does not execute.
+		 * Bracket this call too so the Hotlock waiter count reflects
+		 * reality regardless of which contention path a given kernel
+		 * config/environment actually takes.
+		 */
+		bool vsl_acquired;
+
+		if (!in_interrupt()) {
+			current->wait_depth++;
+			current->ivh_slowpath = true;
+			if (current->flags & PF_IVH_ELIGIBLE)
+				ivh_hotlock_note_waiter_enter(lock);
+		}
+		vsl_acquired = ivh_virt_spin_lock(lock);
+		if (!in_interrupt()) {
+			current->wait_depth--;
+			if (current->flags & PF_IVH_ELIGIBLE)
+				ivh_hotlock_note_waiter_exit(lock);
+		}
+		if (vsl_acquired)
+			return;
+	}
 
 	/*
 	 * Wait for in-progress pending->locked hand-overs with a bounded
@@ -196,12 +321,19 @@ void __lockfunc queued_spin_lock_slowpath(struct qspinlock *lock, u32 val)
 	 */
 	if (val & _Q_LOCKED_MASK) {
 		/* pending-bit holder spinning for owner to release */
-		if (!in_interrupt())
+		if (!in_interrupt()) {
 			current->wait_depth++;
+			current->ivh_slowpath = true;
+			if (current->flags & PF_IVH_ELIGIBLE)
+				ivh_hotlock_note_waiter_enter(lock);
+		}
 		smp_cond_load_acquire(&lock->locked, !VAL);
 		/* owner released; we acquire below — spinning done */
-		if (!in_interrupt())
+		if (!in_interrupt()) {
 			current->wait_depth--;
+			if (current->flags & PF_IVH_ELIGIBLE)
+				ivh_hotlock_note_waiter_exit(lock);
+		}
 	}
 
 	/*
@@ -227,8 +359,12 @@ pv_queue:
 	 * Either way this is the MCS queue slowpath entry; mark as waiting.
 	 * Balanced by decrement at release:.
 	 */
-	if (!in_interrupt())
+	if (!in_interrupt()) {
 		current->wait_depth++;
+		current->ivh_slowpath = true;
+		if (current->flags & PF_IVH_ELIGIBLE)
+			ivh_hotlock_note_waiter_enter(lock);
+	}
 	node = this_cpu_ptr(&qnodes[0].mcs);
 	idx = node->count++;
 	tail = encode_tail(smp_processor_id(), idx);
@@ -390,8 +526,11 @@ locked:
 release:
 	trace_contention_end(lock, 0);
 	/* lock acquired; MCS queue spinning done */
-	if (!in_interrupt())
+	if (!in_interrupt()) {
 		current->wait_depth--;
+		if (current->flags & PF_IVH_ELIGIBLE)
+			ivh_hotlock_note_waiter_exit(lock);
+	}
 	/*
 	 * release the node
 	 */

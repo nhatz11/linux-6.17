@@ -1434,6 +1434,22 @@ struct task_struct {
 	int				wait_depth;
 
 	/*
+	 * Set (sticky, not paired like wait_depth above) at any of the three
+	 * real qspinlock contention entry points in kernel/locking/qspinlock.c
+	 * (pending-bit spin, MCS queue, virt_spin_lock) for the MOST RECENT
+	 * outermost acquisition on this task. Reset to false at the START of
+	 * every new outermost _raw_spin_lock() attempt (lock_depth==0) --
+	 * required to avoid a stale value from an earlier, already-finished
+	 * NESTED lock's slowpath entry leaking into a later, unrelated outer
+	 * lock's reading (same hazard class already found and fixed once for
+	 * ivh_took_slowpath's earlier, now-removed use as a Hotlock sample --
+	 * this is a distinct, smaller use: purely "did this specific
+	 * acquisition take the fast or slow path," read by ivh_post_lock()
+	 * for tracing only, not fed into Hotlock's history/waiters).
+	 */
+	bool				ivh_slowpath;
+
+	/*
 	 * Kernel spinlock critical-section timing (outermost CS only).
 	 * cs_start_ts: sched_clock() snapshot at outermost acquire; reset to 0 in
 	 *   prepare_task_switch() (paused) and reopened in finish_task_switch()

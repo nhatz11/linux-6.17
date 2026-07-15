@@ -197,6 +197,21 @@ void get_steal_and_preemptions(int cpunum,u64* preempt,u64* steals_time){
         *steals_time= 0;
 #endif
 }
+/*
+ * Stage A1: live (not post-hoc) "is this vCPU preempted right now" bit, for
+ * a module to read (vsched_module.c's planned shared health page). The
+ * cumulative steal_time above is only accurate as of the target's last
+ * vmentry -- while a vCPU is actually stolen, its own counter is frozen, so
+ * a steal-time delta can only ever report a preemption after it has already
+ * ended. vcpu_is_preempted() is the live KVM_VCPU_PREEMPTED bit (same
+ * pv_ops-backed primitive qspinlock/osq_lock already use for this exact
+ * purpose) and is not itself exported for direct module use, hence this
+ * one-line wrapper.
+ */
+int ivh_get_vcpu_preempted(int cpunum)
+{
+        return vcpu_is_preempted(cpunum) ? 1 : 0;
+}
 //get average capacity of all cores in the system, set by vCapacity, used by the bpf hooks
 int get_average_capacity_all(void){
         return average_capacity_all;
@@ -243,6 +258,7 @@ void set_ewma_act_ns(int cpu, u64 ewma_act_ns)
 EXPORT_SYMBOL(set_custom_capacity);
 EXPORT_SYMBOL(set_ewma_act_ns);
 EXPORT_SYMBOL(get_steal_and_preemptions);
+EXPORT_SYMBOL(ivh_get_vcpu_preempted);
 EXPORT_SYMBOL(get_max_latency);
 EXPORT_SYMBOL(set_avg_latency);
 EXPORT_SYMBOL(reset_max_latency);
@@ -5700,6 +5716,67 @@ void sched_exec(void)
 	stop_one_cpu(task_cpu(p), migration_cpu_stop, &arg);
 }
 
+/*
+ * ivh_migrate_self - relocate the current (running) task directly to
+ * target_cpu, using the same lightweight mechanism as sched_exec() above:
+ * a bare stop_one_cpu() dispatch, no set_cpus_allowed_ptr()/schedule()
+ * round trip and no change to the task's long-lived cpus_mask.
+ *
+ * Unlike sched_exec(), the destination is supplied by the caller (IVH's
+ * BPF selection hook, kernel/sched/fair.c) rather than chosen via
+ * sched_class->select_task_rq(). The caller has already validated
+ * target_cpu against current->cpus_ptr as part of its own candidate
+ * search, so no additional affinity check is done here beyond what
+ * __migrate_task()/is_cpu_allowed() enforce internally inside the
+ * stopper callback.
+ */
+void ivh_migrate_self(int target_cpu)
+{
+	struct task_struct *p = current;
+	struct migration_arg arg;
+	int src_cpu, saved_nice = 0;
+	bool boosted = false;
+
+	scoped_guard (raw_spinlock_irqsave, &p->pi_lock) {
+		src_cpu = task_cpu(p);
+		if (target_cpu == src_cpu || unlikely(!cpu_active(target_cpu)))
+			return;
+		arg = (struct migration_arg){ p, target_cpu };
+	}
+
+	/*
+	 * 2026-07-06 freeze fix, part 2/2: p still holds the lock that made
+	 * locus (c) migrate it (kernel/sched/fair.c, bpf_sched_post_lock_migrate()).
+	 * If target_cpu's current task is a preempt-disabled spinner,
+	 * wakeup_preempt()'s class-above path (resched_curr(): hard
+	 * TIF_NEED_RESCHED + a real IPI, eligibility-blind) is the only
+	 * deterministic way to wake ivh_virt_spin_lock()'s yield promptly --
+	 * the same-class (CFS) path only sets TIF_NEED_RESCHED_LAZY on this
+	 * VM's preempt=lazy config, which the spinner's yield doesn't see
+	 * until the tick escalates it (~1 tick, CONFIG_HZ=250). Boosting also
+	 * guarantees p -- not the spinner -- is what runs next once the
+	 * spinner does yield (EEVDF eligibility can otherwise re-pick the
+	 * spinner). Non-sleeping (cpuset_lock is DL-only, kernel/sched/syscalls.c);
+	 * cannot leak (stop_one_cpu() always returns -- the stopper always
+	 * signals its completion, even on internal failure -- so the restore
+	 * below always runs, in p's own context, once p resumes). Skips
+	 * user-RT and PI-boosted tasks; every IVH-eligible workload thread
+	 * this project runs is SCHED_NORMAL.
+	 */
+	if (READ_ONCE(ivh_migrate_boost) &&
+	    p->policy == SCHED_NORMAL && !rt_prio(p->prio)) {
+		saved_nice = task_nice(p);
+		sched_set_fifo_low(p);
+		boosted = true;
+	}
+
+	stop_one_cpu(src_cpu, migration_cpu_stop, &arg);
+
+	if (boosted)
+		sched_set_normal(p, saved_nice);
+}
+EXPORT_SYMBOL_GPL(ivh_migrate_self);
+
 DEFINE_PER_CPU(struct kernel_stat, kstat);
 DEFINE_PER_CPU(struct kernel_cpustat, kernel_cpustat);
 
@@ -5853,10 +5930,21 @@ void sched_tick(void)
 
 	rq_unlock(rq, &rf);
 
-	/* EXPERIMENT: bare-schedule() hang diagnosis, 2026-06-30. Cheap
-	 * 32-slot scan; only ever produces output when an IVH self-migration
-	 * is actually stuck past a threshold. */
-	ivh_scan_stuck_waiters();
+	/* EXPERIMENT: bare-schedule() hang diagnosis, 2026-06-30 -- disabled
+	 * 2026-07-06, function deleted entirely 2026-07-07 (was
+	 * ivh_scan_stuck_waiters(), kernel/sched/fair.c). Its job was done by
+	 * the 2026-07-02 stop_one_cpu() fix in bpf_sched_pre_lock_migrate();
+	 * left running, it was itself the cause of a VM freeze: called
+	 * unconditionally on every tick on every CPU, it took the single
+	 * global ivh_wait_lock 32 times per call (~128K acquisitions/sec
+	 * across 16 vCPUs at HZ=250), and on this VM (CONFIG_PARAVIRT_SPINLOCKS
+	 * off, so virt_spin_lock's unfair test-and-set-with-no-backoff path is
+	 * always live) a vCPU stolen by the host mid-critical-section stalled
+	 * every other vCPU's tick handler on that same lock -- exactly the
+	 * escalating RCU stall (CPU 5 then CPU 10, same lock) seen under that
+	 * night's asymmetric contention test. See journalctl -b -1 around
+	 * 01:16-01:19 (2026-07-06) for the stack traces that pinned this down.
+	 */
 
 	if (sched_feat(LATENCY_WARN) && resched_latency)
 		resched_latency_warn(cpu, resched_latency);

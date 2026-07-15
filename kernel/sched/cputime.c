@@ -287,7 +287,21 @@ static __always_inline u64 steal_account_process_time(u64 maxtime)
 
 int is_cpu_preempted(int cpunum)
 {
-	s64 time_diff = sched_clock() - cpu_rq(cpunum)->clock_preempt;
+	struct rq *rq = cpu_rq(cpunum);
+	/*
+	 * clock_preempt is only refreshed on an active scheduler tick
+	 * (account_process_tick, above). A tickless-idle CPU (NO_HZ_IDLE, the
+	 * default) stops refreshing it and looks "stolen" once idle exceeds
+	 * 1.5ms — confirmed 2026-07-02: 270/270 commit-time vetoes measured
+	 * this session hit targets with healthy capacity. last_idle_tp is
+	 * written on idle transitions (account_idle_time, above) and is fresh
+	 * for a just-idled CPU, so take the more recent of the two as the
+	 * true liveness timestamp. Same idiom as the BPF-side GATE_BURST_BUDGET
+	 * check in tools/bpf/MY_ivh_atc.bpf.c.
+	 */
+	u64 last_seen = rq->clock_preempt > rq->last_idle_tp
+			? rq->clock_preempt : rq->last_idle_tp;
+	s64 time_diff = sched_clock() - last_seen;
 
 	return time_diff > 1500000;
 }

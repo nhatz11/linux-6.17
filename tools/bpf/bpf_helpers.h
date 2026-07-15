@@ -29,6 +29,8 @@ static int (*bpf_loop)(__u32 iters, int (*callback_fn)(__u32, void *),
 
 static void *(*bpf_this_cpu_ptr)(void *percpu_ptr) = (void *)154;
 
+static void *(*bpf_get_current_task_btf)(void) = (void *)158;
+
 static long (*bpf_probe_read_kernel)(void *dst, __u32 size, const void *unsafe_ptr) = (void *)113;
 
 static void *(*bpf_ringbuf_reserve)(void *ringbuf, __u64 size, __u64 flags) = (void *)131;

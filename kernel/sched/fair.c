@@ -79,6 +79,28 @@ EXPORT_SYMBOL_GPL(ivh_trylock_misses);
 EXPORT_SYMBOL_GPL(ivh_migrations_done);
 
 /*
+ * Commit-time veto instrumentation, 2026-07-02.  is_cpu_preempted(target_cpu)
+ * in bpf_sched_pre_lock_migrate() discards a selected target after full
+ * search cost was already paid — these counters answer two questions after
+ * a run: (1) is the veto catching targets that are ALSO capacity-unhealthy
+ * (agreement between the heartbeat-staleness signal and the capacity
+ * signal), or is it firing on targets the capacity gate still considers
+ * fine (the two signals have decoupled — see the 300us/1.5ms threshold
+ * mismatch this session found and fixed on the BPF side); (2) is fleet-wide
+ * capacity also low when a veto fires (correlated contention across the
+ * host, not just this one target) — see ivh_veto_fleet_cap_sum vs.
+ * ivh_veto_target_cap_sum.  Read via /proc/ivh_debug.
+ */
+atomic_t ivh_veto_count = ATOMIC_INIT(0);
+atomic_t ivh_veto_target_still_capacity_healthy = ATOMIC_INIT(0);
+atomic64_t ivh_veto_target_cap_sum = ATOMIC64_INIT(0);
+atomic64_t ivh_veto_fleet_cap_sum  = ATOMIC64_INIT(0);
+EXPORT_SYMBOL_GPL(ivh_veto_count);
+EXPORT_SYMBOL_GPL(ivh_veto_target_still_capacity_healthy);
+EXPORT_SYMBOL_GPL(ivh_veto_target_cap_sum);
+EXPORT_SYMBOL_GPL(ivh_veto_fleet_cap_sum);
+
+/*
  * Per-vCPU evaluation cooldown instrumentation.  Per-CPU counters, not
  * atomics: at hackbench-class call volume (~200K+/s) a shared atomic_inc
  * would itself bounce a cache line and distort the overhead being
@@ -86,6 +108,15 @@ EXPORT_SYMBOL_GPL(ivh_migrations_done);
  */
 static DEFINE_PER_CPU(u64, ivh_prelock_calls);
 static DEFINE_PER_CPU(u64, ivh_prelock_cooldown_skipped);
+
+/*
+ * Reject-reason counters for ivh_steal_imminent()'s two internal gates
+ * (shared by locus (a); locus (c) and its own reject-reason counters were
+ * removed along with bpf_sched_post_lock_migrate() -- see that removal's
+ * note further down this file).
+ */
+static DEFINE_PER_CPU(u64, ivh_steal_imminent_capacity_reject);
+static DEFINE_PER_CPU(u64, ivh_steal_imminent_time_left_reject);
 
 /*
  * ivh_wait diagnostic registry — EXPERIMENT ONLY (bare-schedule() hang
@@ -104,19 +135,6 @@ static DEFINE_PER_CPU(u64, ivh_prelock_cooldown_skipped);
  * a number attached)?
  */
 #define IVH_WAIT_SLOTS 32
-#define IVH_WAIT_NUM_THRESH 10
-static const u64 ivh_wait_thresholds_ns[IVH_WAIT_NUM_THRESH] = {
-	1000000ULL,    /*   1 ms */
-	2000000ULL,    /*   2 ms */
-	5000000ULL,    /*   5 ms */
-	10000000ULL,   /*  10 ms */
-	25000000ULL,   /*  25 ms */
-	50000000ULL,   /*  50 ms */
-	100000000ULL,  /* 100 ms */
-	250000000ULL,  /* 250 ms */
-	500000000ULL,  /* 500 ms */
-	1000000000ULL, /*   1  s */
-};
 
 struct ivh_wait_slot {
 	struct task_struct *task;
@@ -166,61 +184,15 @@ static void ivh_wait_unregister(int slot)
 }
 
 /*
- * Called from sched_tick() on whichever CPU is currently ticking (i.e.
- * currently has host time — a stolen CPU never reaches this call, so this
- * is self-limiting to observers that are actually alive, with no single
- * point of failure to babysit).  Snapshots any stuck attempt once per
- * threshold crossing.
+ * 2026-07-07: ivh_scan_stuck_waiters() removed -- confirmed dead (its sole
+ * call site in kernel/sched/core.c's sched_tick() was already commented out
+ * 2026-07-06, root-causing a VM freeze this exact function's unconditional
+ * every-tick, every-CPU global-lock hammering caused; see
+ * project_ivh_scan_stuck_waiters_freeze memory for the full story). The
+ * registry it read (ivh_wait_slots/ivh_wait_lock, ivh_wait_register()/
+ * ivh_wait_unregister() above) is NOT dead -- locus (a) still writes it via
+ * the live sys_ivh_cs_enter() syscall path -- only this scanner is gone.
  */
-void ivh_scan_stuck_waiters(void)
-{
-	u64 now = sched_clock();
-	int i;
-
-	for (i = 0; i < IVH_WAIT_SLOTS; i++) {
-		struct task_struct *t;
-		u64 start;
-		int src, tgt, thresh_idx, phase;
-		unsigned long flags;
-
-		raw_spin_lock_irqsave(&ivh_wait_lock, flags);
-		t = ivh_wait_slots[i].task;
-		start = ivh_wait_slots[i].start_ns;
-		src = ivh_wait_slots[i].src_cpu;
-		tgt = ivh_wait_slots[i].target_cpu;
-		thresh_idx = ivh_wait_slots[i].next_thresh_idx;
-		phase = ivh_wait_slots[i].phase;
-		if (t && thresh_idx < IVH_WAIT_NUM_THRESH &&
-		    now - start >= ivh_wait_thresholds_ns[thresh_idx])
-			ivh_wait_slots[i].next_thresh_idx = thresh_idx + 1;
-		raw_spin_unlock_irqrestore(&ivh_wait_lock, flags);
-
-		if (!t)
-			continue;
-		if (thresh_idx >= IVH_WAIT_NUM_THRESH)
-			continue;
-		if (now - start < ivh_wait_thresholds_ns[thresh_idx])
-			continue;
-
-		{
-			struct rq *tgt_rq = cpu_rq(tgt);
-			int cur_cpu = task_cpu(t);
-			int on_rq = READ_ONCE(t->on_rq);
-			unsigned int tstate = READ_ONCE(t->__state);
-			u64 tgt_heartbeat_age = (tgt_rq->clock_preempt <= now)
-					? now - tgt_rq->clock_preempt : 0;
-
-			trace_printk(
-				"ivh_stuck: pid=%d comm=%s phase=%d waited_us=%llu "
-				"src_cpu=%d target_cpu=%d cur_cpu=%d on_rq=%d state=0x%x "
-				"target_cap=%lu target_heartbeat_stale_us=%llu\n",
-				t->pid, t->comm, phase, (now - start) / 1000,
-				src, tgt, cur_cpu, on_rq, tstate,
-				tgt_rq->cpu_capacity, tgt_heartbeat_age / 1000);
-		}
-	}
-}
-EXPORT_SYMBOL_GPL(ivh_scan_stuck_waiters);
 
 /* average capacity across CPUs, defined in core.c */
 extern int average_capacity_all;
@@ -13213,13 +13185,112 @@ EXPORT_SYMBOL_GPL(ivh_eval_cooldown_ok);
  *
  * Must only be called with lock_depth == 0 and preemptible() == true.
  */
+/*
+ * ivh_steal_imminent - shared "is this vCPU in the IVH danger zone" check.
+ * Used by bpf_sched_pre_lock_migrate() (locus a, below). Written to be
+ * shared with a locus (c) post-acquisition migration too, but that locus
+ * (bpf_sched_post_lock_migrate()) is not part of this build -- see the note
+ * further down this file where it used to live.
+ *
+ * Gate 1: vCPU not throttled (rq->cpu_capacity).
+ *
+ * Gate 2: time-left. 2026-07-03 correction -- this used to be
+ * rq->ewma_act_ns (a walking average maintained externally by a
+ * vsched_module via set_ewma_act_ns(), found stale/unreliable earlier this
+ * project). Replaced with the user's own formula, built entirely from
+ * fields already computed natively in steal_account_process_time()
+ * (kernel/sched/cputime.c), no external module dependency:
+ *
+ *   time_left = last_active_time - elapsed_since_last_active - last_cs_ns
+ *
+ *   last_active_time: how long the PREVIOUS active stretch on this vCPU
+ *     ran before its last preemption/idle transition -- our estimate of a
+ *     typical active-burst length here.
+ *   elapsed_since_last_active: sched_clock() - max(last_preemption,
+ *     last_idle_tp) -- how far into the CURRENT active stretch we already
+ *     are, right now.
+ *   last_cs_ns: this task's own most recently completed critical section
+ *     duration (current->last_cs_ns -- wall-clock/absolute, not
+ *     cumulative) -- the thing we're about to add another one of.
+ *
+ * If last_active_time == 0 (no measurement yet), Gate 2 does not veto --
+ * same fallback behavior the old ewma check had for ewma == 0.
+ *
+ * Does not evaluate cpumask weight, concurrency cap, or Hotlock/tier --
+ * those are caller-specific gates layered on top by each locus.
+ */
+static __always_inline bool ivh_steal_imminent(struct rq *rq)
+{
+	u64 now;
+
+	if (rq->cpu_capacity > ivh_capacity_threshold) {
+		this_cpu_inc(ivh_steal_imminent_capacity_reject);
+		return false;
+	}
+
+	now = sched_clock();
+
+	/*
+	 * 2026-07-14: runtime-switchable Gate 2 formula -- see the comment on
+	 * ivh_time_left_source (include/linux/bpf_sched.h) for why this exists:
+	 * this tree's native last_active_time calculation vs. the 84f1e5fcc
+	 * ("34+") commit's externally-smoothed ewma_act_ns formula, found to
+	 * differ when auditing why 34+ measured a larger IVH benefit than a
+	 * kernel built from this tree under the same workload/sysctls.
+	 */
+	if (ivh_time_left_source) {
+		/* 34+ formula, verbatim: veto only while enough burst time is
+		 * left beyond the threshold -- migration not urgent yet. */
+		u64 ewma = rq->ewma_act_ns;
+
+		if (ewma != 0) {
+			u64 act_sofar = now - rq->last_preemption;
+
+			if (ewma > act_sofar &&
+			    (ewma - act_sofar) >= ivh_time_left_threshold_ns) {
+				this_cpu_inc(ivh_steal_imminent_time_left_reject);
+				return false;
+			}
+		}
+		return true;
+	}
+
+	{
+		/* Default: this tree's native formula. */
+		u64 elapsed_since_active = now - max(rq->last_preemption, (u64)rq->last_idle_tp);
+		s64 time_left = (s64)rq->last_active_time - (s64)elapsed_since_active
+				 - (s64)current->last_cs_ns;
+
+		/*
+		 * 2026-07-05: gated behind ivh_trace_enabled (default OFF). This fires
+		 * on every call that clears the capacity gate above -- under real
+		 * contention that's a large fraction of all Hotlock-hot classifications
+		 * (millions/run), and trace_printk() always writes the ring buffer
+		 * regardless of whether anyone's reading it. Turn on only when
+		 * actively comparing ewma_act_ns vs last_active_time.
+		 */
+		if (unlikely(ivh_trace_enabled))
+			trace_printk("ivh_time_left: cpu=%d ewma_act_ns=%llu last_active_time=%llu "
+				     "elapsed_since_active=%llu last_cs_ns=%llu time_left=%lld "
+				     "threshold=%lu\n",
+				     smp_processor_id(), rq->ewma_act_ns, rq->last_active_time,
+				     elapsed_since_active, current->last_cs_ns, time_left,
+				     ivh_time_left_threshold_ns);
+
+		if (rq->last_active_time != 0 && time_left > (s64)ivh_time_left_threshold_ns) {
+			this_cpu_inc(ivh_steal_imminent_time_left_reject);
+			return false;
+		}
+
+		return true;
+	}
+}
+
 void bpf_sched_pre_lock_migrate(void)
 {
 	struct rq *rq;
-	u64 ewma, act_sofar;
 	int target_cpu;
 	int src_cpu;
-	cpumask_var_t saved_mask;
 	unsigned long flags;
 
 	/* Defense-in-depth: never inject a migration/schedule() into a task
@@ -13233,26 +13304,34 @@ void bpf_sched_pre_lock_migrate(void)
 	rq = this_rq();
 	src_cpu = rq->cpu;
 
-	/* Gate 1: vCPU not throttled */
-	if (rq->cpu_capacity > ivh_capacity_threshold)
+	/* Gate 1+2: vCPU not throttled, enough burst time remains -- shared
+	 * with locus (c), see ivh_steal_imminent() above. */
+	if (!ivh_steal_imminent(rq))
 		return;
-
-	/* Gate 2: enough burst time remains — migration not urgent */
-	ewma = rq->ewma_act_ns;
-	if (ewma != 0) {
-		act_sofar = sched_clock() - rq->last_preemption;
-		if (ewma > act_sofar &&
-		    (ewma - act_sofar) >= ivh_time_left_threshold_ns)
-			return;
-	}
 
 	/* Gate 3: task must be movable (more than one allowed CPU) */
 	if (cpumask_weight(current->cpus_ptr) <= 1)
 		return;
 
-	/* Gate 4: concurrency cap — don't pile threads into schedule() */
-	if ((unsigned long)atomic_read(&ivh_in_schedule) >= ivh_max_concurrent)
+	/*
+	 * Gate 4: concurrency cap -- atomic reservation, not check-then-act.
+	 * 2026-07-07: the old atomic_read()-then-later-atomic_inc() pattern
+	 * had a real TOCTOU window (movability check already passed above;
+	 * a real spinlock trylock and a full BPF destination search both run
+	 * below, before the old increment site) -- multiple threads could
+	 * all pass the read before any of them incremented, letting actual
+	 * concurrent in-flight migrations exceed ivh_max_concurrent under
+	 * bursty arrival (exactly what a lower CS-length floor produces on
+	 * locus (c) -- confirmed via live investigation, see the comment on
+	 * ivh_post_lock_min_cs_ns's removal history). Reserve unconditionally
+	 * via fetch_inc; every bail-out path below rolls back via the
+	 * matching atomic_dec, mirroring the PRMPT_HELD_MASK destination
+	 * reservation pattern already used in this function.
+	 */
+	if ((unsigned long)atomic_fetch_inc(&ivh_in_schedule) >= ivh_max_concurrent) {
+		atomic_dec(&ivh_in_schedule);
 		return;
+	}
 
 	/*
 	 * Block recursive IVH calls from any spinlock acquired inside this
@@ -13267,9 +13346,20 @@ void bpf_sched_pre_lock_migrate(void)
 	current->lock_depth++;
 
 	/*
-	 * Select target CPU via BPF hook.  Use trylock: if another thread is
-	 * already selecting, skip migration for this CS rather than spinning
-	 * with IRQs disabled.  The caller will retry on the next lock attempt.
+	 * 2026-07-14: reverted to a blocking raw_spin_lock_irqsave(), matching
+	 * the 34+ (84f1e5fcc) committed behavior -- the intervening real-trylock
+	 * fix (2026-07-02) was a deliberate correctness improvement (avoid
+	 * spinning with IRQs disabled under contention), but empirically, under
+	 * this project's high-concurrency test workload (many threads racing to
+	 * migrate off the same throttled CPUs simultaneously), it was silently
+	 * dropping ~13% of eligible migrations outright (ivh_trylock_misses)
+	 * that 34+'s blocking behavior never drops -- it just serializes them.
+	 * Confirmed via direct A/B: 34+ measured 4-6x host-preempted improvement
+	 * at the same sysctls/workload where this tree's trylock version only
+	 * measured ~1.3-1.6x. Reverting to re-test whether this is the dominant
+	 * cause. If so, a smarter fix (bounded spin-then-give-up, or a per-CPU
+	 * rather than global selection lock) should replace this blocking
+	 * lock rather than living with the IRQs-disabled spin risk long-term.
 	 */
 	raw_spin_lock_irqsave(&my_spinlock, flags);
 	target_cpu = bpf_sched_cfs_select_run_cpu_spin(
@@ -13279,35 +13369,18 @@ void bpf_sched_pre_lock_migrate(void)
 		atomic_fetch_or(PRMPT_HELD_MASK, prmpt_flags(target_cpu));
 	raw_spin_unlock_irqrestore(&my_spinlock, flags);
 
-	trace_printk("ivh_selected: pid=%d comm=%s src=%d dst=%d cap=%lu avg_cap=%d\n",
-		     current->pid, current->comm, src_cpu, target_cpu,
-		     rq->cpu_capacity, average_capacity_all);
+	if (unlikely(ivh_trace_enabled))
+		trace_printk("ivh_selected: pid=%d comm=%s src=%d dst=%d cap=%lu avg_cap=%d\n",
+			     current->pid, current->comm, src_cpu, target_cpu,
+			     rq->cpu_capacity, average_capacity_all);
 
 	if (target_cpu < 0 || target_cpu == smp_processor_id()) {
 		if (target_cpu >= 0)
 			atomic_fetch_andnot(PRMPT_HELD_MASK, prmpt_flags(target_cpu));
+		atomic_dec(&ivh_in_schedule);
 		current->lock_depth--;
 		return;
 	}
-
-	/*
-	 * Synchronous self-migration: temporarily restrict cpus_mask to
-	 * {target_cpu} and call schedule().  The scheduler sees that current
-	 * is no longer allowed on this CPU and migrates it.  When schedule()
-	 * returns we are running on target_cpu.  Restore original mask so the
-	 * task's permanent affinity is unchanged.
-	 *
-	 * Use cpumask_var_t (heap via GFP_KERNEL) to avoid a 1024-byte
-	 * stack frame on NR_CPUS=8192/CPUMASK_OFFSTACK=y builds.
-	 * GFP_KERNEL is safe: we are in process context (in_task) with
-	 * preemption enabled and lock_depth == 1 (our temporary guard).
-	 */
-	if (!alloc_cpumask_var(&saved_mask, GFP_KERNEL)) {
-		atomic_fetch_andnot(PRMPT_HELD_MASK, prmpt_flags(target_cpu));
-		current->lock_depth--;
-		return;
-	}
-	cpumask_copy(saved_mask, &current->cpus_mask);
 
 	/*
 	 * Layer 1 — borrowed from preempt_migrate_func(): check target health
@@ -13317,50 +13390,51 @@ void bpf_sched_pre_lock_migrate(void)
 	 * Abort rather than pin ourselves to a CPU that may never get time.
 	 */
 	if (is_cpu_preempted(target_cpu)) {
+		unsigned long target_cap = cpu_rq(target_cpu)->cpu_capacity;
+
+		atomic_inc(&ivh_veto_count);
+		atomic64_add(target_cap, &ivh_veto_target_cap_sum);
+		atomic64_add(average_capacity_all, &ivh_veto_fleet_cap_sum);
+		if (target_cap > ivh_capacity_threshold)
+			atomic_inc(&ivh_veto_target_still_capacity_healthy);
+
 		atomic_fetch_andnot(PRMPT_HELD_MASK, prmpt_flags(target_cpu));
+		atomic_dec(&ivh_in_schedule);
 		current->lock_depth--;
-		free_cpumask_var(saved_mask);
 		return;
 	}
 
-	atomic_inc(&ivh_in_schedule);
+	/* Reservation already held from Gate 4 above -- proceed straight to dispatch. */
 
 	/*
-	 * EXPERIMENT: bare-schedule() hang diagnosis, 2026-06-30.
-	 * Swapped from schedule_timeout_interruptible() back to plain
-	 * schedule() (the version that was observed to hang) so we can
-	 * find out *where* a stuck task actually is instead of theorizing.
-	 * ivh_wait_register/unregister + sched_tick()'s
-	 * ivh_scan_stuck_waiters() give a timeline of cur_cpu/on_rq/target
-	 * heartbeat staleness for any attempt that's been pending past a
-	 * threshold while this call is blocked inside schedule() below.
+	 * 2026-07-02: replaced the set_cpus_allowed_ptr()+schedule() pair
+	 * (general-purpose affinity-change API, built for arbitrary external
+	 * callers, plus a second full schedule() after the stopper thread had
+	 * already relocated the task) with a direct stop_one_cpu() dispatch —
+	 * the same lightweight mechanism sched_exec() uses. Never touches
+	 * current->cpus_mask, so no restore call and no race window against a
+	 * concurrent legitimate affinity change. ivh_wait_register/unregister
+	 * still wraps the call for hang-diagnosis visibility: unlike the old
+	 * bare schedule() (which could consume a foreign sleep state — the
+	 * on_rq=0 lost-wakeup bug, see the TASK_RUNNING gate above),
+	 * stop_one_cpu()'s internal wait is a normal, correctly-paired
+	 * completion, not exposed to that failure mode, but it can still
+	 * legitimately stall if the target's stopper kthread itself can't get
+	 * host time — this counter distinguishes that from a hang.
 	 */
 	u64 wait_start_ns = sched_clock();
-	int wait_slot = -1;
-
-	/*
-	 * Phase 1: register around set_cpus_allowed_ptr() itself. For a
-	 * running task this blocks inside affine_move_task() ->
-	 * wait_for_completion() (core.c) — if the stuck state is actually
-	 * here (not in the phase-2 schedule() below), this is where we'll
-	 * catch it.
-	 */
-	int wait_slot_p1 = ivh_wait_register(current, src_cpu, target_cpu, 1);
-	int sca_ret = set_cpus_allowed_ptr(current, cpumask_of(target_cpu));
-	ivh_wait_unregister(wait_slot_p1);
-
-	if (sca_ret == 0) {
-		/* Phase 2: the bare schedule() previously (and solely) instrumented. */
-		wait_slot = ivh_wait_register(current, src_cpu, target_cpu, 2);
-		schedule();
-		ivh_wait_unregister(wait_slot);
-	}
+	int wait_slot = ivh_wait_register(current, src_cpu, target_cpu, 1);
+	ivh_migrate_self(target_cpu);
+	ivh_wait_unregister(wait_slot);
 	u64 wait_elapsed_ns = sched_clock() - wait_start_ns;
 
 	atomic_dec(&ivh_in_schedule);
 
 	/* Post-migration diagnostics */
-	{
+	if (wait_elapsed_ns > 1000000ULL) /* >1ms: treat as the slow/stuck case */
+		atomic_inc(&ivh_timeout_count);
+
+	if (unlikely(ivh_trace_enabled)) {
 		int landed_cpu   = smp_processor_id();
 		bool migrated    = (landed_cpu == target_cpu);
 		struct rq *dst_rq = cpu_rq(target_cpu);
@@ -13369,11 +13443,8 @@ void bpf_sched_pre_lock_migrate(void)
 				     ? now - dst_rq->clock_preempt : 0;
 		unsigned long dst_cap = dst_rq->cpu_capacity;
 
-		if (wait_elapsed_ns > 1000000ULL) /* >1ms: treat as the slow/stuck case */
-			atomic_inc(&ivh_timeout_count);
-
 		trace_printk(
-			"ivh_bare_sched: comm=%s src=%d dst=%d landed=%d "
+			"ivh_migrate_self: comm=%s src=%d dst=%d landed=%d "
 			"wait_elapsed_us=%llu dst_cap=%lu dst_heartbeat_age_us=%llu "
 			"actually_migrated=%s\n",
 			current->comm, src_cpu, target_cpu, landed_cpu,
@@ -13382,9 +13453,6 @@ void bpf_sched_pre_lock_migrate(void)
 			migrated ? "yes" : "no_landed_elsewhere");
 	}
 
-	set_cpus_allowed_ptr(current, saved_mask);
-	free_cpumask_var(saved_mask);
-
 	atomic_inc(&ivh_migrations_done);
 	/* Release the target CPU selection hold */
 	atomic_fetch_andnot(PRMPT_HELD_MASK, prmpt_flags(target_cpu));
@@ -13392,15 +13460,25 @@ void bpf_sched_pre_lock_migrate(void)
 }
 EXPORT_SYMBOL_GPL(bpf_sched_pre_lock_migrate);
 
+
 /* /proc/ivh_debug — snapshot all IVH counters for hang diagnosis */
 static int ivh_debug_show(struct seq_file *m, void *v)
 {
 	u64 prelock_calls = 0, prelock_skipped = 0;
+	u64 post_lock_calls = 0, post_lock_hot = 0;
+	u64 steal_imminent_capacity_reject = 0, steal_imminent_time_left_reject = 0;
+	u64 prelock_hotlock_cold_skipped = 0, prelock_hotlock_hot_passed = 0;
 	int cpu;
 
 	for_each_possible_cpu(cpu) {
 		prelock_calls += per_cpu(ivh_prelock_calls, cpu);
 		prelock_skipped += per_cpu(ivh_prelock_cooldown_skipped, cpu);
+		prelock_hotlock_cold_skipped += per_cpu(ivh_prelock_hotlock_cold_skipped, cpu);
+		prelock_hotlock_hot_passed += per_cpu(ivh_prelock_hotlock_hot_passed, cpu);
+		post_lock_calls += per_cpu(ivh_post_lock_calls, cpu);
+		post_lock_hot += per_cpu(ivh_post_lock_hot, cpu);
+		steal_imminent_capacity_reject += per_cpu(ivh_steal_imminent_capacity_reject, cpu);
+		steal_imminent_time_left_reject += per_cpu(ivh_steal_imminent_time_left_reject, cpu);
 	}
 
 	seq_printf(m, "ivh_in_schedule:    %d\n", atomic_read(&ivh_in_schedule));
@@ -13413,6 +13491,35 @@ static int ivh_debug_show(struct seq_file *m, void *v)
 	if (prelock_calls)
 		seq_printf(m, "ivh_prelock_skip_pct:         %llu%%\n",
 			   prelock_skipped * 100 / prelock_calls);
+	seq_printf(m, "ivh_prelock_hotlock_cold_skipped: %llu\n", prelock_hotlock_cold_skipped);
+	seq_printf(m, "ivh_prelock_hotlock_hot_passed: %llu\n", prelock_hotlock_hot_passed);
+	seq_printf(m, "\n");
+
+	{
+		int veto_count = atomic_read(&ivh_veto_count);
+
+		seq_printf(m, "ivh_veto_count:      %d\n", veto_count);
+		if (veto_count) {
+			s64 target_sum = atomic64_read(&ivh_veto_target_cap_sum);
+			s64 fleet_sum  = atomic64_read(&ivh_veto_fleet_cap_sum);
+			int still_healthy = atomic_read(&ivh_veto_target_still_capacity_healthy);
+
+			seq_printf(m, "ivh_veto_target_cap_avg: %lld\n", target_sum / veto_count);
+			seq_printf(m, "ivh_veto_fleet_cap_avg:  %lld\n", fleet_sum / veto_count);
+			seq_printf(m, "ivh_veto_target_still_capacity_healthy_pct: %d%%\n",
+				   still_healthy * 100 / veto_count);
+			seq_printf(m, "# still_healthy_pct high = heartbeat and capacity signals\n");
+			seq_printf(m, "#   disagree often (heartbeat vetoes what capacity thinks is fine)\n");
+			seq_printf(m, "# fleet_cap_avg near target_cap_avg = contention correlated across\n");
+			seq_printf(m, "#   the host, not isolated to this one target\n");
+		}
+	}
+	seq_printf(m, "\n");
+	seq_printf(m, "ivh_post_lock_enabled: %lu\n", ivh_post_lock_enabled);
+	seq_printf(m, "ivh_post_lock_calls: %llu\n", post_lock_calls);
+	seq_printf(m, "ivh_post_lock_hot:   %llu\n", post_lock_hot);
+	seq_printf(m, "ivh_steal_imminent_capacity_reject: %llu\n", steal_imminent_capacity_reject);
+	seq_printf(m, "ivh_steal_imminent_time_left_reject: %llu\n", steal_imminent_time_left_reject);
 	seq_printf(m, "\n");
 	seq_printf(m, "# If in_schedule > 0 during a hang:\n");
 	seq_printf(m, "#   threads are stuck in schedule() waiting for vCPU on target\n");

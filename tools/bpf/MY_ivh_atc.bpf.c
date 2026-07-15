@@ -6,6 +6,18 @@ unsigned long tgidpid = 0;
 unsigned long cgid = 0;
 unsigned long allret = 0;
 unsigned long max_exec_slice = 0;
+
+/*
+ * Round-robin starting point for test3()'s destination search, 2026-07-10.
+ * process_cpu() used to always scan starting at (source_cpu + 1), so two
+ * lockholders on the same source vCPU always probed destinations in the
+ * same order and converged on the same low-numbered "first free" CPU.
+ * Bumped once per test3() call and shared across all CPUs/threads; a plain
+ * non-atomic increment is fine here since this is just a load-spreading
+ * hint, not a correctness-critical value (same reasoning as the benign
+ * last-write-wins race documented on dest_verdict_cache below).
+ */
+unsigned int ivh_rr_start = 0;
 #define fits_capacity(cap, max)   ((cap) * 1280 < (max) * 1024)
 #define SCHED_FIXEDPOINT_SHIFT    10
 #define SCHED_FIXEDPOINT_SCALE    (1L << SCHED_FIXEDPOINT_SHIFT)
@@ -156,12 +168,24 @@ return now_time - ref;
 //Returns 1 if the vCPU heartbeat is stale >1.5ms (hypervisor is stealing it),
 //0 if the heartbeat is fresh (CPU is running normally).
 //Matches the threshold used by the kernel's is_cpu_preempted() in cputime.c.
+//
+// 2026-07-02: clock_preempt is only refreshed on an active scheduler tick
+// (account_process_tick, kernel-side). A tickless-idle CPU (NO_HZ_IDLE, the
+// default) stops refreshing it and looks "stolen" once idle exceeds 1.5ms —
+// confirmed this session: 270/270 commit-time vetoes hit targets with
+// healthy capacity. last_idle_tp is written on idle transitions
+// (account_idle_time, tick-independent) and is fresh for a just-idled CPU,
+// so take the more recent of the two as the true liveness timestamp. Same
+// idiom already used in the GATE_BURST_BUDGET block below.
 static int is_cpu_preempted(struct rq *rq, u64 now_time)
 {
-    if (rq->clock_preempt > now_time)
+    u64 last_seen = rq->clock_preempt > rq->last_idle_tp
+                     ? rq->clock_preempt : rq->last_idle_tp;
+
+    if (last_seen > now_time)
         return 0;
 
-    return now_time - rq->clock_preempt > 300000ULL;
+    return now_time - last_seen > 1500000ULL;
 }
 
 /*
@@ -178,9 +202,10 @@ static int is_cpu_preempted(struct rq *rq, u64 now_time)
 #define REJ_PREEMPTED     6  /* target heartbeat stale (hypervisor stole it) */
 #define REJ_BURST_ORDER   7  /* target's active burst started earlier than ours */
 #define REJ_BURST_BUDGET  8  /* target has used up its typical active window */
-#define ACC_TIER1_ACTIVE  9  /* accepted: active (non-idle) worker */
-#define ACC_TIER2_IDLE    10 /* accepted (fallback record): idle vCPU */
-#define REJ_MAX           11
+#define ACC_TIER1_IDLE    9  /* accepted: nr_running == 0, genuinely empty runqueue */
+#define ACC_TIER2_NR1     10 /* accepted (fallback record): nr_running == 1 */
+#define REJ_NR_RUNNING    11 /* target runqueue depth >= 2 — would queue behind existing work */
+#define REJ_MAX           12
 
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -197,6 +222,47 @@ static __always_inline void bump_reason(u32 reason)
 }
 
 /*
+ * Destination-verdict cache, 2026-07-02.  process_cpu() is called at very
+ * high frequency (millions/sec under load) and re-reads/re-derives the same
+ * per-CPU facts on every call, even when two calls from different source
+ * vCPUs scan the same candidate moments apart.  cpu_capacity is written by
+ * userspace (vcap) on its own poll cadence -- much slower than the
+ * process_cpu() call rate -- so caching it for a short TTL costs
+ * negligible extra staleness.
+ *
+ * Deliberately NOT cached: GATE_LOCKHOLDER (lock_depth flickers at ~200ns
+ * per this session's measured last_cs_ns histogram -- caching it risks a
+ * stale "not a lock holder" verdict feeding a real migration decision,
+ * exactly the LHP scenario IVH exists to prevent) and GATE_PREEMPTED
+ * (heartbeat staleness -- treated as fast-changing until proven otherwise).
+ *
+ * GATE_BURST_ORDER's *raw* last_preemption value is cached (a per-CPU,
+ * caller-independent fact), but its pass/fail verdict is NOT -- that
+ * comparison is against the calling source rq's own last_preemption
+ * (ctx->rq_last_preempt), which differs per caller, so the boolean result
+ * cannot be shared across source vCPUs the way GATE_CAPACITY_LOW's can.
+ *
+ * Plain (non-percpu) array: the whole point is sharing one verdict across
+ * different source vCPUs' concurrent scans, which a percpu map would defeat.
+ * Concurrent writers racing to update the same target's slot is a benign
+ * last-write-wins race on soft state, not a correctness issue.
+ */
+#define DEST_CACHE_TTL_NS 10000ULL
+
+struct dest_cache_entry {
+    u8  cap_healthy;      /* cached GATE_CAPACITY_LOW verdict */
+    u64 last_preemption;  /* cached raw value, for GATE_BURST_ORDER */
+    u64 cached_at_ns;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 256);
+    __type(key, u32);
+    __type(value, struct dest_cache_entry);
+} dest_verdict_cache SEC(".maps");
+
+/*
  * Compile-time gate toggles for process_cpu(), EXPERIMENT: hackbench
  * leave-one-out gate sweep, 2026-07-01.  Set to 0 to disable a gate.
  * (CPUMASK and CLAIMED are not toggleable: CPUMASK is a hard correctness
@@ -206,10 +272,23 @@ static __always_inline void bump_reason(u32 reason)
 #define GATE_LOCKHOLDER    1
 #define GATE_SPINNER    0
 #define GATE_CAPACITY_LOW    1
-#define GATE_NOT_BETTER    0
-#define GATE_PREEMPTED    0
-#define GATE_BURST_ORDER    1
+#define GATE_NOT_BETTER    1
+#define GATE_PREEMPTED    1
+#define GATE_BURST_ORDER    0
 #define GATE_BURST_BUDGET    0
+
+/*
+ * Stage A5 (ivh_build_and_evaluation_plan_2026-07-11.md): runtime toggle for
+ * the Tier-2 (nr_running==1) reluctant-fallback destination below. Default 1
+ * preserves exactly today's behavior (record the lateral candidate, keep
+ * scanning for Tier-1). Set to 0 at runtime (bpftool map update on the .bss
+ * map, or a loader flag once one exists) to make process_cpu() abstain
+ * (leave target_cpu at -1) instead of ever accepting a Tier-2 landing --
+ * lets "IVH found nothing good" be observed/tested cleanly, and composes
+ * with a future adaptive-spinning fallback (the thread just spins normally
+ * instead of taking a lateral, not-actually-better migration).
+ */
+int ivh_tier2_fallback_enabled = 1;
 
 /*
  * Destination capacity floor, 2026-07-02 gate-combo experiment: require
@@ -218,13 +297,14 @@ static __always_inline void bump_reason(u32 reason)
  * >500". With a strict floor here, dest > 850 > source (<=512) always
  * holds, so GATE_NOT_BETTER is provably redundant and left off.
  */
-#define IVH_CAP_FLOOR    850
+#define IVH_CAP_FLOOR    400
 
 struct task_ctx {
     struct task_struct *curr;          /* task that is to be moved */
     int *target_cpu_ptr;               /* result - where should the task be moved? */
     u64 now;
-    int start;                         /* starting CPU */
+    int start;                         /* CPU the search scan starts from (round-robin, not necessarily source_cpu) */
+    int source_cpu;                    /* actual source CPU — excluded from candidacy */
     u64 rq_last_preempt;               /* last_preemption of source rq (age reference) */
     int source_capacity;               /* cpu_capacity of the source vCPU */
     int total_cpus;                    /* total number of CPUs in system */
@@ -242,7 +322,7 @@ static int process_cpu(u32 iter, void *data)
     int cpu = (iter + ctx->start) % ctx->total_cpus;
 
     /* Never migrate a task to the CPU it's already on. */
-    if (cpu == ctx->start)
+    if (cpu == ctx->source_cpu)
         return 0;
 
     //cpumask of curr cpu
@@ -292,10 +372,39 @@ static int process_cpu(u32 iter, void *data)
     }
 #endif
 
+#if GATE_CAPACITY_LOW || GATE_BURST_ORDER
+    /*
+     * Shared cache lookup for both gates below — see dest_verdict_cache
+     * comment above for why cap_healthy is a cacheable final verdict but
+     * last_preemption is cached as a raw value, not a verdict.
+     */
+    u8  cap_healthy;
+    u64 dest_last_preemption;
+    {
+        u32 cache_key = (u32)cpu;
+        struct dest_cache_entry *ce = bpf_map_lookup_elem(&dest_verdict_cache, &cache_key);
+
+        if (ce && ctx->now >= ce->cached_at_ns &&
+            ctx->now - ce->cached_at_ns < DEST_CACHE_TTL_NS) {
+            cap_healthy = ce->cap_healthy;
+            dest_last_preemption = ce->last_preemption;
+        } else {
+            struct dest_cache_entry fresh;
+
+            cap_healthy = select_rq->cpu_capacity > IVH_CAP_FLOOR;
+            dest_last_preemption = select_rq->last_preemption;
+            fresh.cap_healthy = cap_healthy;
+            fresh.last_preemption = dest_last_preemption;
+            fresh.cached_at_ns = ctx->now;
+            bpf_map_update_elem(&dest_verdict_cache, &cache_key, &fresh, BPF_ANY);
+        }
+    }
+#endif
+
 #if GATE_CAPACITY_LOW
     /* Strict floor: only migrate to a vCPU well above the source trigger
      * ceiling — see IVH_CAP_FLOOR comment above. */
-    if (select_rq->cpu_capacity <= IVH_CAP_FLOOR) {
+    if (!cap_healthy) {
         bump_reason(REJ_CAPACITY_LOW);
         return 0;
     }
@@ -321,8 +430,11 @@ static int process_cpu(u32 iter, void *data)
 
 #if GATE_BURST_ORDER
     /* Skip if target vCPU started its active burst earlier than us — it has
-     * less remaining burst time and is closer to being preempted. */
-    if (select_rq->last_preemption <= ctx->rq_last_preempt) {
+     * less remaining burst time and is closer to being preempted.
+     * dest_last_preemption is the cached raw value (see cache block above);
+     * the comparison itself is still done fresh per-caller since it depends
+     * on ctx->rq_last_preempt (the calling source rq's own value). */
+    if (dest_last_preemption <= ctx->rq_last_preempt) {
         bump_reason(REJ_BURST_ORDER);
         return 0;
     }
@@ -354,20 +466,48 @@ static int process_cpu(u32 iter, void *data)
     }
 #endif
 
-    if (!idle_cpu(select_rq)) {
-        /* Tier 1: active worker — computing, no lock involvement.
-         * No hypervisor vCPU wake-up cost. Stop search immediately. */
-        bump_reason(ACC_TIER1_ACTIVE);
-        *target_cpu_ptr = (int)(cpu);
-        *(ctx->found_active_worker_ptr) = 1;
-        return 1;
-    }
+    /*
+     * 2026-07-02: runqueue-depth gate + inverted tier preference. The old
+     * logic preferred a busy ("active worker") destination to avoid a
+     * hypervisor vCPU wake-up cost. On a saturated guest that means the
+     * migrated thread queues behind dest->curr — pure added latency for a
+     * thread that hasn't even acquired its target lock yet. Prefer a
+     * genuinely empty runqueue instead.
+     *
+     * nr_running is read live, never cached in dest_verdict_cache: it
+     * changes faster than cpu_capacity and on the same order as
+     * lock_depth — the same reasoning that keeps GATE_LOCKHOLDER and
+     * GATE_PREEMPTED out of the cache applies here.
+     */
+    {
+        u32 dest_nr = select_rq->nr_running;
 
-    /* Tier 2: idle vCPU — safe fallback, hypervisor wake-up required.
-     * Keep searching for a Tier 1 active worker. */
-    if (!*(ctx->found_active_worker_ptr)) {
-        bump_reason(ACC_TIER2_IDLE);
-        *target_cpu_ptr = (int)(cpu);
+        if (dest_nr >= 2) {
+            /* Deep queue: reject outright. */
+            bump_reason(REJ_NR_RUNNING);
+            return 0;
+        }
+
+        if (dest_nr == 0) {
+            /* Tier 1 (inverted): genuinely empty runqueue — nothing to
+             * queue behind. Best possible landing, stop search immediately. */
+            bump_reason(ACC_TIER1_IDLE);
+            *target_cpu_ptr = (int)(cpu);
+            *(ctx->found_active_worker_ptr) = 1;
+            return 1;
+        }
+
+        /* dest_nr == 1: reluctant fallback. Remember it but keep scanning
+         * for a truly-empty runqueue -- unless Stage A5's toggle says to
+         * abstain instead of ever accepting a lateral Tier-2 landing. */
+        if (!ivh_tier2_fallback_enabled) {
+            bump_reason(REJ_NOT_BETTER); /* reuse: "didn't accept this candidate" */
+            return 0;
+        }
+        if (!*(ctx->found_active_worker_ptr)) {
+            bump_reason(ACC_TIER2_NR1);
+            *target_cpu_ptr = (int)(cpu);
+        }
     }
 
     return 0;
@@ -509,8 +649,12 @@ int BPF_PROG(test3, struct rq *rq, struct task_struct *curr, u64 now_time, int a
     if (bpf_map_lookup_elem(&jit_tgids, &tgid))
         return -1;
 
-    int start = 0;
-    u32 nr_loops = total_cpus - 1;
+    /* Round-robin the scan's starting CPU across calls instead of always
+     * pivoting off source_cpu — see ivh_rr_start comment at top of file. */
+    int start = ivh_rr_start % total_cpus;
+    ivh_rr_start++;
+
+    u32 nr_loops = total_cpus;
     int target_cpu = -1;
 
     int found_active_worker = 0;
@@ -519,7 +663,8 @@ int BPF_PROG(test3, struct rq *rq, struct task_struct *curr, u64 now_time, int a
         .curr = curr,
         .target_cpu_ptr = &target_cpu,
         .now = now_time,
-        .start = rq->cpu,
+        .start = start,
+        .source_cpu = rq->cpu,
         .rq_last_preempt = rq->last_preemption,
         .source_capacity = rq->cpu_capacity,
         .total_cpus = total_cpus,

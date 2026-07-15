@@ -1,0 +1,159 @@
+#!/usr/bin/env bpftrace
+/*
+ * Measures P(real steal follows | staleness signal fired), for several
+ * candidate staleness thresholds, WITHOUT going through is_cpu_preempted()'s
+ * built-in 1.5ms gate. Ground truth for "real steal" is rq->prev_steal_time,
+ * which steal_account_process_time() increments by the raw paravirt steal
+ * delta on every call regardless of magnitude (the 1ms/1.5ms gates in
+ * cputime.c only gate whether last_preemption/preemptions/max_latency get
+ * updated, not prev_steal_time itself) -- so this reads the un-thresholded
+ * ground truth directly.
+ *
+ * Samples via kprobe:update_rq_clock (arg0 = this CPU's rq*, ~420K/s/cpu,
+ * established this session as a safe high-frequency per-cpu sampling point).
+ *
+ * "Staleness" tracks, per-CPU and entirely in bpftrace's own clock domain,
+ * how long it's been (in OUR sampling time) since the heartbeat value
+ * (max(clock_preempt, last_idle_tp)) last CHANGED -- rather than comparing
+ * the kernel's sched_clock()-based heartbeat directly against bpftrace's
+ * nsecs (an earlier version of this script did that and got nonsense: nsecs
+ * and sched_clock() are not reliably in the same domain on this system --
+ * virtually every sample read as "stale by 512ms-1s", which is impossible).
+ * This version never subtracts across the two clocks, so it can't have that
+ * bug, at the cost of being scoped to bpftrace's own sampling resolution
+ * (~2-3us at this kprobe's fire rate) rather than the same formula
+ * is_cpu_preempted() literally uses.
+ *
+ * Run under active co-tenant contention (verify with the step-6 check in
+ * demo_guide_2026-07-02.md first). Self-terminates after 30s via an internal
+ * interval probe (so END always runs and prints the summary table) -- wrap
+ * in a generous plain `timeout` as a safety net only, not `-s KILL`, since
+ * SIGKILL would prevent END from ever printing.
+ *
+ *   sudo timeout 45 bpftrace tools/bpf/signal_precision.bt
+ */
+
+BEGIN
+{
+	printf("sampling... (thresholds: 500ns 1us 5us 10us 50us 100us 300us 1.5ms)\n");
+}
+
+kprobe:update_rq_clock
+{
+	// Cheap, on EVERY call (this hook fires ~420K/s/cpu -- too fast for
+	// the full 8-threshold analysis below, which bpftrace silently drops
+	// most of under, biasing exactly the correlation we're measuring).
+	// Steal accumulates into a per-cpu pending counter so no steal event
+	// is ever lost between decimated analysis rounds, and the heartbeat
+	// change-detector runs every call so the "staleness" clock can't miss
+	// the actual moment it should reset.
+	$rq = (struct rq *)arg0;
+	$c = cpu;
+
+	$steal_now = $rq->prev_steal_time;
+	$hb = $rq->clock_preempt > $rq->last_idle_tp ? $rq->clock_preempt : $rq->last_idle_tp;
+
+	$prev_hb = @prev_hb[$c];
+	$have_prev = @have_prev[$c];
+
+	if ($have_prev) {
+		$steal_delta = $steal_now - @prev_steal[$c];
+		if ($steal_delta > 0) {
+			@pending_steal[$c] += $steal_delta;
+		}
+		if ($hb != $prev_hb) {
+			@last_change_ns[$c] = (int64)nsecs;
+			@prev_hb[$c] = $hb;
+		}
+	} else {
+		@last_change_ns[$c] = (int64)nsecs;
+		@prev_hb[$c] = $hb;
+		@have_prev[$c] = 1;
+	}
+	@prev_steal[$c] = $steal_now;
+	@call_count[$c]++;
+
+	// Expensive part, decimated: only every Nth call per cpu does the
+	// threshold bucketing + histogram work. This is a fixed, load-blind
+	// schedule (a modulo counter), not the runtime's own event-pressure
+	// drops -- so it loses resolution/sample-count, not correlation.
+	if ($have_prev && (@call_count[$c] % 200 == 0)) {
+		$staleness = (int64)nsecs - @last_change_ns[$c];
+		if ($staleness < 0) {
+			$staleness = 0;
+		}
+		$prev_stale = @prev_staleness[$c];
+		$pending = @pending_steal[$c];
+
+		if (@have_prev_analysis[$c]) {
+			if ($prev_stale > 500)    { @fired_500ns++;  if ($pending > 0) { @hit_500ns++;  } }
+			if ($prev_stale > 1000)   { @fired_1us++;    if ($pending > 0) { @hit_1us++;    } }
+			if ($prev_stale > 5000)   { @fired_5us++;    if ($pending > 0) { @hit_5us++;    } }
+			if ($prev_stale > 10000)  { @fired_10us++;   if ($pending > 0) { @hit_10us++;   } }
+			if ($prev_stale > 50000)  { @fired_50us++;   if ($pending > 0) { @hit_50us++;   } }
+			if ($prev_stale > 100000) { @fired_100us++;  if ($pending > 0) { @hit_100us++;  } }
+			if ($prev_stale > 300000) { @fired_300us++;  if ($pending > 0) { @hit_300us++;  } }
+			if ($prev_stale > 1500000){ @fired_1500us++; if ($pending > 0) { @hit_1500us++; } }
+
+			@samples++;
+			if ($pending > 0) {
+				@steal_events++;
+				@steal_magnitude_ns = hist($pending);
+			}
+		}
+
+		@prev_staleness[$c] = $staleness;
+		@have_prev_analysis[$c] = 1;
+		@pending_steal[$c] = 0;
+		@staleness_dist_ns = hist($staleness);
+	}
+}
+
+interval:s:1
+{
+	time("[%H:%M:%S] ");
+	printf("samples=%lld steal_events=%lld base_rate=%s\n",
+	    @samples, @steal_events,
+	    @samples > 0 ? "see final summary" : "n/a");
+}
+
+interval:s:30
+{
+	exit();
+}
+
+END
+{
+	printf("\n=== final: fired vs hit, by candidate threshold ===\n");
+	printf("total samples: %lld, total steal events: %lld, unconditional base rate: %lld / %lld\n",
+	    @samples, @steal_events, @steal_events, @samples);
+
+	printf("\nthreshold   fired        hit          p(steal|fired)\n");
+	printf("500ns       %-12lld %-12lld %lld/%lld\n", @fired_500ns, @hit_500ns, @hit_500ns, @fired_500ns);
+	printf("1us         %-12lld %-12lld %lld/%lld\n", @fired_1us, @hit_1us, @hit_1us, @fired_1us);
+	printf("5us         %-12lld %-12lld %lld/%lld\n", @fired_5us, @hit_5us, @hit_5us, @fired_5us);
+	printf("10us        %-12lld %-12lld %lld/%lld\n", @fired_10us, @hit_10us, @hit_10us, @fired_10us);
+	printf("50us        %-12lld %-12lld %lld/%lld\n", @fired_50us, @hit_50us, @hit_50us, @fired_50us);
+	printf("100us       %-12lld %-12lld %lld/%lld\n", @fired_100us, @hit_100us, @hit_100us, @fired_100us);
+	printf("300us       %-12lld %-12lld %lld/%lld\n", @fired_300us, @hit_300us, @hit_300us, @fired_300us);
+	printf("1.5ms       %-12lld %-12lld %lld/%lld\n", @fired_1500us, @hit_1500us, @hit_1500us, @fired_1500us);
+
+	printf("\nsteal magnitude histogram (ns), when a steal was detected:\n");
+	print(@steal_magnitude_ns);
+	printf("\nstaleness distribution (ns), all samples:\n");
+	print(@staleness_dist_ns);
+
+	clear(@prev_steal); clear(@prev_staleness); clear(@have_prev);
+	clear(@prev_hb); clear(@last_change_ns);
+	clear(@pending_steal); clear(@call_count); clear(@have_prev_analysis);
+	clear(@fired_500ns); clear(@hit_500ns);
+	clear(@fired_1us); clear(@hit_1us);
+	clear(@fired_5us); clear(@hit_5us);
+	clear(@fired_10us); clear(@hit_10us);
+	clear(@fired_50us); clear(@hit_50us);
+	clear(@fired_100us); clear(@hit_100us);
+	clear(@fired_300us); clear(@hit_300us);
+	clear(@fired_1500us); clear(@hit_1500us);
+	clear(@samples); clear(@steal_events);
+	clear(@steal_magnitude_ns); clear(@staleness_dist_ns);
+}

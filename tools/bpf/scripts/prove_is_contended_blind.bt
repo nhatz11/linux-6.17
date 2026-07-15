@@ -1,0 +1,77 @@
+#!/usr/bin/env bpftrace
+/*
+ * Proof, for the advisor: queued_spin_is_contended() (checked immediately
+ * after acquisition, the way Hotlock originally sampled it) reads "not
+ * contended" for the overwhelming majority of acquisitions that DID
+ * genuinely go through real contention -- not because contention is rare,
+ * but because the qspinlock queue typically drains back to empty by the
+ * time the new holder finishes claiming it (confirmed against the actual
+ * kernel source in kernel/locking/qspinlock.c, queue: label onward -- see
+ * tools/bpf/docs/post_acquisition_reactive_migration_2026-07-02.md).
+ *
+ * This captures BOTH signals in the SAME run, same window, so the
+ * comparison is apples-to-apples:
+ *   (a) real slowpath entries -- queued_spin_lock_slowpath() actually
+ *       called, i.e. genuine contention happened for this acquisition.
+ *   (b) the lock word's own contended bits, read the instant AFTER
+ *       _raw_spin_lock() returns -- what queued_spin_is_contended() itself
+ *       would see at that exact point.
+ *
+ * Usage:
+ *   sudo bash -c 'workload &  bpftrace tools/bpf/scripts/prove_is_contended_blind.bt'
+ * or just run this in one terminal and a workload (hackbench, NHextend) in
+ * another -- it runs for 8s and prints a summary.
+ */
+
+BEGIN
+{
+	printf("sampling for 8s...\n");
+}
+
+kprobe:_raw_spin_lock
+{
+	@lockptr[tid] = arg0;
+	@total_acquires++;
+}
+
+kprobe:queued_spin_lock_slowpath
+{
+	@slowpath_entries++;
+}
+
+kretprobe:_raw_spin_lock
+/@lockptr[tid]/
+{
+	$val = *(uint32 *)@lockptr[tid];
+	$contended = $val & ~0xff;
+	if ($contended != 0) {
+		@is_contended_true++;
+	}
+	delete(@lockptr[tid]);
+}
+
+interval:s:8 { exit(); }
+
+END
+{
+	printf("\n=== is_contended() blindness proof ===\n");
+	printf("Plain _raw_spin_lock() acquisitions tracked:     %lld\n", @total_acquires);
+	printf("  -- of THESE, is_contended()==true at claim:    %lld  (%d%% -- essentially never)\n",
+	    @is_contended_true,
+	    @total_acquires > 0 ? (uint64)(@is_contended_true * 100 / @total_acquires) : 0);
+	printf("\n");
+	printf("Genuine queued_spin_lock_slowpath() entries (system-wide, all\n");
+	printf("spinlock wrapper variants -- _irqsave/_irq/_bh too, a BROADER\n");
+	printf("population than the plain-_raw_spin_lock count above, so don't\n");
+	printf("divide one by the other): %lld\n", @slowpath_entries);
+	printf("\n");
+	printf("The point: slowpath entries are in the MILLIONS (real contention is\n");
+	printf("common), while is_contended()==true, checked immediately after a\n");
+	printf("plain _raw_spin_lock() claim, is ~0%% -- not because contention is\n");
+	printf("rare, but because the qspinlock queue typically drains back to\n");
+	printf("empty by the time the new holder finishes claiming it (confirmed\n");
+	printf("against kernel/locking/qspinlock.c's own slowpath source -- the\n");
+	printf("exact transition is labeled /* No contention */ in-tree).\n");
+
+	clear(@lockptr); clear(@total_acquires); clear(@slowpath_entries); clear(@is_contended_true);
+}

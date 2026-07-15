@@ -200,6 +200,22 @@ lhp_cstime.bpf.o: lhp_cstime.bpf.c
 		-I$(srctree) -I./include \
 		-c $< -o $@
 
+# --- ivh_hotlock_observe self-contained build (Checkpoint H validation tool) ---
+ivh_hotlock_observe: ivh_hotlock_observe.c ivh_hotlock_observe.skel.h
+	cc -O2 \
+		-I$(srctree)/tools/include/uapi \
+		-I$(IVH_LIBBPF_INC) \
+		-o $@ $< \
+		$(IVH_LIBBPF_LIB)/libbpf.a -lelf -lz
+
+ivh_hotlock_observe.skel.h: ivh_hotlock_observe.bpf.o
+	$(IVH_BPFTOOL) gen skeleton $< name ivh_hotlock_observe > $@
+
+ivh_hotlock_observe.bpf.o: ivh_hotlock_observe.bpf.c
+	clang -O2 -g -target bpf -D__TARGET_ARCH_$(IVH_ARCH) \
+		-I$(srctree) -I./include \
+		-c $< -o $@
+
 # --- lhp_waittime self-contained build ---
 lhp_waittime: lhp_waittime.c lhp_waittime.skel.h
 	cc -O2 \
