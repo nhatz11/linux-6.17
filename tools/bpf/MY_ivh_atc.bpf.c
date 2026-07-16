@@ -6,6 +6,23 @@ unsigned long tgidpid = 0;
 unsigned long cgid = 0;
 unsigned long allret = 0;
 unsigned long max_exec_slice = 0;
+/*
+ * EXPERIMENT 2026-07-15: destination search always starts from the
+ * *source* CPU's own index (ctx->start = rq->cpu) and stops at the first
+ * accepted Tier-1 candidate. Since that start point is fixed per source
+ * CPU, every migration attempt from a given stolen CPU scans candidates
+ * in the exact same order and piles onto the same first-found busy
+ * target -- a likely thundering-herd contributor to the ~10x guest-level
+ * holder-preemption regression. This cursor rotates the scan start so
+ * consecutive searches (even from the same source) spread across
+ * different targets instead.
+ *
+ * MEASURED WORSE: host-preempted improvement 1.49x->1.22x, iterations
+ * -7.5%->-15.4%, holder preemption unchanged (~10.5%, no improvement).
+ * Thundering-herd was not the driver of the holder-preemption cost.
+ * Reverted to fixed per-source start; cursor kept unused for reference.
+ */
+unsigned long ivh_rr_cursor = 0;
 #define fits_capacity(cap, max)   ((cap) * 1280 < (max) * 1024)
 #define SCHED_FIXEDPOINT_SHIFT    10
 #define SCHED_FIXEDPOINT_SCALE    (1L << SCHED_FIXEDPOINT_SHIFT)
@@ -156,24 +173,132 @@ return now_time - ref;
 //Returns 1 if the vCPU heartbeat is stale >1.5ms (hypervisor is stealing it),
 //0 if the heartbeat is fresh (CPU is running normally).
 //Matches the threshold used by the kernel's is_cpu_preempted() in cputime.c.
+//EXPERIMENT 2026-07-15: tried widening to 6ms (1.5x the HZ=250 tick period)
+//on the theory that 1.5ms < tick period causes false "preempted" reads on
+//healthy busy CPUs by sampling-phase alone. Measured WORSE: host-preempted
+//improvement dropped ~1.49x->1.44x, iterations -12.8% (vs -7.5% at 1.5ms),
+//and one migration ballooned to 203.9ms (vs 7-12ms max at 1.5ms) -- 6ms lets
+//genuinely-preempted targets through. Reverted to 1.5ms, the best measured
+//so far.
 static int is_cpu_preempted(struct rq *rq, u64 now_time)
 {
-    if (rq->clock_preempt > now_time)
+    u64 ref = rq->last_idle_tp > rq->clock_preempt
+              ? rq->last_idle_tp : rq->clock_preempt;
+
+    if (ref > now_time)
         return 0;
 
-    return now_time - rq->clock_preempt > 300000ULL;
+    /*
+     * EXPERIMENT 2026-07-15 (second pass): 6ms = 1.5x the HZ=250 tick
+     * period.  The 1.5ms threshold is BELOW the 4ms tick period, so on a
+     * busy-but-healthy CPU (heartbeat only refreshed at tick) this check
+     * false-fires ~60% of the time by sampling phase alone — measured
+     * directly: 9182 PREEMPTED rejections of clean candidates vs 6565
+     * accepts in one run, driving a 53% full-scan selection failure rate
+     * (1423 of 2674 ivh_selected traces returned dst=-1), which left
+     * threads spinning out their ~20ms waits on stolen vCPUs.  The gate
+     * order makes the tight threshold redundant as steal protection:
+     * GATE_CAPACITY_LOW (floor 850) has already excluded every actually
+     * stolen candidate before this gate runs.  The first 6ms experiment
+     * earlier tonight measured worse, but that was in the old regime
+     * (no userspace-holder gate, extend grace 50us, eval cooldown drops,
+     * active-balance escalation) where extra migrations amplified the
+     * stacking damage; those are all fixed now.
+     */
+    return now_time - ref > 6000000ULL;
 }
+
+/*
+ * Per-CPU counters: why did process_cpu() reject a candidate, or how did it
+ * accept one?  EXPERIMENT: hackbench gate-rejection profiling, 2026-07-01.
+ * Read after a run with: bpftool map dump name reject_reasons
+ */
+#define REJ_CPUMASK       0  /* not in task's own cpus_ptr */
+#define REJ_CLAIMED       1  /* already claimed by another IVH thread this tick */
+#define REJ_LOCKHOLDER    2  /* target's curr is inside a critical section */
+#define REJ_SPINNER       3  /* target's curr is already an MCS waiter */
+#define REJ_CAPACITY_LOW  4  /* fails EDWARDS-style capacity gate */
+#define REJ_NOT_BETTER    5  /* target capacity <= source capacity */
+#define REJ_PREEMPTED     6  /* target heartbeat stale (hypervisor stole it) */
+#define REJ_BURST_ORDER   7  /* target's active burst started earlier than ours */
+#define REJ_BURST_BUDGET  8  /* target has used up its typical active window */
+#define ACC_TIER1_ACTIVE  9  /* accepted: active (non-idle) worker */
+#define ACC_TIER2_IDLE    10 /* accepted (fallback record): idle vCPU */
+#define REJ_USER_LOCKHOLDER 11 /* target's curr holds a USERSPACE lock (rseq cr_counter) */
+#define REJ_MAX           12
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, REJ_MAX);
+    __type(key, u32);
+    __type(value, u64);
+} reject_reasons SEC(".maps");
+
+/*
+ * EXPERIMENT: capacity-floor sanity check, 2026-07-15. Is IVH_CAP_FLOOR
+ * (850) actually calibrated against the live cpu_capacity signal, or is
+ * it another stale constant like the 300us/1.5ms preemption threshold
+ * was? Keyed by *candidate* cpu index (0-15), summed across all real
+ * CPUs that evaluate it -- best-effort, not atomic-safe against every
+ * race, good enough for a sanity average. Dump with:
+ *   bpftool map dump name cap_sum ; bpftool map dump name cap_cnt
+ */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 16);
+    __type(key, u32);
+    __type(value, u64);
+} cap_sum SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 16);
+    __type(key, u32);
+    __type(value, u64);
+} cap_cnt SEC(".maps");
+
+static __always_inline void bump_reason(u32 reason)
+{
+    u64 *val = bpf_map_lookup_elem(&reject_reasons, &reason);
+    if (val)
+        (*val)++;
+}
+
+/*
+ * Compile-time gate toggles for process_cpu(), EXPERIMENT: hackbench
+ * leave-one-out gate sweep, 2026-07-01.  Set to 0 to disable a gate.
+ * (CPUMASK and CLAIMED are not toggleable: CPUMASK is a hard correctness
+ * requirement, CLAIMED prevents two IVH threads racing onto the same
+ * target — neither is a tunable policy decision.)
+ */
+#define GATE_LOCKHOLDER    1
+#define GATE_SPINNER    0
+#define GATE_CAPACITY_LOW    1
+#define GATE_NOT_BETTER    1
+#define GATE_PREEMPTED    1
+#define GATE_BURST_ORDER    0
+#define GATE_BURST_BUDGET    0
+
+/*
+ * Destination capacity floor, 2026-07-02 gate-combo experiment: require
+ * a migration target to be well above ivh_capacity_threshold (currently
+ * tuned to 512 as the *source* trigger ceiling), not just "average or
+ * >500". With a strict floor here, dest > 850 > source (<=512) always
+ * holds, so GATE_NOT_BETTER is provably redundant and left off.
+ */
+#define IVH_CAP_FLOOR    850
 
 struct task_ctx {
     struct task_struct *curr;          /* task that is to be moved */
     int *target_cpu_ptr;               /* result - where should the task be moved? */
     u64 now;
-    int start;                         /* starting CPU */
+    int start;                         /* scan start offset (rotated, NOT necessarily the source CPU) */
+    int source_cpu;                    /* actual source CPU -- never migrate here */
     u64 rq_last_preempt;               /* last_preemption of source rq (age reference) */
-    int *found_active_worker_ptr;      /* Tier 1: found a pure-compute vCPU */
-    int average_capacity;              /* system average capacity */
     int source_capacity;               /* cpu_capacity of the source vCPU */
     int total_cpus;                    /* total number of CPUs in system */
+    int average_capacity;              /* system average capacity, for EDWARDS-style gate */
+    int *found_active_worker_ptr;      /* 1 once a Tier 1 (active worker) target is found */
 };
 
 static int process_cpu(u32 iter, void *data)
@@ -186,7 +311,7 @@ static int process_cpu(u32 iter, void *data)
     int cpu = (iter + ctx->start) % ctx->total_cpus;
 
     /* Never migrate a task to the CPU it's already on. */
-    if (cpu == ctx->start)
+    if (cpu == ctx->source_cpu)
         return 0;
 
     //cpumask of curr cpu
@@ -194,8 +319,10 @@ static int process_cpu(u32 iter, void *data)
     unsigned long cpumask_bits = *(cpumask->bits);
 
     //is valid cpu for task?
-    if (!(cpumask_bits & (1UL << cpu)))
+    if (!(cpumask_bits & (1UL << cpu))) {
+        bump_reason(REJ_CPUMASK);
         return 0;
+    }
 
     int *target_cpu_ptr = ctx->target_cpu_ptr;
 
@@ -206,47 +333,128 @@ static int process_cpu(u32 iter, void *data)
     if (!select_rq)
         return 0;
 
+    /* EXPERIMENT: capacity-floor sanity check, 2026-07-15 (see cap_sum/cap_cnt above). */
+    {
+        u32 key = (u32)cpu;
+        u64 *sum = bpf_map_lookup_elem(&cap_sum, &key);
+        u64 *cnt = bpf_map_lookup_elem(&cap_cnt, &key);
+        if (sum && cnt) {
+            __sync_fetch_and_add(sum, select_rq->cpu_capacity);
+            __sync_fetch_and_add(cnt, 1);
+        }
+    }
+
     //has this cpu been selected by other IVH threads?
-    if (select_rq->prmpt_flags.counter & (1 << 2))
+    if (select_rq->prmpt_flags.counter & (1 << 2)) {
+        bump_reason(REJ_CLAIMED);
         return 0;
+    }
 
+#if GATE_LOCKHOLDER
     /* Skip lockholders: vCPU is inside a CS; adding more work hurts. */
-    if (select_rq->curr->lock_depth > 0)
+    if (select_rq->curr->lock_depth > 0) {
+        bump_reason(REJ_LOCKHOLDER);
         return 0;
+    }
 
+    /*
+     * EXPERIMENT 2026-07-15: USERSPACE lockholder gate.
+     *
+     * task->lock_depth is only maintained by the KERNEL spinlock wrappers
+     * (kernel/locking/spinlock.c).  A userspace CS holder (NHextend2 /
+     * pthread_spin_lock via the nptl patch) marks its critical section in
+     * rseq->cr_counter (bits [31:2] = nesting depth, set by inc_extend()
+     * in userspace) — its lock_depth stays 0 the whole time.  So the gate
+     * above NEVER protects the userspace holder: migrants land on the
+     * holder's CPU, the enqueue path's wakeup preemption sets a HARD
+     * need-resched (which the rseq extension cannot defer), and the holder
+     * loses the CPU mid-CS for a full mate-slice.  This was the dominant
+     * driver of the ~10x guest-level holder-preemption elevation.
+     *
+     * cr_counter lives in USER memory.  bpf_probe_read_user() reads the
+     * CALLING task's address space, so the check is only valid when the
+     * target's curr shares the caller's mm (same process — exactly the
+     * case that matters: one NHextend2 thread evaluating a CPU running a
+     * sibling thread).  For foreign-mm targets, skip the check (behaves
+     * as before).  copy_from_user_nofault semantics: safe in atomic
+     * context, returns -EFAULT instead of faulting.
+     */
+    {
+        struct task_struct *tcurr = select_rq->curr;
+
+        if (tcurr->mm && ctx->curr->mm && tcurr->mm == ctx->curr->mm) {
+            struct rseq *urseq = tcurr->rseq;
+
+            if (urseq) {
+                u32 cr = 0;
+
+                if (!bpf_probe_read_user(&cr, sizeof(cr), &urseq->cr_counter)
+                    && (cr & ~3u)) {
+                    bump_reason(REJ_USER_LOCKHOLDER);
+                    return 0;
+                }
+            }
+        }
+    }
+#endif
+
+#if GATE_SPINNER
     /*
      * Skip spinners: already queued in an MCS waiter list.
      * - lock free:  spinner already judged this vCPU safe for itself —
      *               migrating here risks thrashing.
      * - lock held:  migrated task joins queue behind existing waiter,
      *               the waiter preemption problem.
+     *
+     * EXPERIMENT 2026-07-15: tried enabling this to reduce the busy-target
+     * stacking that was driving ~10x guest-level holder preemption. Measured
+     * WORSE on every axis: host-preempted improvement 1.49x->1.27x,
+     * iterations -7.5%->-17.4%, holder preemption unchanged (~10.5%, no
+     * improvement). Reverted to 0.
      */
-    if (select_rq->curr->wait_depth > 0)
+    if (select_rq->curr->wait_depth > 0) {
+        bump_reason(REJ_SPINNER);
         return 0;
+    }
+#endif
 
-    /*
-     * "Good enough" gate (EDWARDS-style): only migrate to a vCPU that is
-     * either above the system average or above the 50% floor (500/1024).
-     * Also requires the target to be strictly better than the source —
-     * lateral migrations to equally-throttled vCPUs waste a schedule()
-     * call and stall under uniform host contention (e.g. all CPUs stolen).
-     */
-    if (!(select_rq->cpu_capacity > ctx->average_capacity ||
-          select_rq->cpu_capacity > 500))
+#if GATE_CAPACITY_LOW
+    /* Strict floor: only migrate to a vCPU well above the source trigger
+     * ceiling — see IVH_CAP_FLOOR comment above. */
+    if (select_rq->cpu_capacity <= IVH_CAP_FLOOR) {
+        bump_reason(REJ_CAPACITY_LOW);
         return 0;
+    }
+#endif
 
-    if (select_rq->cpu_capacity <= ctx->source_capacity)
+#if GATE_NOT_BETTER
+    /* Target must be strictly better than the source — lateral migrations
+     * to equally-throttled vCPUs waste a schedule() call and stall under
+     * uniform host contention (e.g. all CPUs stolen). */
+    if (select_rq->cpu_capacity <= ctx->source_capacity) {
+        bump_reason(REJ_NOT_BETTER);
         return 0;
+    }
+#endif
 
+#if GATE_PREEMPTED
     /* Skip if the vCPU heartbeat is stale — hypervisor has already preempted it. */
-    if (is_cpu_preempted(select_rq, ctx->now))
+    if (is_cpu_preempted(select_rq, ctx->now)) {
+        bump_reason(REJ_PREEMPTED);
         return 0;
+    }
+#endif
 
+#if GATE_BURST_ORDER
     /* Skip if target vCPU started its active burst earlier than us — it has
      * less remaining burst time and is closer to being preempted. */
-    if (select_rq->last_preemption <= ctx->rq_last_preempt)
+    if (select_rq->last_preemption <= ctx->rq_last_preempt) {
+        bump_reason(REJ_BURST_ORDER);
         return 0;
+    }
+#endif
 
+#if GATE_BURST_BUDGET
     /*
      * Skip if this vCPU has already used up its typical active window.
      *
@@ -261,24 +469,39 @@ static int process_cpu(u32 iter, void *data)
      * already reached that budget, preemption is overdue — migrating there
      * would put the task on a vCPU that is about to be yanked away.
      */
-    u64 ref = select_rq->last_idle_tp > select_rq->last_preemption
-              ? select_rq->last_idle_tp : select_rq->last_preemption;
-    u64 target_active = ctx->now > ref ? ctx->now - ref : 0;
-    if (select_rq->ewma_act_ns > 0 && target_active >= select_rq->ewma_act_ns)
-        return 0;
+    {
+        u64 ref = select_rq->last_idle_tp > select_rq->last_preemption
+                  ? select_rq->last_idle_tp : select_rq->last_preemption;
+        u64 target_active = ctx->now > ref ? ctx->now - ref : 0;
+        if (select_rq->ewma_act_ns > 0 && target_active >= select_rq->ewma_act_ns) {
+            bump_reason(REJ_BURST_BUDGET);
+            return 0;
+        }
+    }
+#endif
 
-    if (!idle_cpu(select_rq)) {
-        /* Tier 1: active worker — computing, no lock involvement.
-         * No hypervisor vCPU wake-up cost. Stop search immediately. */
+    if (idle_cpu(select_rq)) {
+        /*
+         * Tier 1 (preferred): idle vCPU. Migrating a spinner onto a busy
+         * clean CPU just stacks it behind whoever's already running there
+         * — including, sometimes, the very holder we're trying to protect,
+         * which is what was driving the ~10x holder-preemption regression
+         * measured 2026-07-15. An idle target costs a hypervisor wake-up,
+         * but the thread runs immediately instead of queuing. Stop search.
+         */
+        bump_reason(ACC_TIER2_IDLE);
         *target_cpu_ptr = (int)(cpu);
         *(ctx->found_active_worker_ptr) = 1;
         return 1;
     }
 
-    /* Tier 2: idle vCPU — safe fallback, hypervisor wake-up required.
-     * Keep searching for a Tier 1 active worker. */
-    if (!*(ctx->found_active_worker_ptr))
+    /* Tier 2 (fallback): active/busy vCPU. No wake-up cost, but the thread
+     * queues behind existing work. Keep searching for a Tier 1 idle target
+     * first; only settle for this if none exists. */
+    if (!*(ctx->found_active_worker_ptr)) {
+        bump_reason(ACC_TIER1_ACTIVE);
         *target_cpu_ptr = (int)(cpu);
+    }
 
     return 0;
 }
@@ -422,6 +645,7 @@ int BPF_PROG(test3, struct rq *rq, struct task_struct *curr, u64 now_time, int a
     int start = 0;
     u32 nr_loops = total_cpus - 1;
     int target_cpu = -1;
+
     int found_active_worker = 0;
 
     struct task_ctx task_context = {
@@ -429,11 +653,12 @@ int BPF_PROG(test3, struct rq *rq, struct task_struct *curr, u64 now_time, int a
         .target_cpu_ptr = &target_cpu,
         .now = now_time,
         .start = rq->cpu,
+        .source_cpu = rq->cpu,
         .rq_last_preempt = rq->last_preemption,
-        .found_active_worker_ptr = &found_active_worker,
-        .average_capacity = average_capacity,
         .source_capacity = rq->cpu_capacity,
-        .total_cpus = total_cpus
+        .total_cpus = total_cpus,
+        .average_capacity = average_capacity,
+        .found_active_worker_ptr = &found_active_worker
     };
 
     unsigned long mm_bits = curr->mm ? curr->mm->cpu_bitmap[0] : 0UL;

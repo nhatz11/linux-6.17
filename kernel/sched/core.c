@@ -5853,6 +5853,11 @@ void sched_tick(void)
 
 	rq_unlock(rq, &rf);
 
+	/* EXPERIMENT: bare-schedule() hang diagnosis, 2026-06-30. Cheap
+	 * 32-slot scan; only ever produces output when an IVH self-migration
+	 * is actually stuck past a threshold. */
+	ivh_scan_stuck_waiters();
+
 	if (sched_feat(LATENCY_WARN) && resched_latency)
 		resched_latency_warn(cpu, resched_latency);
 

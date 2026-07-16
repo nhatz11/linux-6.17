@@ -20,6 +20,56 @@ static inline void tracefs_print_init(void *inst) { }
 #include <asm/byteorder.h>
 #include <errno.h>
 #include <sys/syscall.h>
+#include <sched.h>
+#include <fcntl.h>
+
+/*
+ * Host-level steal-time ground truth, read from /proc/vcap_info
+ * (custom_modules/vsched_module.c, get_info_read() -> get_steal_and_preemptions()
+ * -> paravirt_steal_clock()). Per-CPU raw cumulative steal ns since boot, driven
+ * directly by the KVM steal-time MSR -- independent of guest scheduling entirely,
+ * unlike cs_preempted_count below (which only catches guest-internal off-CPU
+ * gaps, not real host-level vCPU steals).
+ */
+#define VCAP_MAX_CPUS 256
+
+/*
+ * Persistent thread-local fd + pread(fd, buf, sz, 0): the kernel proc handler
+ * blocks re-read() via *ppos>0 (single-shot dump per open), but pread() passes
+ * a local pos and never touches f_pos, so it re-triggers the dump every call
+ * without re-opening the file (avoiding an open()+close() pair per check).
+ */
+static __thread int vcap_steal_fd = -1;
+
+static int read_vcap_steal(unsigned long long *steal_out)
+{
+        char buf[8192];
+        char *saveptr, *tok;
+        ssize_t n;
+        int cpu = -1, field = 0;
+
+        if (vcap_steal_fd < 0) {
+                vcap_steal_fd = open("/proc/vcap_info", O_RDONLY);
+                if (vcap_steal_fd < 0)
+                        return -1;
+        }
+        n = pread(vcap_steal_fd, buf, sizeof(buf) - 1, 0);
+        if (n <= 0)
+                return -1;
+        buf[n] = '\0';
+
+        tok = strtok_r(buf, "\n", &saveptr);
+        while (tok) {
+                if (field == 0) {
+                        sscanf(tok, "CPU %d:", &cpu);
+                } else if (field == 2 && cpu >= 0 && cpu < VCAP_MAX_CPUS) {
+                        steal_out[cpu] = strtoull(tok, NULL, 10);
+                }
+                field = (field + 1) % 4;
+                tok = strtok_r(NULL, "\n", &saveptr);
+        }
+        return 0;
+}
 
 /*
  * Pre-lock migration trigger — call BEFORE attempting grab_lock(), not after.
@@ -32,7 +82,7 @@ static inline void tracefs_print_init(void *inst) { }
 #endif
 static inline void ivh_cs_enter(void)
 {
-	syscall(__NR_ivh_cs_enter);
+        syscall(__NR_ivh_cs_enter);
 }
 
 /* Updated version of rseq structure with cr_counter, wait_counter, and timing fields */
@@ -55,7 +105,7 @@ static bool no_rseq;
 static bool extend_wait;
 static bool no_pin;
 
-static int loop_spin = 7500;
+static int loop_spin = 600000;
 static int num_threads = -1;
 static int num_busy_threads = 0;
 
@@ -133,7 +183,10 @@ struct thread_data {
         unsigned long long                      max_migration_ns;
         unsigned long long                      slow_migration_count; /* ivh_cs_enter() > 1ms */
         /* CS preemption tracking: how often was the lock holder preempted */
-        unsigned long long                      cs_preempted_count;  /* CS cycles with >100us off-CPU */
+        unsigned long long                      cs_preempted_count;  /* CS cycles with >100us off-CPU, GUEST-LEVEL proxy */
+        /* Host-level steal-time tracking (ground truth, see read_vcap_steal) */
+        unsigned long long                      host_preempted_count;
+        unsigned long long                      host_preempted_migrated_count;
         struct data                             *data;
         int                                     cpu;
 };
@@ -318,8 +371,6 @@ static void grab_lock(struct thread_data *tdata, struct data *data)
                 }
         } while (prev && !data->done);
 
-	printf("after done while loop\n");
-
         if (contention)
                 tdata->contention++;
 
@@ -333,8 +384,11 @@ static void grab_lock(struct thread_data *tdata, struct data *data)
         start_ns = get_time_ns();
         start_active_ns = get_time_cputime();
 
+        int cs_cpu_start = sched_getcpu();
+        unsigned long long steal_before[VCAP_MAX_CPUS] = {0};
+        read_vcap_steal(steal_before);
+
         tracefs_printf(NULL, "Have lock!\n");
-	printf("have lock\n");
         delta = end_wait - start_wait;
         if (!tdata->total_wait || tdata->max_wait < delta)
                 tdata->max_wait = delta;
@@ -357,8 +411,27 @@ static void grab_lock(struct thread_data *tdata, struct data *data)
         end = get_time();
         end_ns = get_time_ns();
         end_active_ns = get_time_cputime();
+
+        int cs_cpu_end = sched_getcpu();
+        unsigned long long steal_after[VCAP_MAX_CPUS] = {0};
+        read_vcap_steal(steal_after);
+        {
+                /* >100us floor matches the kernel's own >1ms rq->preemptions
+                 * filter's order of magnitude, filtering background
+                 * steal-counter noise rather than any nonzero delta. */
+                bool migrated = (cs_cpu_start != cs_cpu_end);
+                long long delta_start = (long long)steal_after[cs_cpu_start] - (long long)steal_before[cs_cpu_start];
+                bool host_preempted = delta_start > 100000LL;
+                if (migrated) {
+                        long long delta_end = (long long)steal_after[cs_cpu_end] - (long long)steal_before[cs_cpu_end];
+                        host_preempted = host_preempted || (delta_end > 100000LL);
+                        tdata->host_preempted_migrated_count++;
+                }
+                if (host_preempted)
+                        tdata->host_preempted_count++;
+        }
+
         tracefs_printf(NULL, "released lock!\n");
-	printf("release lock\n");
         tdata->last_cs_ns        = end_ns - start_ns;
         tdata->last_cs_active_ns = end_active_ns - start_active_ns;
         tdata->last_wait_ns      = start_ns - start_wait_ns;
@@ -396,7 +469,6 @@ static void grab_lock(struct thread_data *tdata, struct data *data)
 
         tdata->total += delta;
         tdata->x_count++;
-	printf("finish grablock func\n");
 }
 
 static void *busy_thread(void *d)
@@ -457,6 +529,13 @@ int main (int argc, char **argv)
         int ch;
         int i;
 
+        {
+                const char *ls = getenv("NHEXTEND_LOOP_SPIN");
+
+                if (ls)
+                        loop_spin = atoi(ls);
+        }
+
         while ((ch = getopt(argc, argv, "dwvlnb:")) >= 0) {
                 switch (ch) {
                         case 'd':
@@ -484,7 +563,7 @@ int main (int argc, char **argv)
                                 break;
                         }
                         default:
-                                fprintf(stderr, "usage: NHextend [-d|-w|-v|-l|-n] [-b busy_threads] [threads]\n"
+                                fprintf(stderr, "usage: NHextend2 [-d|-w|-v|-l|-n] [-b busy_threads] [threads]\n"
                                                 "  -d: disable rseq\n"
                                                 "  -n: no CPU pinning (threads float across all CPUs, needed for IVH migration)\n"
                                                 "  -w: extend while trying to get lock\n"
@@ -587,18 +666,15 @@ int main (int argc, char **argv)
         }
 
         pthread_barrier_wait(&pbarrier);
-        sleep(5);
+        {
+                const char *dur = getenv("NHEXTEND_DURATION");
+                sleep(dur ? atoi(dur) : 5);
+        }
 
-        printf("Finish up\n");
         data.done = true;
         wmb();
-        printf("TEST\n");
         for (i = 0; i < num_threads + num_busy_threads; i++) {
-                
-		printf("ENTER FORLOOP\n");
-		
-		pthread_join(threads[i], NULL);
-		printf("joined\n");
+                pthread_join(threads[i], NULL);
                 if (i >= num_threads)
                         continue;
                 if (verbose) {
@@ -676,6 +752,7 @@ int main (int argc, char **argv)
                 /* IVH migration stats — measures ivh_cs_enter() duration, not CS hold */
                 unsigned long long g_mig_count = 0, g_mig_sum = 0, g_mig_max = 0;
                 unsigned long long g_slow = 0, g_cs_preempted = 0;
+                unsigned long long g_host_preempted = 0, g_host_migrated = 0;
                 printf("IVH migration stats (ivh_cs_enter duration, NOT included in CS above):\n");
                 printf("  %-6s  %-10s  %-12s  %-12s  %-12s\n",
                        "thread", "calls", "avg_ns", "max_ns", "slow(>1ms)");
@@ -692,6 +769,8 @@ int main (int argc, char **argv)
                         if (t->max_migration_ns > g_mig_max) g_mig_max = t->max_migration_ns;
                         g_slow      += t->slow_migration_count;
                         g_cs_preempted += t->cs_preempted_count;
+                        g_host_preempted += t->host_preempted_count;
+                        g_host_migrated  += t->host_preempted_migrated_count;
                 }
                 unsigned long long g_mig_cnt = g_mig_count ? g_mig_count : 1;
                 unsigned long long g_cs_cnt  = g_count ? g_count : 1;
@@ -703,10 +782,16 @@ int main (int argc, char **argv)
                 printf("  Stuck (>1ms)        : %llu  (%.4f%% of migrations)\n",
                        g_slow, 100.0 * g_slow / g_mig_cnt);
                 printf("\n");
-                printf("CS holder preemption (off-CPU >100us DURING lock hold):\n");
+                printf("CS holder preemption (off-CPU >100us DURING lock hold, GUEST-LEVEL, ru_nivcsw-style proxy):\n");
                 printf("  Preempted CS cycles : %llu / %llu  (%.4f%%)\n",
                        g_cs_preempted, g_count,
                        100.0 * g_cs_preempted / g_cs_cnt);
+                printf("\n");
+                printf("HOST-level steal during hold (real /proc/vcap_info steal_time delta, ground truth):\n");
+                printf("  Host-preempted CS cycles : %llu / %llu  (%.4f%%)\n",
+                       g_host_preempted, g_count,
+                       100.0 * g_host_preempted / g_cs_cnt);
+                printf("  (of which, thread migrated mid-CS): %llu\n", g_host_migrated);
                 printf("\n");
         }
 

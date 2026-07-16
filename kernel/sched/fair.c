@@ -78,6 +78,150 @@ EXPORT_SYMBOL_GPL(ivh_in_schedule);
 EXPORT_SYMBOL_GPL(ivh_trylock_misses);
 EXPORT_SYMBOL_GPL(ivh_migrations_done);
 
+/*
+ * Per-vCPU evaluation cooldown instrumentation.  Per-CPU counters, not
+ * atomics: at hackbench-class call volume (~200K+/s) a shared atomic_inc
+ * would itself bounce a cache line and distort the overhead being
+ * measured.  Summed across CPUs for display in /proc/ivh_debug.
+ */
+static DEFINE_PER_CPU(u64, ivh_prelock_calls);
+static DEFINE_PER_CPU(u64, ivh_prelock_cooldown_skipped);
+
+/*
+ * ivh_wait diagnostic registry — EXPERIMENT ONLY (bare-schedule() hang
+ * investigation, 2026-06-30).  Records every in-flight self-migration
+ * attempt in bpf_sched_pre_lock_migrate() so the periodic tick handler
+ * (sched_tick(), which by construction only runs on CPUs that are
+ * actually getting host time — no dedicated watchdog thread needed)
+ * can opportunistically snapshot the state of any attempt that has been
+ * pending unusually long, at increasing time thresholds, giving a
+ * timeline instead of a single sample.
+ *
+ * Answers directly: is the task still on src_cpu (migration never
+ * completed), or on target_cpu but not on_rq (lost), or on_rq on
+ * target_cpu with a heartbeat that's been stale exactly as long as the
+ * task has been stuck (confirms "target vCPU has no host time", with
+ * a number attached)?
+ */
+#define IVH_WAIT_SLOTS 32
+#define IVH_WAIT_NUM_THRESH 10
+static const u64 ivh_wait_thresholds_ns[IVH_WAIT_NUM_THRESH] = {
+	1000000ULL,    /*   1 ms */
+	2000000ULL,    /*   2 ms */
+	5000000ULL,    /*   5 ms */
+	10000000ULL,   /*  10 ms */
+	25000000ULL,   /*  25 ms */
+	50000000ULL,   /*  50 ms */
+	100000000ULL,  /* 100 ms */
+	250000000ULL,  /* 250 ms */
+	500000000ULL,  /* 500 ms */
+	1000000000ULL, /*   1  s */
+};
+
+struct ivh_wait_slot {
+	struct task_struct *task;
+	u64  start_ns;
+	int  src_cpu;
+	int  target_cpu;
+	int  next_thresh_idx;
+	int  phase;  /* 1 = inside first set_cpus_allowed_ptr(); 2 = inside post-migration schedule() */
+};
+static struct ivh_wait_slot ivh_wait_slots[IVH_WAIT_SLOTS];
+static DEFINE_RAW_SPINLOCK(ivh_wait_lock);
+
+/* Call right before the self-migrating schedule() (phase 2) or the initial
+ * set_cpus_allowed_ptr() (phase 1).  Returns slot index or -1. */
+static int ivh_wait_register(struct task_struct *task, int src_cpu, int target_cpu, int phase)
+{
+	unsigned long flags;
+	int i, slot = -1;
+
+	raw_spin_lock_irqsave(&ivh_wait_lock, flags);
+	for (i = 0; i < IVH_WAIT_SLOTS; i++) {
+		if (!ivh_wait_slots[i].task) {
+			ivh_wait_slots[i].task = task;
+			ivh_wait_slots[i].start_ns = sched_clock();
+			ivh_wait_slots[i].src_cpu = src_cpu;
+			ivh_wait_slots[i].target_cpu = target_cpu;
+			ivh_wait_slots[i].next_thresh_idx = 0;
+			ivh_wait_slots[i].phase = phase;
+			slot = i;
+			break;
+		}
+	}
+	raw_spin_unlock_irqrestore(&ivh_wait_lock, flags);
+	return slot;
+}
+
+/* Call right after the self-migrating schedule() returns. */
+static void ivh_wait_unregister(int slot)
+{
+	unsigned long flags;
+
+	if (slot < 0)
+		return;
+	raw_spin_lock_irqsave(&ivh_wait_lock, flags);
+	ivh_wait_slots[slot].task = NULL;
+	raw_spin_unlock_irqrestore(&ivh_wait_lock, flags);
+}
+
+/*
+ * Called from sched_tick() on whichever CPU is currently ticking (i.e.
+ * currently has host time — a stolen CPU never reaches this call, so this
+ * is self-limiting to observers that are actually alive, with no single
+ * point of failure to babysit).  Snapshots any stuck attempt once per
+ * threshold crossing.
+ */
+void ivh_scan_stuck_waiters(void)
+{
+	u64 now = sched_clock();
+	int i;
+
+	for (i = 0; i < IVH_WAIT_SLOTS; i++) {
+		struct task_struct *t;
+		u64 start;
+		int src, tgt, thresh_idx, phase;
+		unsigned long flags;
+
+		raw_spin_lock_irqsave(&ivh_wait_lock, flags);
+		t = ivh_wait_slots[i].task;
+		start = ivh_wait_slots[i].start_ns;
+		src = ivh_wait_slots[i].src_cpu;
+		tgt = ivh_wait_slots[i].target_cpu;
+		thresh_idx = ivh_wait_slots[i].next_thresh_idx;
+		phase = ivh_wait_slots[i].phase;
+		if (t && thresh_idx < IVH_WAIT_NUM_THRESH &&
+		    now - start >= ivh_wait_thresholds_ns[thresh_idx])
+			ivh_wait_slots[i].next_thresh_idx = thresh_idx + 1;
+		raw_spin_unlock_irqrestore(&ivh_wait_lock, flags);
+
+		if (!t)
+			continue;
+		if (thresh_idx >= IVH_WAIT_NUM_THRESH)
+			continue;
+		if (now - start < ivh_wait_thresholds_ns[thresh_idx])
+			continue;
+
+		{
+			struct rq *tgt_rq = cpu_rq(tgt);
+			int cur_cpu = task_cpu(t);
+			int on_rq = READ_ONCE(t->on_rq);
+			unsigned int tstate = READ_ONCE(t->__state);
+			u64 tgt_heartbeat_age = (tgt_rq->clock_preempt <= now)
+					? now - tgt_rq->clock_preempt : 0;
+
+			trace_printk(
+				"ivh_stuck: pid=%d comm=%s phase=%d waited_us=%llu "
+				"src_cpu=%d target_cpu=%d cur_cpu=%d on_rq=%d state=0x%x "
+				"target_cap=%lu target_heartbeat_stale_us=%llu\n",
+				t->pid, t->comm, phase, (now - start) / 1000,
+				src, tgt, cur_cpu, on_rq, tstate,
+				tgt_rq->cpu_capacity, tgt_heartbeat_age / 1000);
+		}
+	}
+}
+EXPORT_SYMBOL_GPL(ivh_scan_stuck_waiters);
+
 /* average capacity across CPUs, defined in core.c */
 extern int average_capacity_all;
 
@@ -12938,20 +13082,16 @@ out_unlock:
 
 //ivh start
 
-/*
- * Per-migration watchdog: armed on src_cpu before schedule(); fires on src_cpu
- * (HRTIMER_MODE_REL_PINNED keeps it here even after the task migrates away).
- * If schedule() hasn't returned within ivh_migration_timeout_ns, the target
- * vCPU is assumed stolen and the original affinity is restored so the task
- * can run on any healthy CPU instead of waiting indefinitely.
- */
+#if 0
 struct ivh_migration_wd {
 	struct hrtimer     timer;
 	struct task_struct *task;
-	cpumask_var_t      rescue_mask; /* saved_mask minus target_cpu */
-	atomic_t           done;        /* 1 once schedule() returned or timer fired */
+	cpumask_var_t      rescue_mask;
+	atomic_t           done;
 };
+#endif
 
+#if 0
 /*
  * ivh_rescue_stuck_task - directly pull a task out of a stolen CPU's runqueue.
  *
@@ -13017,22 +13157,47 @@ static void ivh_rescue_stuck_task(struct task_struct *p,
 	attach_one_task(dst_rq, p);
 }
 
-static enum hrtimer_restart ivh_migration_watchdog(struct hrtimer *timer)
-{
-	struct ivh_migration_wd *wd =
-		container_of(timer, struct ivh_migration_wd, timer);
+#endif /* watchdog and rescue disabled */
 
-	if (atomic_cmpxchg(&wd->done, 0, 1) == 0) {
-		atomic_inc(&ivh_timeout_count);
-		/*
-		 * Directly pull the task from the stolen CPU's runqueue.
-		 * Cannot use set_cpus_allowed_ptr() here: it queues stop work
-		 * on the stolen CPU which never executes while the vCPU is dark.
-		 */
-		ivh_rescue_stuck_task(wd->task, wd->rescue_mask);
+/*
+ * ivh_eval_cooldown_ok - per-vCPU rate limiter on full IVH pre-lock
+ * evaluation.  ivh_pre_lock() fires on every spin_lock() acquisition by
+ * an eligible task; under high lock-call-volume workloads (hackbench:
+ * ~200K+ full evaluations/sec) the fixed cost of entering
+ * bpf_sched_pre_lock_migrate() (gates + my_spinlock + BPF trampoline)
+ * dominates even with zero migrations.  The condition being gated
+ * (rq->cpu_capacity, rq->ewma_act_ns / rq->last_preemption) is a
+ * property of the vCPU, not of the calling thread or the lock being
+ * taken, and changes on the timescale of a hypervisor steal event
+ * (>300us, see is_cpu_preempted()) — far slower than the cadence at
+ * which lock-heavy workloads re-enter this path.  Collapsing repeated
+ * evaluation of the same still-valid answer to once per cooldown window
+ * removes the redundant work without discriminating by lock identity
+ * or duration (see kernel/locking/spinlock.c ivh_pre_lock()).
+ *
+ * rq->ivh_last_eval_ns is touched only from process context (in_task())
+ * on the physical CPU that owns that rq, by whichever task happens to be
+ * running there at the moment — strictly sequential by construction,
+ * same access discipline already relied on for rq->clock_preempt /
+ * rq->last_preemption.  No locking needed.
+ */
+bool ivh_eval_cooldown_ok(void)
+{
+	struct rq *rq = this_rq();
+	u64 now = sched_clock();
+
+	this_cpu_inc(ivh_prelock_calls);
+
+	if (ivh_eval_cooldown_ns &&
+	    now - rq->ivh_last_eval_ns < ivh_eval_cooldown_ns) {
+		this_cpu_inc(ivh_prelock_cooldown_skipped);
+		return false;
 	}
-	return HRTIMER_NORESTART;
+
+	rq->ivh_last_eval_ns = now;
+	return true;
 }
+EXPORT_SYMBOL_GPL(ivh_eval_cooldown_ok);
 
 /**
  * bpf_sched_pre_lock_migrate - synchronous self-migration before spinlock acquire.
@@ -13056,6 +13221,14 @@ void bpf_sched_pre_lock_migrate(void)
 	int src_cpu;
 	cpumask_var_t saved_mask;
 	unsigned long flags;
+
+	/* Defense-in-depth: never inject a migration/schedule() into a task
+	 * that isn't TASK_RUNNING (see the matching, primary gate in
+	 * ivh_pre_lock(), kernel/locking/spinlock.c) — doing so consumes a
+	 * sleep state that belongs to some other subsystem's prepare-to-wait
+	 * sequence and produces a permanent lost wakeup. */
+	if (READ_ONCE(current->__state) != TASK_RUNNING)
+		return;
 
 	rq = this_rq();
 	src_cpu = rq->cpu;
@@ -13150,56 +13323,64 @@ void bpf_sched_pre_lock_migrate(void)
 		return;
 	}
 
-	/*
-	 * Layer 2 — hrtimer watchdog (not pinned).  If schedule() has not
-	 * returned within ivh_migration_timeout_ns, the target was stolen
-	 * between the Layer-1 check and schedule().  The callback widens
-	 * affinity back to rescue_mask so the task can escape.
-	 *
-	 * Intentionally NOT pinned: the source vCPU is stolen (that is why
-	 * we are migrating), so a PINNED timer would silently sit dark on
-	 * that CPU and never fire.  An unpinned timer lets the kernel move
-	 * it to whichever CPU is actually running.
-	 */
-	struct ivh_migration_wd wd;
-	bool wd_armed = false;
-
-	if (ivh_migration_timeout_ns && alloc_cpumask_var(&wd.rescue_mask, GFP_KERNEL)) {
-		/* Rescue mask = original CPUs minus the now-suspected target. */
-		cpumask_andnot(wd.rescue_mask, saved_mask, cpumask_of(target_cpu));
-		if (cpumask_empty(wd.rescue_mask))
-			cpumask_copy(wd.rescue_mask, saved_mask);
-
-		atomic_set(&wd.done, 0);
-		wd.task = current;
-		hrtimer_setup_on_stack(&wd.timer, ivh_migration_watchdog,
-				       CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-		hrtimer_start(&wd.timer,
-			      ns_to_ktime(ivh_migration_timeout_ns),
-			      HRTIMER_MODE_REL);
-		wd_armed = true;
-	}
-
-	trace_printk("ivh_pre_sched: pid=%d comm=%s src=%d dst=%d in_sched=%d\n",
-		     current->pid, current->comm, src_cpu, target_cpu,
-		     atomic_read(&ivh_in_schedule));
 	atomic_inc(&ivh_in_schedule);
 
-	if (set_cpus_allowed_ptr(current, cpumask_of(target_cpu)) == 0)
+	/*
+	 * EXPERIMENT: bare-schedule() hang diagnosis, 2026-06-30.
+	 * Swapped from schedule_timeout_interruptible() back to plain
+	 * schedule() (the version that was observed to hang) so we can
+	 * find out *where* a stuck task actually is instead of theorizing.
+	 * ivh_wait_register/unregister + sched_tick()'s
+	 * ivh_scan_stuck_waiters() give a timeline of cur_cpu/on_rq/target
+	 * heartbeat staleness for any attempt that's been pending past a
+	 * threshold while this call is blocked inside schedule() below.
+	 */
+	u64 wait_start_ns = sched_clock();
+	int wait_slot = -1;
+
+	/*
+	 * Phase 1: register around set_cpus_allowed_ptr() itself. For a
+	 * running task this blocks inside affine_move_task() ->
+	 * wait_for_completion() (core.c) — if the stuck state is actually
+	 * here (not in the phase-2 schedule() below), this is where we'll
+	 * catch it.
+	 */
+	int wait_slot_p1 = ivh_wait_register(current, src_cpu, target_cpu, 1);
+	int sca_ret = set_cpus_allowed_ptr(current, cpumask_of(target_cpu));
+	ivh_wait_unregister(wait_slot_p1);
+
+	if (sca_ret == 0) {
+		/* Phase 2: the bare schedule() previously (and solely) instrumented. */
+		wait_slot = ivh_wait_register(current, src_cpu, target_cpu, 2);
 		schedule();
+		ivh_wait_unregister(wait_slot);
+	}
+	u64 wait_elapsed_ns = sched_clock() - wait_start_ns;
 
 	atomic_dec(&ivh_in_schedule);
 
-	if (wd_armed) {
-		/* Signal the watchdog we finished, then wait for any in-flight callback. */
-		atomic_cmpxchg(&wd.done, 0, 1);
-		hrtimer_cancel(&wd.timer);
-		destroy_hrtimer_on_stack(&wd.timer);
-		free_cpumask_var(wd.rescue_mask);
-	}
+	/* Post-migration diagnostics */
+	{
+		int landed_cpu   = smp_processor_id();
+		bool migrated    = (landed_cpu == target_cpu);
+		struct rq *dst_rq = cpu_rq(target_cpu);
+		u64  now         = sched_clock();
+		u64  heartbeat_age = (dst_rq->clock_preempt <= now)
+				     ? now - dst_rq->clock_preempt : 0;
+		unsigned long dst_cap = dst_rq->cpu_capacity;
 
-	trace_printk("ivh_post_sched: pid=%d comm=%s landed_cpu=%d dst_was=%d\n",
-		     current->pid, current->comm, smp_processor_id(), target_cpu);
+		if (wait_elapsed_ns > 1000000ULL) /* >1ms: treat as the slow/stuck case */
+			atomic_inc(&ivh_timeout_count);
+
+		trace_printk(
+			"ivh_bare_sched: comm=%s src=%d dst=%d landed=%d "
+			"wait_elapsed_us=%llu dst_cap=%lu dst_heartbeat_age_us=%llu "
+			"actually_migrated=%s\n",
+			current->comm, src_cpu, target_cpu, landed_cpu,
+			wait_elapsed_ns / 1000,
+			dst_cap, heartbeat_age / 1000,
+			migrated ? "yes" : "no_landed_elsewhere");
+	}
 
 	set_cpus_allowed_ptr(current, saved_mask);
 	free_cpumask_var(saved_mask);
@@ -13214,10 +13395,24 @@ EXPORT_SYMBOL_GPL(bpf_sched_pre_lock_migrate);
 /* /proc/ivh_debug — snapshot all IVH counters for hang diagnosis */
 static int ivh_debug_show(struct seq_file *m, void *v)
 {
+	u64 prelock_calls = 0, prelock_skipped = 0;
+	int cpu;
+
+	for_each_possible_cpu(cpu) {
+		prelock_calls += per_cpu(ivh_prelock_calls, cpu);
+		prelock_skipped += per_cpu(ivh_prelock_cooldown_skipped, cpu);
+	}
+
 	seq_printf(m, "ivh_in_schedule:    %d\n", atomic_read(&ivh_in_schedule));
 	seq_printf(m, "ivh_trylock_misses: %d\n", atomic_read(&ivh_trylock_misses));
 	seq_printf(m, "ivh_migrations_done:%d\n", atomic_read(&ivh_migrations_done));
 	seq_printf(m, "ivh_timeout_count:  %d\n", atomic_read(&ivh_timeout_count));
+	seq_printf(m, "ivh_prelock_calls:  %llu\n", prelock_calls);
+	seq_printf(m, "ivh_prelock_cooldown_skipped: %llu\n", prelock_skipped);
+	seq_printf(m, "ivh_prelock_evaluated:        %llu\n", prelock_calls - prelock_skipped);
+	if (prelock_calls)
+		seq_printf(m, "ivh_prelock_skip_pct:         %llu%%\n",
+			   prelock_skipped * 100 / prelock_calls);
 	seq_printf(m, "\n");
 	seq_printf(m, "# If in_schedule > 0 during a hang:\n");
 	seq_printf(m, "#   threads are stuck in schedule() waiting for vCPU on target\n");

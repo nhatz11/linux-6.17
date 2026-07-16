@@ -46,6 +46,28 @@ extern unsigned long ivh_migration_timeout_ns;
 /* Concurrency cap: max threads allowed in schedule() during IVH migration. */
 extern unsigned long ivh_max_concurrent;
 
+/* schedule_timeout_interruptible duration for IVH migration (ms).
+ * How long to wait for the target vCPU before giving up and restoring affinity.
+ *   echo 5 > /proc/sys/kernel/ivh_sched_timeout_ms
+ */
+extern unsigned long ivh_sched_timeout_ms;
+
+/*
+ * Per-vCPU evaluation cooldown (ns); defined in bpf_sched.c.
+ * Minimum spacing between full IVH pre-lock evaluations on the same vCPU,
+ * regardless of which thread/lock triggers ivh_pre_lock(). Set 0 to disable.
+ *   echo 50000 > /proc/sys/kernel/ivh_eval_cooldown_ns
+ */
+extern unsigned long ivh_eval_cooldown_ns;
+
+/*
+ * ivh_eval_cooldown_ok - per-vCPU rate limiter on full IVH pre-lock
+ * evaluation.  Returns true (and stamps the cooldown) if this vCPU is due
+ * for another full evaluation; false if one happened too recently.
+ * Implemented in kernel/sched/fair.c.
+ */
+bool ivh_eval_cooldown_ok(void);
+
 DECLARE_STATIC_KEY_FALSE(bpf_sched_enabled_key);
 
 static inline bool bpf_sched_enabled(void)
