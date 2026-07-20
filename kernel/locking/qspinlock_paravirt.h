@@ -266,7 +266,27 @@ pv_wait_early(struct pv_node *prev, int loop)
 	if ((loop & PV_PREV_CHECK_MASK) != 0)
 		return false;
 
-	return READ_ONCE(prev->state) != VCPU_RUNNING;
+	if (READ_ONCE(prev->state) != VCPU_RUNNING)
+		return true;
+
+	/*
+	 * IVH (default OFF, sysctl ivh_pv_wait_mechanism): bail out of the hot
+	 * MCS spin early — into ivh_pv_wait()'s non-halting backoff — when the
+	 * predecessor's vCPU is currently preempted by the host, in addition
+	 * to the stock check above.  vcpu_is_preempted(prev->cpu) reads the
+	 * live KVM steal bit, and for an MCS queue node prev->cpu is exactly
+	 * "the thing we are waiting on", so this is the in-kernel analogue of
+	 * NHextend3's validated steal-flag check: stop burning a hot pCPU
+	 * spinning for a descheduled predecessor and back off politely
+	 * (TPAUSE) instead.  Correctness is unaffected either way — the
+	 * caller's for(;;) loop re-checks node->locked regardless; this only
+	 * changes *when* we transition from hot-spin to backoff.  Gated so
+	 * that sysctl==0 reproduces the exact upstream pv_wait_early() check.
+	 */
+	if (!READ_ONCE(ivh_pv_wait_mechanism))
+		return false;
+
+	return vcpu_is_preempted(prev->cpu);
 }
 
 /*

@@ -87,6 +87,10 @@ EXPORT_SYMBOL_GPL(ivh_migrations_done);
 static DEFINE_PER_CPU(u64, ivh_prelock_calls);
 static DEFINE_PER_CPU(u64, ivh_prelock_cooldown_skipped);
 
+/* Per-CPU rejection counters for ivh_steal_imminent()'s two gates, below. */
+static DEFINE_PER_CPU(u64, ivh_steal_imminent_capacity_reject);
+static DEFINE_PER_CPU(u64, ivh_steal_imminent_time_left_reject);
+
 /*
  * ivh_wait diagnostic registry — EXPERIMENT ONLY (bare-schedule() hang
  * investigation, 2026-06-30).  Records every in-flight self-migration
@@ -13199,6 +13203,56 @@ bool ivh_eval_cooldown_ok(void)
 }
 EXPORT_SYMBOL_GPL(ivh_eval_cooldown_ok);
 
+/*
+ * ivh_steal_imminent - Gate 1+2, "is this vCPU in the IVH danger zone".
+ *
+ * Runtime-switchable between two "time left" formulas via
+ * ivh_time_left_source (kernel/sched/bpf_sched.c):
+ *   0 (default) = this commit's original rq->ewma_act_ns formula, verbatim.
+ *   1           = a later tree's rq->last_active_time formula.
+ */
+static __always_inline bool ivh_steal_imminent(struct rq *rq)
+{
+	u64 now;
+
+	if (rq->cpu_capacity > ivh_capacity_threshold) {
+		this_cpu_inc(ivh_steal_imminent_capacity_reject);
+		return false;
+	}
+
+	now = sched_clock();
+
+	if (!READ_ONCE(ivh_time_left_source)) {
+		/* Original formula, verbatim. */
+		u64 ewma = rq->ewma_act_ns;
+
+		if (ewma != 0) {
+			u64 act_sofar = now - rq->last_preemption;
+
+			if (ewma > act_sofar &&
+			    (ewma - act_sofar) >= ivh_time_left_threshold_ns) {
+				this_cpu_inc(ivh_steal_imminent_time_left_reject);
+				return false;
+			}
+		}
+		return true;
+	}
+
+	{
+		/* Later tree's formula. */
+		u64 elapsed_since_active = now - max(rq->last_preemption, (u64)rq->last_idle_tp);
+		s64 time_left = (s64)rq->last_active_time - (s64)elapsed_since_active
+				 - (s64)current->last_cs_ns;
+
+		if (rq->last_active_time != 0 && time_left > (s64)ivh_time_left_threshold_ns) {
+			this_cpu_inc(ivh_steal_imminent_time_left_reject);
+			return false;
+		}
+
+		return true;
+	}
+}
+
 /**
  * bpf_sched_pre_lock_migrate - synchronous self-migration before spinlock acquire.
  *
@@ -13216,7 +13270,6 @@ EXPORT_SYMBOL_GPL(ivh_eval_cooldown_ok);
 void bpf_sched_pre_lock_migrate(void)
 {
 	struct rq *rq;
-	u64 ewma, act_sofar;
 	int target_cpu;
 	int src_cpu;
 	cpumask_var_t saved_mask;
@@ -13233,18 +13286,9 @@ void bpf_sched_pre_lock_migrate(void)
 	rq = this_rq();
 	src_cpu = rq->cpu;
 
-	/* Gate 1: vCPU not throttled */
-	if (rq->cpu_capacity > ivh_capacity_threshold)
+	/* Gate 1+2: vCPU not throttled, enough burst time remains. */
+	if (!ivh_steal_imminent(rq))
 		return;
-
-	/* Gate 2: enough burst time remains — migration not urgent */
-	ewma = rq->ewma_act_ns;
-	if (ewma != 0) {
-		act_sofar = sched_clock() - rq->last_preemption;
-		if (ewma > act_sofar &&
-		    (ewma - act_sofar) >= ivh_time_left_threshold_ns)
-			return;
-	}
 
 	/* Gate 3: task must be movable (more than one allowed CPU) */
 	if (cpumask_weight(current->cpus_ptr) <= 1)
@@ -13267,11 +13311,22 @@ void bpf_sched_pre_lock_migrate(void)
 	current->lock_depth++;
 
 	/*
-	 * Select target CPU via BPF hook.  Use trylock: if another thread is
-	 * already selecting, skip migration for this CS rather than spinning
-	 * with IRQs disabled.  The caller will retry on the next lock attempt.
+	 * Select target CPU via BPF hook. ivh_selection_trylock
+	 * (include/linux/bpf_sched.h) switches between:
+	 *   0 = blocking raw_spin_lock_irqsave().
+	 *   1 = trylock-and-skip: if another thread is already selecting,
+	 *       skip migration for this CS rather than spinning with IRQs
+	 *       disabled. The caller retries on its next lock attempt.
 	 */
-	raw_spin_lock_irqsave(&my_spinlock, flags);
+	if (READ_ONCE(ivh_selection_trylock)) {
+		if (!raw_spin_trylock_irqsave(&my_spinlock, flags)) {
+			atomic_inc(&ivh_trylock_misses);
+			current->lock_depth--;
+			return;
+		}
+	} else {
+		raw_spin_lock_irqsave(&my_spinlock, flags);
+	}
 	target_cpu = bpf_sched_cfs_select_run_cpu_spin(
 			rq, current, sched_clock(),
 			average_capacity_all, num_online_cpus());
@@ -13291,11 +13346,57 @@ void bpf_sched_pre_lock_migrate(void)
 	}
 
 	/*
-	 * Synchronous self-migration: temporarily restrict cpus_mask to
-	 * {target_cpu} and call schedule().  The scheduler sees that current
-	 * is no longer allowed on this CPU and migrates it.  When schedule()
-	 * returns we are running on target_cpu.  Restore original mask so the
-	 * task's permanent affinity is unchanged.
+	 * ivh_migrate_mechanism == 1: dispatch via migrate_task_to()
+	 * (stop_one_cpu() + migration_cpu_stop(), CONFIG_NUMA_BALANCING) instead
+	 * of the mechanism-0 path below. No cpus_mask override, so nothing to
+	 * save/restore -- migrate_task_to() requires target_cpu to already be in
+	 * current's cpus_mask and simply declines (mt_ret != 0) rather than
+	 * forcing it otherwise, unlike mechanism 0's temporary override. See the
+	 * full tradeoff comment on ivh_migrate_mechanism in bpf_sched.c.
+	 */
+	if (READ_ONCE(ivh_migrate_mechanism)) {
+		u64 wait_start_ns, wait_elapsed_ns;
+		int wait_slot, mt_ret;
+
+		/* Same target-health check as the mechanism-0 path below. */
+		if (is_cpu_preempted(target_cpu)) {
+			atomic_fetch_andnot(PRMPT_HELD_MASK, prmpt_flags(target_cpu));
+			current->lock_depth--;
+			return;
+		}
+
+		atomic_inc(&ivh_in_schedule);
+
+		wait_start_ns = sched_clock();
+		wait_slot = ivh_wait_register(current, src_cpu, target_cpu, 3);
+		mt_ret = migrate_task_to(current, target_cpu);
+		ivh_wait_unregister(wait_slot);
+		wait_elapsed_ns = sched_clock() - wait_start_ns;
+
+		atomic_dec(&ivh_in_schedule);
+
+		if (wait_elapsed_ns > 1000000ULL) /* >1ms: treat as the slow/stuck case */
+			atomic_inc(&ivh_timeout_count);
+
+		trace_printk(
+			"ivh_stop_one_cpu: comm=%s src=%d dst=%d landed=%d "
+			"wait_elapsed_us=%llu ret=%d\n",
+			current->comm, src_cpu, target_cpu, smp_processor_id(),
+			wait_elapsed_ns / 1000, mt_ret);
+
+		if (mt_ret == 0)
+			atomic_inc(&ivh_migrations_done);
+		atomic_fetch_andnot(PRMPT_HELD_MASK, prmpt_flags(target_cpu));
+		current->lock_depth--;
+		return;
+	}
+
+	/*
+	 * Synchronous self-migration (mechanism 0, default): temporarily
+	 * restrict cpus_mask to {target_cpu} and call schedule().  The
+	 * scheduler sees that current is no longer allowed on this CPU and
+	 * migrates it.  When schedule() returns we are running on target_cpu.
+	 * Restore original mask so the task's permanent affinity is unchanged.
 	 *
 	 * Use cpumask_var_t (heap via GFP_KERNEL) to avoid a 1024-byte
 	 * stack frame on NR_CPUS=8192/CPUMASK_OFFSTACK=y builds.
@@ -13392,15 +13493,38 @@ void bpf_sched_pre_lock_migrate(void)
 }
 EXPORT_SYMBOL_GPL(bpf_sched_pre_lock_migrate);
 
+#if defined(CONFIG_KVM_GUEST) && defined(CONFIG_PARAVIRT_SPINLOCKS)
+/* Live count of ivh_pv_wait() invocations, defined in arch/x86/kernel/kvm.c.
+ * Nonzero == the IVH non-halting PV spinlock wait path is actually running
+ * (i.e. real MCS queueing was restored and contended waiters reached it). */
+DECLARE_PER_CPU(u64, ivh_pv_wait_calls);
+#endif
+
 /* /proc/ivh_debug — snapshot all IVH counters for hang diagnosis */
 static int ivh_debug_show(struct seq_file *m, void *v)
 {
 	u64 prelock_calls = 0, prelock_skipped = 0;
+	u64 capacity_reject = 0, time_left_reject = 0;
+	u64 coldthread_skipped = 0, hotthread_passed = 0;
+	u64 mutex_spin_observed = 0, mutex_spin_owner_preempted = 0;
+	u64 pv_wait_calls = 0;
+	u64 obs_total_holds = 0, obs_stolen_holds = 0;
 	int cpu;
 
 	for_each_possible_cpu(cpu) {
+#if defined(CONFIG_KVM_GUEST) && defined(CONFIG_PARAVIRT_SPINLOCKS)
+		pv_wait_calls += per_cpu(ivh_pv_wait_calls, cpu);
+#endif
 		prelock_calls += per_cpu(ivh_prelock_calls, cpu);
 		prelock_skipped += per_cpu(ivh_prelock_cooldown_skipped, cpu);
+		capacity_reject += per_cpu(ivh_steal_imminent_capacity_reject, cpu);
+		time_left_reject += per_cpu(ivh_steal_imminent_time_left_reject, cpu);
+		coldthread_skipped += per_cpu(ivh_prelock_coldthread_skipped, cpu);
+		hotthread_passed += per_cpu(ivh_prelock_hotthread_passed, cpu);
+		mutex_spin_observed += per_cpu(ivh_mutex_spin_observed, cpu);
+		mutex_spin_owner_preempted += per_cpu(ivh_mutex_spin_owner_preempted, cpu);
+		obs_total_holds += per_cpu(ivh_obs_total_holds, cpu);
+		obs_stolen_holds += per_cpu(ivh_obs_stolen_holds, cpu);
 	}
 
 	seq_printf(m, "ivh_in_schedule:    %d\n", atomic_read(&ivh_in_schedule));
@@ -13413,6 +13537,33 @@ static int ivh_debug_show(struct seq_file *m, void *v)
 	if (prelock_calls)
 		seq_printf(m, "ivh_prelock_skip_pct:         %llu%%\n",
 			   prelock_skipped * 100 / prelock_calls);
+	seq_printf(m, "\n");
+	seq_printf(m, "ivh_time_left_source:   %lu\n", READ_ONCE(ivh_time_left_source));
+	seq_printf(m, "ivh_selection_trylock:  %lu\n", READ_ONCE(ivh_selection_trylock));
+	seq_printf(m, "ivh_migrate_mechanism:  %lu\n", READ_ONCE(ivh_migrate_mechanism));
+	seq_printf(m, "\n");
+	seq_printf(m, "ivh_hot_threads_enabled:       %lu\n", READ_ONCE(ivh_hot_threads_enabled));
+	seq_printf(m, "ivh_hot_preempt_gate_enabled:  %lu\n", READ_ONCE(ivh_hot_preempt_gate_enabled));
+	seq_printf(m, "ivh_hot_wait_threshold:        %lu\n", READ_ONCE(ivh_hot_wait_threshold));
+	seq_printf(m, "ivh_hot_preempt_threshold:     %lu\n", READ_ONCE(ivh_hot_preempt_threshold));
+	seq_printf(m, "ivh_hot_threads_ewma_k:        %lu\n", READ_ONCE(ivh_hot_threads_ewma_k));
+	seq_printf(m, "ivh_hot_wait_zero_n:           %lu\n", READ_ONCE(ivh_hot_wait_zero_n));
+	seq_printf(m, "ivh_hot_preempt_ewma_k_rise:   %lu\n", READ_ONCE(ivh_hot_preempt_ewma_k_rise));
+	seq_printf(m, "ivh_hot_preempt_ewma_k_fall:   %lu\n", READ_ONCE(ivh_hot_preempt_ewma_k_fall));
+	seq_printf(m, "ivh_prelock_coldthread_skipped: %llu\n", coldthread_skipped);
+	seq_printf(m, "ivh_prelock_hotthread_passed:   %llu\n", hotthread_passed);
+	seq_printf(m, "ivh_mutex_spin_observed:          %llu\n", mutex_spin_observed);
+	seq_printf(m, "ivh_mutex_spin_owner_preempted:   %llu\n", mutex_spin_owner_preempted);
+	seq_printf(m, "ivh_pv_wait_calls:                %llu\n", pv_wait_calls);
+	seq_printf(m, "ivh_steal_imminent_capacity_reject:  %llu\n", capacity_reject);
+	seq_printf(m, "ivh_steal_imminent_time_left_reject: %llu\n", time_left_reject);
+	seq_printf(m, "\n");
+	seq_printf(m, "ivh_obs_total_holds:  %llu\n", obs_total_holds);
+	seq_printf(m, "ivh_obs_stolen_holds: %llu\n", obs_stolen_holds);
+	if (obs_total_holds)
+		seq_printf(m, "ivh_obs_stolen_pct:   %llu.%04llu%%\n",
+			   obs_stolen_holds * 100 / obs_total_holds,
+			   (obs_stolen_holds * 1000000 / obs_total_holds) % 10000);
 	seq_printf(m, "\n");
 	seq_printf(m, "# If in_schedule > 0 during a hang:\n");
 	seq_printf(m, "#   threads are stuck in schedule() waiting for vCPU on target\n");

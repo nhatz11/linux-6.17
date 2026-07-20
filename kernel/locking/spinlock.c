@@ -36,6 +36,133 @@
  * sched_clock() is used instead of ktime_get_ns() because spinlocks fire
  * before timekeeping is initialized; sched_clock() is safe in any context.
  */
+
+/*
+ * ---------------------------------------------------------------------
+ * Hot Threads: per-task contention/preemption classifier (see
+ * linux/bpf_sched.h). Replaces the earlier per-lock "Hotlock" design.
+ *
+ * Two independent, event-driven EWMAs live directly on task_struct
+ * (ivh_wait_decay, ivh_preempt_decay — see include/linux/sched.h) rather
+ * than in a shared hashed table: each task is the sole writer of its own
+ * counters, so plain READ_ONCE/WRITE_ONCE replaces the atomic CAS-retry
+ * loop the per-lock table needed. A thread is classified "hot" (worth an
+ * IVH migration) only if it BOTH contends real locks (ivh_wait_decay) AND
+ * has actually been caught by host steal mid-critical-section
+ * (ivh_preempt_decay) — an AND gate. Either signal alone is a false
+ * positive: busy-but-never-stolen wastes a migration on a thread nobody
+ * strands, and stolen-but-uncontended (a solo lock holder) strands nobody
+ * regardless of its own preemption. Validated in userspace against a real
+ * pinning experiment (hotthreads_test.c) before being ported here.
+ * ---------------------------------------------------------------------
+ */
+
+/* Pre-lock gate counters, surfaced via /proc/ivh_debug (fair.c). */
+DEFINE_PER_CPU(u64, ivh_prelock_coldthread_skipped);
+DEFINE_PER_CPU(u64, ivh_prelock_hotthread_passed);
+EXPORT_PER_CPU_SYMBOL_GPL(ivh_prelock_coldthread_skipped);
+EXPORT_PER_CPU_SYMBOL_GPL(ivh_prelock_hotthread_passed);
+
+/*
+ * Observe-only stats (ivh_observe, see cs_exit() below and PR_SET_IVH_ELIGIBLE
+ * in kernel/sys.c). Fed regardless of migration eligibility -- lets ivh_exec
+ * -v measure a process's real host-preemption exposure whether or not IVH is
+ * actually protecting it (-v -n). Surfaced via /proc/ivh_debug (fair.c).
+ */
+DEFINE_PER_CPU(u64, ivh_obs_total_holds);
+DEFINE_PER_CPU(u64, ivh_obs_stolen_holds);
+EXPORT_PER_CPU_SYMBOL_GPL(ivh_obs_total_holds);
+EXPORT_PER_CPU_SYMBOL_GPL(ivh_obs_stolen_holds);
+
+/*
+ * ivh_hot_note_wait_event - per-task contended-wait EWMA feed, called from
+ * kernel/locking/qspinlock.c's slowpath enter points (pending-bit spin,
+ * MCS queue). Not static/inline: called across a file boundary. Single
+ * writer (current), so a plain compute-and-store replaces the per-lock
+ * table's atomic CAS loop.
+ */
+void ivh_hot_note_wait_event(void)
+{
+	unsigned int k = (unsigned int)READ_ONCE(ivh_hot_threads_ewma_k);
+	int old = READ_ONCE(current->ivh_wait_decay);
+	int sample = 1 << IVH_HOTLOCK_SCALE;	/* contended wait = 1.0 */
+
+	if (k > 15)
+		k = 15;
+	WRITE_ONCE(current->ivh_wait_decay, (u16)(old + ((sample - old) >> k)));
+}
+EXPORT_SYMBOL_GPL(ivh_hot_note_wait_event);
+
+/*
+ * ivh_hot_preempt_update - per-task preempt-during-CS EWMA feed, called
+ * from cs_exit() below for every outermost eligible CS.
+ *
+ * Asymmetric cooldown: a real catch (stolen==true) uses a FAST shift
+ * (ivh_hot_preempt_ewma_k_rise, default 3 -- one catch still spikes the
+ * EWMA to SCALE*2^-3=128, comfortably above the 40 threshold, so real
+ * exposure keeps registering immediately). A clean release (stolen==false)
+ * uses a separate, SLOWER shift (ivh_hot_preempt_ewma_k_fall, default 8).
+ * This is deliberately NOT the same constant in both directions -- a
+ * symmetric EWMA (one shared k) was measured to cause a severe live
+ * regression (2.1% -> 15-17% host-preempted-CS): successful IVH protection
+ * suppresses the very catch evidence preempt_decay needs to stay above
+ * threshold, so it decays back down, protection lapses, a real catch
+ * happens, it spikes back up, and the cycle repeats. Decoupling rise from
+ * fall raises the protected-state equilibrium (E_prot = SCALE / (1 +
+ * ((1-p)/p) * 2^-(k_fall-k_rise)), p = the thread's true catch rate) high
+ * enough to clear the threshold while still genuinely tracking p -- unlike
+ * a permanent latch, a thread whose real behavior later goes cold still
+ * lapses back out, just on a slower, self-adjusting timescale (~2^k_fall
+ * holds) instead of every single release. Validated in userspace
+ * (hotthreads_cooldown_test.c): k_rise=3/k_fall=8 restored host-preempted-CS
+ * to the no-gate baseline while lapsing within ~700 holds once a thread
+ * genuinely stopped being caught, versus a permanent latch which never
+ * lapsed at all.
+ */
+static __always_inline void ivh_hot_preempt_update(bool stolen)
+{
+	unsigned int k = stolen ? (unsigned int)READ_ONCE(ivh_hot_preempt_ewma_k_rise)
+				 : (unsigned int)READ_ONCE(ivh_hot_preempt_ewma_k_fall);
+	int old = READ_ONCE(current->ivh_preempt_decay);
+	int sample = stolen ? (1 << IVH_HOTLOCK_SCALE) : 0;
+
+	if (k > 15)
+		k = 15;
+	WRITE_ONCE(current->ivh_preempt_decay, (u16)(old + ((sample - old) >> k)));
+}
+
+/*
+ * ivh_hot_wait_decay_sample_zero - occasional (1-in-N release events)
+ * 0-sample for wait_decay, so it reflects RECENT contention rather than
+ * lifetime contention. wait_decay's SCALE-samples come only from actual
+ * contended-wait events (qspinlock.c); without an occasional 0-feed it can
+ * only ever climb, so a thread that contended briefly (e.g. a daemon's
+ * startup) and has since been idle stays permanently above threshold.
+ * Piggybacks on cs_exit()'s existing ivh_universal_eligible-gated block
+ * (which already runs for every outermost release of an eligible task)
+ * rather than adding a new touch point on the uncontended fastpath -- same
+ * 1-in-N coarsening trick the old per-lock Hotlock table used for its own
+ * non-contended sample path.
+ */
+static __always_inline void ivh_hot_wait_decay_sample_zero(void)
+{
+	unsigned int n = (unsigned int)READ_ONCE(ivh_hot_wait_zero_n);
+	unsigned int k;
+	int old;
+
+	if (n == 0)
+		n = 1;
+	if (++current->ivh_wait_zero_ctr < n)
+		return;
+	current->ivh_wait_zero_ctr = 0;
+
+	k = (unsigned int)READ_ONCE(ivh_hot_threads_ewma_k);
+	if (k > 15)
+		k = 15;
+	old = READ_ONCE(current->ivh_wait_decay);
+	WRITE_ONCE(current->ivh_wait_decay, (u16)(old - (old >> k)));
+}
+
 /*
  * ivh_pre_lock — IVH gate + synchronous self-migration, called BEFORE
  * __raw_spin_lock*() so that no MCS node has been allocated yet and
@@ -43,11 +170,16 @@
  * Must not be called from trylock paths (they don't block) or when already
  * holding a spinlock (lock_depth > 0 means preemption is already off).
  */
-static __always_inline void ivh_pre_lock(void)
+static __always_inline void ivh_pre_lock(raw_spinlock_t *lock)
 {
 	if (!bpf_sched_enabled())
 		return;
-	if (!(current->flags & PF_IVH_ELIGIBLE))
+	/* 2026-07-20: PF_IVH_ELIGIBLE no longer consulted here --
+	 * ivh_universal_eligible is the sole gate now, not an ivh_exec-wrapper
+	 * opt-in. if (!(current->flags & PF_IVH_ELIGIBLE) && ...)
+	 * ivh_exclude (per-task opt-out, since the global switch alone can't
+	 * exclude one process) added same day. */
+	if (!READ_ONCE(ivh_universal_eligible) || current->ivh_exclude)
 		return;
 	if (!in_task() || !preemptible() || current->lock_depth > 0)
 		return;
@@ -66,6 +198,69 @@ static __always_inline void ivh_pre_lock(void)
 	if (READ_ONCE(current->__state) != TASK_RUNNING)
 		return;
 	/*
+	 * Hot Threads selectivity gate, default OFF (ivh_hot_threads_enabled).
+	 * A thread is worth evaluating for IVH migration if it contends real
+	 * locks (ivh_wait_decay) -- "would my LHP strand anyone." That's the
+	 * only condition checked by default: ivh_preempt_decay (was my thread
+	 * actually caught by real host steal mid-hold) is deliberately NOT
+	 * consulted unless ivh_hot_preempt_gate_enabled is set, because it's
+	 * fed from real KERNEL raw-spinlock holds (cs_enter/cs_exit), which
+	 * are sub-microsecond -- host steal arrives in ~5-6ms chunks, so it
+	 * essentially never lands inside one of these holds by chance. Live
+	 * measurement: ivh_preempt_decay read exactly 0 for 90%+ of eligible
+	 * evaluations, causing a severe regression (2% -> 12%+ host-preempted)
+	 * when it gated migrations, confirmed unfixable by threshold tuning.
+	 * "Is my vCPU actually in danger right now" doesn't need re-answering
+	 * here anyway: bpf_sched_pre_lock_migrate() below already runs its own
+	 * real-time Gate 1+2 (ivh_steal_imminent(), fresh per-CPU cpu_capacity
+	 * + time-left) before committing to a migration -- a contended-but-
+	 * currently-safe thread costs a declined evaluation there, not a
+	 * wasted migration. Validated in userspace closed-loop simulation
+	 * (hotthreads_twostage_test.c): wait-only + downstream Gate 1+2
+	 * restores host-preempted-CS to the no-gate baseline across a full
+	 * Gate-1+2-quality sensitivity sweep, while ivh_preempt_decay's own
+	 * false-positive exclusions (a single-owner, never-contended lock)
+	 * are already covered by ivh_wait_decay alone -- it never generates a
+	 * contended-wait event, so it's excluded regardless of preempt_decay.
+	 * Checked BEFORE the per-vCPU cooldown so a cold thread never consumes
+	 * this vCPU's cooldown window ahead of a genuinely hot one.
+	 */
+	if (READ_ONCE(ivh_hot_threads_enabled)) {
+		bool wait_hot;
+
+		/*
+		 * Wait-side hot test, with an optional sticky one-way latch
+		 * (ivh_hot_wait_latch_enabled, default OFF -- when off this is
+		 * bit-for-bit the original `wait_decay > threshold` test). The
+		 * latch fixes the live-measured failure mode where a sustained
+		 * lock-holder's wait_decay sits at/below the fixed threshold
+		 * (its distribution mode is BELOW 512=HALF) and the 1-in-N
+		 * 0-sample keeps dragging it back down, so a static threshold
+		 * rejects most of a genuinely hot thread's acquisitions. Once a
+		 * task has EVER crossed the threshold it stays hot for life; a
+		 * task that never contends (wait_decay == 0) never arms, so
+		 * idle/cold exclusion is unchanged.
+		 */
+		if (READ_ONCE(ivh_hot_wait_latch_enabled) &&
+		    READ_ONCE(current->ivh_wait_latched)) {
+			wait_hot = true;
+		} else if (READ_ONCE(current->ivh_wait_decay) > ivh_hot_wait_threshold) {
+			wait_hot = true;
+			if (READ_ONCE(ivh_hot_wait_latch_enabled))
+				WRITE_ONCE(current->ivh_wait_latched, 1);
+		} else {
+			wait_hot = false;
+		}
+
+		if (!wait_hot ||
+		    (READ_ONCE(ivh_hot_preempt_gate_enabled) &&
+		     READ_ONCE(current->ivh_preempt_decay) <= ivh_hot_preempt_threshold)) {
+			this_cpu_inc(ivh_prelock_coldthread_skipped);
+			return;
+		}
+		this_cpu_inc(ivh_prelock_hotthread_passed);
+	}
+	/*
 	 * Per-vCPU evaluation cooldown — see ivh_eval_cooldown_ok() in fair.c.
 	 * Cuts redundant full evaluations under high lock-call-volume
 	 * workloads (hackbench) without discriminating by which lock or how
@@ -82,6 +277,15 @@ static __always_inline void cs_enter(void)
 	if (current->lock_depth == 1) {
 		current->cs_start_ts = sched_clock();
 		current->cs_wall_start_ts = current->cs_start_ts;
+		/* 2026-07-20: PF_IVH_ELIGIBLE no longer consulted here --
+		 * ivh_universal_eligible is the sole eligibility gate now, not
+		 * an ivh_exec-wrapper opt-in (ivh_observe is separate, for the
+		 * -v stats tool, and stays, unaffected by ivh_exclude -- an
+		 * excluded task can still be observed).
+		 * if (current->flags & PF_IVH_ELIGIBLE) || */
+		if ((READ_ONCE(ivh_universal_eligible) && !current->ivh_exclude) ||
+		    current->ivh_observe)
+			current->cs_steal_start = ivh_this_cpu_steal_ns();
 	}
 }
 
@@ -93,6 +297,46 @@ static __always_inline void cs_exit(void)
 		current->cumulative_cs_time += now - current->cs_start_ts;
 		current->cs_start_ts = 0;
 		current->cs_wall_start_ts = 0;
+		/*
+		 * Hot Threads: preempt_decay feed. Between the outermost
+		 * cs_enter() and this cs_exit() a raw spinlock is held, so
+		 * preemption is disabled and this task cannot migrate vCPUs —
+		 * cs_steal_start and this read are guaranteed same-vCPU. The
+		 * only thing that can advance the counter in that window is
+		 * exactly the host steal we want to detect.
+		 */
+		/* 2026-07-20: PF_IVH_ELIGIBLE no longer consulted in either
+		 * condition below -- ivh_universal_eligible is the sole
+		 * eligibility gate now, not an ivh_exec-wrapper opt-in
+		 * (ivh_observe is separate, for the -v stats tool, and stays,
+		 * unaffected by ivh_exclude -- an excluded task can still be
+		 * observed). if ((current->flags & PF_IVH_ELIGIBLE) || ...) */
+		if ((READ_ONCE(ivh_universal_eligible) && !current->ivh_exclude) ||
+		    current->ivh_observe) {
+			u64 steal_now = ivh_this_cpu_steal_ns();
+			bool stolen = steal_now - current->cs_steal_start
+					> IVH_HOT_STEAL_FLOOR_NS;
+
+			if (READ_ONCE(ivh_universal_eligible) && !current->ivh_exclude) {
+				ivh_hot_preempt_update(stolen);
+				ivh_hot_wait_decay_sample_zero();
+			}
+			/*
+			 * Observe-only stats (ivh_exec -v): independent of the
+			 * EWMA feed above, and independent of eligibility --
+			 * this task may not be migration-eligible at all
+			 * (ivh_exec -v -n). Global per-CPU counters, one
+			 * observation domain at a time by design: fine for a
+			 * benchmark wrapper measuring one workload in
+			 * isolation, not meant to be combined with unrelated
+			 * concurrent IVH-eligible traffic.
+			 */
+			if (current->ivh_observe) {
+				this_cpu_inc(ivh_obs_total_holds);
+				if (stolen)
+					this_cpu_inc(ivh_obs_stolen_holds);
+			}
+		}
 	}
 }
 
@@ -236,7 +480,7 @@ EXPORT_SYMBOL(_raw_spin_trylock_bh);
 #ifndef CONFIG_INLINE_SPIN_LOCK
 noinline void __lockfunc _raw_spin_lock(raw_spinlock_t *lock)
 {
-	ivh_pre_lock();
+	ivh_pre_lock(lock);
 	__raw_spin_lock(lock);
 	if (!in_interrupt()) {
 		current->lock_depth++;
@@ -251,7 +495,7 @@ noinline unsigned long __lockfunc _raw_spin_lock_irqsave(raw_spinlock_t *lock)
 {
 	unsigned long flags;
 
-	ivh_pre_lock();
+	ivh_pre_lock(lock);
 	flags = __raw_spin_lock_irqsave(lock);
 	if (!in_interrupt()) {
 		current->lock_depth++;
@@ -265,7 +509,7 @@ EXPORT_SYMBOL(_raw_spin_lock_irqsave);
 #ifndef CONFIG_INLINE_SPIN_LOCK_IRQ
 noinline void __lockfunc _raw_spin_lock_irq(raw_spinlock_t *lock)
 {
-	ivh_pre_lock();
+	ivh_pre_lock(lock);
 	__raw_spin_lock_irq(lock);
 	if (!in_interrupt()) {
 		current->lock_depth++;
@@ -279,7 +523,7 @@ EXPORT_SYMBOL(_raw_spin_lock_irq);
 noinline void __lockfunc _raw_spin_lock_bh(raw_spinlock_t *lock)
 {
 	bool track = !in_interrupt();
-	ivh_pre_lock();
+	ivh_pre_lock(lock);
 	__raw_spin_lock_bh(lock);
 	if (track) {
 		current->lock_depth++;

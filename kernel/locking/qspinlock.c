@@ -24,6 +24,7 @@
 #include <asm/byteorder.h>
 #include <asm/qspinlock.h>
 #include <trace/events/lock.h>
+#include <linux/bpf_sched.h>
 
 /*
  * Include queued spinlock definitions and statistics code
@@ -196,8 +197,16 @@ void __lockfunc queued_spin_lock_slowpath(struct qspinlock *lock, u32 val)
 	 */
 	if (val & _Q_LOCKED_MASK) {
 		/* pending-bit holder spinning for owner to release */
-		if (!in_interrupt())
+		if (!in_interrupt()) {
 			current->wait_depth++;
+			/* Hot Threads: per-task contended-wait event (pending spin). */
+			/* 2026-07-20: PF_IVH_ELIGIBLE no longer consulted here --
+			 * ivh_universal_eligible is the sole gate now, not an
+			 * ivh_exec-wrapper opt-in; ivh_exclude added same day for
+			 * per-task opt-out. if (current->flags & PF_IVH_ELIGIBLE) */
+			if (READ_ONCE(ivh_universal_eligible) && !current->ivh_exclude)
+				ivh_hot_note_wait_event();
+		}
 		smp_cond_load_acquire(&lock->locked, !VAL);
 		/* owner released; we acquire below — spinning done */
 		if (!in_interrupt())
@@ -227,8 +236,16 @@ pv_queue:
 	 * Either way this is the MCS queue slowpath entry; mark as waiting.
 	 * Balanced by decrement at release:.
 	 */
-	if (!in_interrupt())
+	if (!in_interrupt()) {
 		current->wait_depth++;
+		/* Hot Threads: per-task contended-wait event (MCS queue). */
+		/* 2026-07-20: PF_IVH_ELIGIBLE no longer consulted here --
+		 * ivh_universal_eligible is the sole gate now, not an
+		 * ivh_exec-wrapper opt-in; ivh_exclude added same day for
+		 * per-task opt-out. if (current->flags & PF_IVH_ELIGIBLE) */
+		if (READ_ONCE(ivh_universal_eligible) && !current->ivh_exclude)
+			ivh_hot_note_wait_event();
+	}
 	node = this_cpu_ptr(&qnodes[0].mcs);
 	idx = node->count++;
 	tail = encode_tail(smp_processor_id(), idx);

@@ -62,6 +62,31 @@ static inline bool vcpu_is_preempted(long cpu)
 {
 	return pv_vcpu_is_preempted(cpu);
 }
+
+/*
+ * IVH pv_wait/pv_kick mechanism toggle, default 0 (OFF/safe).
+ *
+ *   0 - "as-close-to-stock-as-possible" fallback: real host-cooperative
+ *       halt + KVM_HC_KICK_CPU hypercall wake if the host advertises
+ *       KVM_FEATURE_PV_UNHALT (byte-for-byte the pre-IVH kvm_wait()/
+ *       kvm_kick_cpu() behavior), else a plain bounded cpu_relax() busy
+ *       loop with no TPAUSE and no steal-bit logic — the least-surprising,
+ *       lowest-risk degenerate case when the host offers nothing to
+ *       cooperate with.
+ *   1 - IVH's own non-hypervisor-cooperative substitute: TPAUSE-based
+ *       backoff (never halts, never issues a wake hypercall) plus the
+ *       steal-bit-gated early bailout in pv_wait_early().
+ *
+ * This only ever branches inside the already-registered, permanently
+ * installed ivh_pv_wait()/ivh_pv_kick() callbacks (arch/x86/kernel/kvm.c)
+ * and pv_wait_early() (kernel/locking/qspinlock_paravirt.h) — it never
+ * touches virt_spin_lock_key or pv_ops.lock.* registration, both of which
+ * are decided exactly once at boot in kvm_spinlock_init(), same as
+ * upstream. See kvm_spinlock_init()'s comment for why that boot-time
+ * decision is deliberately NOT made runtime-toggleable.
+ *   echo 1 > /proc/sys/kernel/ivh_pv_wait_mechanism
+ */
+extern unsigned long ivh_pv_wait_mechanism;
 #endif
 
 #ifdef CONFIG_PARAVIRT
