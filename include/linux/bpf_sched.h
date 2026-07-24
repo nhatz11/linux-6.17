@@ -123,6 +123,16 @@ extern unsigned long ivh_hot_threads_enabled;
  */
 extern unsigned long ivh_universal_eligible;
 
+/* Advisory (non-authoritative) Gate 1+2 re-check for task @t's current CPU,
+ * called from kernel/rseq.c's rseq_update_cpu_node_id() to publish
+ * RSEQ_SCHED_STATE_FLAG_IVH_DANGER (include/uapi/linux/rseq.h) on every
+ * return-to-userspace. Defined in kernel/sched/fair.c. See the doc comment
+ * there and on RSEQ_SCHED_STATE_FLAG_IVH_DANGER for why this deliberately
+ * duplicates ivh_steal_imminent()'s gates instead of calling it directly.
+ */
+struct task_struct;
+bool ivh_task_rq_in_danger(struct task_struct *t);
+
 /* Whether ivh_pre_lock()'s Hot Threads gate also consults ivh_preempt_decay
  * (the old AND-gate) or only ivh_wait_decay (the validated-good default).
  * Default OFF -- preempt_decay's real-KVM-steal-during-a-kernel-raw-

@@ -26,6 +26,8 @@
 #include <linux/slab.h>
 #include <linux/kprobes.h>
 #include <linux/nmi.h>
+#include <linux/smp.h>
+#include <trace/events/ipi.h>
 #include <linux/swait.h>
 #include <linux/syscore_ops.h>
 #include <linux/cc_platform.h>
@@ -1072,12 +1074,32 @@ arch_initcall(activate_jump_labels);
  * truly blocked, the paired kick has nothing to wake and ivh_pv_kick() is a
  * no-op (the busy-waiter self-wakes when the lock word changes).
  *
- * The two window constants below are conservative and tunable; they bound how
+ * The window constants below are conservative and tunable; they bound how
  * long a single ivh_pv_wait() naps before returning to let the PV slowpath
  * re-spin / re-hash and call again.
  */
 #define IVH_PV_WAIT_TSC		65536ULL	/* max cycles per wait call */
 #define IVH_PV_TPAUSE_CYCLES	512ULL		/* per-iteration C0.2 nap */
+
+/*
+ * IVH_PV_ADAPTIVE_TSC (~1 ms @ 3 GHz) is the deadline used instead of
+ * IVH_PV_WAIT_TSC by ivh_pv_wait()'s mechanism==1 branch, paired with the
+ * real pv_kick_node()/ivh_pv_kick() IPI wake added below (kernel/locking/
+ * qspinlock_paravirt.h's pv_kick_node(), and ivh_pv_kick() further down this
+ * file). The two are a package deal, not independent tunables:
+ *
+ *   - With no wake vehicle, IVH_PV_WAIT_TSC (22 us) is the right size: the
+ *     deadline IS the wake, so it must be short.
+ *   - With a real smp_send_reschedule() wake, the IPI is the common-case
+ *     wake and the deadline becomes a worst-case backstop for a lost/
+ *     misdelivered IPI, not the primary mechanism, so it can (and should,
+ *     to avoid needless re-polling on every nap) be long.
+ *
+ * Do not widen this without the IPI wake in place, and do not add the IPI
+ * wake while leaving the deadline at IVH_PV_WAIT_TSC — see
+ * tools/bpf/docs/ivh_adaptive_tpause_ipi_plan_2026-07-22.md secs 4.1/5.1.
+ */
+#define IVH_PV_ADAPTIVE_TSC	3000000ULL	/* max cycles/wait, mechanism==1 */
 
 DEFINE_PER_CPU(u64, ivh_pv_wait_calls);		/* surfaced in /proc/ivh_debug */
 
@@ -1188,13 +1210,101 @@ static void ivh_pv_wait(u8 *ptr, u8 val)
 	}
 
 	/*
+	 * ivh_pv_wait_mechanism == 2: a real halt/safe_halt (genuine vCPU yield,
+	 * a real HLT vmexit that the host observes and can reschedule the
+	 * descheduled lock holder onto), woken by the real smp_send_reschedule()
+	 * IPI in ivh_pv_kick()/pv_kick_node() -- NOT by KVM_HC_KICK_CPU, and
+	 * therefore NOT gated on kvm_para_has_feature(KVM_FEATURE_PV_UNHALT).
+	 *
+	 * Why this is correct without PV_UNHALT (verified against x86/KVM
+	 * semantics, not assumed):
+	 *   - HLT in a guest always vmexits (host-side HLT-passthrough is only
+	 *     enabled for dedicated pCPUs / KVM_HINTS_REALTIME, and
+	 *     kvm_spinlock_init() below already routes that case to native
+	 *     qspinlock so this path is never reached then). So the yield is
+	 *     real and host-visible regardless of PV_UNHALT -- PV_UNHALT only
+	 *     ever optimized the *wake* (a directed hypercall vs a generic IPI),
+	 *     never whether the halt traps.
+	 *   - A HLT-exited (host-blocked) vCPU is un-halted by ANY interrupt
+	 *     delivered to its LAPIC. smp_send_reschedule() sends a genuine
+	 *     RESCHEDULE_VECTOR APIC IPI (native_smp_send_reschedule ->
+	 *     __apic_send_IPI), which KVM injects into the target and thereby
+	 *     unblocks it. This is baseline interrupt-driven wake, not a
+	 *     paravirt feature.
+	 *
+	 * The halt sequence below deliberately mirrors the mechanism==0
+	 * PV_UNHALT halt sequence above byte-for-byte (same lost-wakeup guard,
+	 * same irqs_disabled() branch structure) -- only the PV_UNHALT gate and
+	 * the wake vehicle differ. Do not "simplify" one without the other.
+	 *
+	 * Lost-wakeup race: with IRQs disabled we re-check READ_ONCE(*ptr)==val
+	 * and only then halt; safe_halt()'s sti;hlt is atomic (one-instruction
+	 * sti interrupt shadow), so a kick landing between the re-check and the
+	 * halt is delivered right after the hlt begins and un-halts us -- it
+	 * cannot be lost. In the plain halt() (already-irqs-disabled) branch the
+	 * pending IPI un-halts the CPU even though IF=0 (HLT resumes on any
+	 * pending interrupt regardless of the IF flag; the interrupt simply
+	 * stays pending until IRQs are re-enabled) -- so no hang there either.
+	 *
+	 * Backstop if the IPI is ever lost/misdelivered: a halted CPU still
+	 * un-halts on the next timer tick (HLT participates in the normal
+	 * interrupt/tick infrastructure), whereupon the PV slowpath's own
+	 * for(;;) re-checks node->locked / lock->locked and retries. That bound
+	 * (one tick) is tighter and more robust than mechanism==1's explicit
+	 * IVH_PV_ADAPTIVE_TSC deadline.
+	 *
+	 * "Scoped halt" (2026-07-23): this branch itself is unchanged, but for
+	 * a role-C queued MCS waiter (kernel/locking/qspinlock_paravirt.h's
+	 * pv_wait_node()) it is now reached on a NARROWER trigger than before
+	 * -- only when pv_wait_early() actually fired for the predecessor
+	 * (prev host-preempted or itself MCS-halted), never merely because the
+	 * SPIN_THRESHOLD spin exhausted while prev looked healthy. See the
+	 * wait_early-gated `continue` there. A role-A/B waiter (queue head /
+	 * pending-bit, pv_wait_head_or_lock()) has no predecessor to scope
+	 * against and reaches this same branch UNCONDITIONALLY after its own
+	 * SPIN_THRESHOLD, exactly as mechanisms 0/1 do -- this asymmetry is
+	 * intentional, not an oversight: there is no vcpu_is_preempted()
+	 * signal available for "the current lock holder" from that path, only
+	 * for an MCS predecessor. See
+	 * tools/bpf/docs/ivh_scoped_halt_ipi_mechanism2_plan_2026-07-23.md for
+	 * the full reasoning, including the honest caveat that this means
+	 * mechanism 2 never yields the pCPU under pure in-guest (non-preempted)
+	 * contention for a role-C waiter -- it degrades to native qspinlock
+	 * spin in that case, not to mechanism 0's unconditional halt.
+	 */
+	if (READ_ONCE(ivh_pv_wait_mechanism) == 2) {
+		if (irqs_disabled()) {
+			if (READ_ONCE(*ptr) == val)
+				halt();
+		} else {
+			local_irq_disable();
+			if (READ_ONCE(*ptr) == val)
+				safe_halt();
+			else
+				local_irq_enable();
+		}
+		return;
+	}
+
+	/*
 	 * sysctl ON: IVH's own non-hypervisor-cooperative substitute. Bounded,
 	 * non-halting poll.  Return as soon as the condition clears, or
 	 * (possibly "spuriously") when the window elapses so the PV slowpath
 	 * loop re-checks lock/node state and retries.  Never blocks, never
 	 * leaves TASK_RUNNING.
+	 *
+	 * Deadline is IVH_PV_ADAPTIVE_TSC (~1 ms), not IVH_PV_WAIT_TSC: the
+	 * real IPI wake now wired into pv_kick_node() (kernel/locking/
+	 * qspinlock_paravirt.h) and ivh_pv_kick() below is the expected common
+	 * wake, so ivh_pv_backoff()'s __tpause naps are cut short by that IPI
+	 * (an "external interrupt occurs" is one of TPAUSE's own exit
+	 * conditions, see arch/x86/lib/delay.c's delay_halt_tpause() comment;
+	 * this holds regardless of the waiter's local IRQ-enabled state) well
+	 * before this loop's own deadline check would fire. The deadline
+	 * itself is only the fallback for a lost/misdelivered IPI — see the
+	 * IVH_PV_ADAPTIVE_TSC comment above for why the two are paired.
 	 */
-	deadline = rdtsc() + IVH_PV_WAIT_TSC;
+	deadline = rdtsc() + IVH_PV_ADAPTIVE_TSC;
 	do {
 		if (READ_ONCE(*ptr) != val)
 			return;
@@ -1205,16 +1315,50 @@ static void ivh_pv_wait(u8 *ptr, u8 val)
 static void ivh_pv_kick(int cpu)
 {
 	/*
-	 * Only the sysctl==0 + host-PV_UNHALT-supported fallback path above
+	 * mechanism==0: only the host-PV_UNHALT-supported fallback path above
 	 * ever actually halts, so only it needs a real wake; mirror its
 	 * condition exactly so wait/kick stay consistent with each other even
 	 * if the sysctl changes between one thread's wait and another's kick.
-	 * In every other case nobody is truly halted, so there is nothing to
-	 * wake and this is a deliberate no-op.
+	 * If the host doesn't offer PV_UNHALT, nobody is truly halted (the
+	 * cpu_relax() busy loop self-corrects), so this is a deliberate no-op.
 	 */
-	if (!READ_ONCE(ivh_pv_wait_mechanism) &&
-	    kvm_para_has_feature(KVM_FEATURE_PV_UNHALT))
-		ivh_pv_hypercall_kick(cpu);
+	if (!READ_ONCE(ivh_pv_wait_mechanism)) {
+		if (kvm_para_has_feature(KVM_FEATURE_PV_UNHALT))
+			ivh_pv_hypercall_kick(cpu);
+		return;
+	}
+
+	/*
+	 * mechanism==1 or ==2 (any nonzero mechanism falls here): this is
+	 * __pv_queued_spin_unlock_slowpath()'s pv_kick(node->cpu) for the
+	 * queue-head waiter (role B, waiting in
+	 * ivh_pv_wait(&lock->locked, _Q_SLOW_VAL) inside
+	 * pv_wait_head_or_lock()). By the time pv_kick() runs there,
+	 * lock->locked has already been smp_store_release()'d to 0 (the
+	 * unlock happened first), so the condition ivh_pv_wait() is polling
+	 * for has already changed before this IPI is sent — the ordering the
+	 * waiter's own READ_ONCE(*ptr) re-check depends on is already
+	 * satisfied by the unlock path itself, this call only needs to wake
+	 * the waiter (cut mechanism 1's current TPAUSE nap short, or un-halt
+	 * mechanism 2's real HLT). `cpu` is node->cpu recovered from
+	 * pv_unhash(lock); upstream's own comment right above this call site
+	 * (in __pv_queued_spin_unlock_slowpath()) already establishes that
+	 * read is valid this late and that kicking an active/non-halted vCPU
+	 * is harmless — we rely on that same guarantee.
+	 *
+	 * The SAME smp_send_reschedule() serves both mechanisms because the
+	 * two want a genuinely identical kick: a real, targeted APIC IPI to
+	 * `cpu`. For mechanism 2 that IPI is also what un-halts a real HLT
+	 * (see ivh_pv_wait()'s mechanism==2 branch), which is the whole point
+	 * of mechanism 2 being able to drop the KVM_HC_KICK_CPU hypercall.
+	 *
+	 * A lost or spurious IPI is not a hang: pv_wait_head_or_lock()'s
+	 * outer for(;;) always re-attempts the trylock/hash dance on return
+	 * from pv_wait(). Mechanism 1's ivh_pv_wait() always returns by
+	 * IVH_PV_ADAPTIVE_TSC; mechanism 2's HLT un-halts on the next timer
+	 * tick at the latest — either way, no wake is required for progress.
+	 */
+	smp_send_reschedule(cpu);
 }
 
 /*

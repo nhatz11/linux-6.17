@@ -13241,8 +13241,8 @@ static __always_inline bool ivh_steal_imminent(struct rq *rq)
 	{
 		/* Later tree's formula. */
 		u64 elapsed_since_active = now - max(rq->last_preemption, (u64)rq->last_idle_tp);
-		s64 time_left = (s64)rq->last_active_time - (s64)elapsed_since_active
-				 - (s64)current->last_cs_ns;
+		s64 runway = (s64)rq->last_active_time - (s64)elapsed_since_active;
+		s64 time_left = runway - (s64)current->last_cs_ns;
 
 		if (rq->last_active_time != 0 && time_left > (s64)ivh_time_left_threshold_ns) {
 			this_cpu_inc(ivh_steal_imminent_time_left_reject);
@@ -13252,6 +13252,79 @@ static __always_inline bool ivh_steal_imminent(struct rq *rq)
 		return true;
 	}
 }
+
+/*
+ * ivh_rq_capacity_and_timeleft_ok - Gate 1+2 verdict, WITHOUT the
+ * ivh_steal_imminent_*_reject stat side effects.
+ *
+ * Deliberate duplication of ivh_steal_imminent()'s two gates, not a shared
+ * call: this is invoked from the rseq return-to-userspace path
+ * (rseq_update_cpu_node_id() -> ivh_task_rq_in_danger(), kernel/rseq.c)
+ * every time an IVH-eligible thread resumes userspace execution -- far more
+ * often than actual lock attempts reach ivh_pre_lock()/sys_ivh_cs_enter().
+ * Reusing ivh_steal_imminent() verbatim would inflate
+ * ivh_steal_imminent_capacity_reject/_time_left_reject with advisory
+ * evaluations that never correspond to an actual migration decision,
+ * corrupting what those counters mean in /proc/ivh_debug. Keep the two
+ * gate bodies in sync by hand if either changes.
+ */
+static __always_inline bool ivh_rq_capacity_and_timeleft_ok(struct rq *rq,
+							     struct task_struct *t)
+{
+	u64 now;
+
+	if (rq->cpu_capacity > ivh_capacity_threshold)
+		return false;
+
+	now = sched_clock();
+
+	if (!READ_ONCE(ivh_time_left_source)) {
+		u64 ewma = rq->ewma_act_ns;
+
+		if (ewma != 0) {
+			u64 act_sofar = now - rq->last_preemption;
+
+			if (ewma > act_sofar &&
+			    (ewma - act_sofar) >= ivh_time_left_threshold_ns)
+				return false;
+		}
+		return true;
+	}
+
+	{
+		u64 elapsed_since_active = now - max(rq->last_preemption, (u64)rq->last_idle_tp);
+		s64 runway = (s64)rq->last_active_time - (s64)elapsed_since_active;
+		s64 time_left = runway - (s64)t->last_cs_ns;
+
+		return !(rq->last_active_time != 0 && time_left > (s64)ivh_time_left_threshold_ns);
+	}
+}
+
+/**
+ * ivh_task_rq_in_danger - cheap, advisory-only re-evaluation of Gate 1+2 for
+ * the CPU @t is currently on, called from kernel/rseq.c's
+ * rseq_update_cpu_node_id() (the rseq return-to-userspace path) so that
+ * RSEQ_SCHED_STATE_FLAG_IVH_DANGER can be published to userspace via the
+ * already-scheduled rseq_sched_state write -- no extra syscall, no extra
+ * user_write_access, just one more bit computed from data already resident
+ * (task_rq(t)'s cache line is already hot for the ON_CPU-flag update).
+ *
+ * NOT the authoritative migration decision: ivh_pre_lock() /
+ * sys_ivh_cs_enter() still gate the real migration synchronously and can
+ * reject even when this bit is set (this evaluation can be briefly stale --
+ * up to one return-to-userspace interval old -- and does not hold any lock
+ * or cooldown state). The point is purely to let userspace skip the
+ * syscall for the common case where migration is clearly not going to
+ * happen, per NHextend3's IVH_DANGER pre-check (see ivh_cs_enter() there).
+ */
+bool ivh_task_rq_in_danger(struct task_struct *t)
+{
+	if (!READ_ONCE(ivh_universal_eligible) || t->ivh_exclude)
+		return false;
+
+	return ivh_rq_capacity_and_timeleft_ok(task_rq(t), t);
+}
+EXPORT_SYMBOL_GPL(ivh_task_rq_in_danger);
 
 /**
  * bpf_sched_pre_lock_migrate - synchronous self-migration before spinlock acquire.
@@ -13393,10 +13466,27 @@ void bpf_sched_pre_lock_migrate(void)
 
 	/*
 	 * Synchronous self-migration (mechanism 0, default): temporarily
-	 * restrict cpus_mask to {target_cpu} and call schedule().  The
-	 * scheduler sees that current is no longer allowed on this CPU and
-	 * migrates it.  When schedule() returns we are running on target_cpu.
-	 * Restore original mask so the task's permanent affinity is unchanged.
+	 * restrict cpus_mask to {target_cpu} and call set_cpus_allowed_ptr().
+	 * The scheduler sees that current is no longer allowed on this CPU
+	 * and migrates it -- set_cpus_allowed_ptr() itself blocks (via
+	 * affine_move_task()'s wait_for_completion(), core.c) until that
+	 * migration has actually completed, so by the time it returns we are
+	 * already running on target_cpu. Restore original mask so the task's
+	 * permanent affinity is unchanged.
+	 *
+	 * 2026-07-20: dropped the explicit schedule() call that used to sit
+	 * here after set_cpus_allowed_ptr() returned. It was redundant --
+	 * live kernel investigation confirmed set_cpus_allowed_ptr() already
+	 * contains its own internal sleep/wake (the wait_for_completion()
+	 * above) that fully accomplishes the "block until landed" role, so
+	 * the extra schedule() was purely one more wasted context-switch
+	 * round trip on every single migration, not a real requirement.
+	 * (The original bare-schedule() hang investigation from 2026-06-30
+	 * this replaced was about a *different* stuck-task class, in
+	 * set_cpus_allowed_ptr() itself, not something the removed schedule()
+	 * call was providing protection against -- see ivh_wait_register()
+	 * phase 1, still in place below, which continues to instrument
+	 * exactly that call.)
 	 *
 	 * Use cpumask_var_t (heap via GFP_KERNEL) to avoid a 1024-byte
 	 * stack frame on NR_CPUS=8192/CPUMASK_OFFSTACK=y builds.
@@ -13427,35 +13517,17 @@ void bpf_sched_pre_lock_migrate(void)
 	atomic_inc(&ivh_in_schedule);
 
 	/*
-	 * EXPERIMENT: bare-schedule() hang diagnosis, 2026-06-30.
-	 * Swapped from schedule_timeout_interruptible() back to plain
-	 * schedule() (the version that was observed to hang) so we can
-	 * find out *where* a stuck task actually is instead of theorizing.
-	 * ivh_wait_register/unregister + sched_tick()'s
-	 * ivh_scan_stuck_waiters() give a timeline of cur_cpu/on_rq/target
-	 * heartbeat staleness for any attempt that's been pending past a
-	 * threshold while this call is blocked inside schedule() below.
+	 * Register around set_cpus_allowed_ptr() itself. For a running task
+	 * this blocks inside affine_move_task() -> wait_for_completion()
+	 * (core.c) -- that is the entire migration wait now (see the removed-
+	 * schedule() comment above); ivh_scan_stuck_waiters() (sched_tick())
+	 * gives a timeline of cur_cpu/on_rq/target heartbeat staleness for
+	 * any attempt pending past a threshold while blocked in this call.
 	 */
 	u64 wait_start_ns = sched_clock();
-	int wait_slot = -1;
-
-	/*
-	 * Phase 1: register around set_cpus_allowed_ptr() itself. For a
-	 * running task this blocks inside affine_move_task() ->
-	 * wait_for_completion() (core.c) — if the stuck state is actually
-	 * here (not in the phase-2 schedule() below), this is where we'll
-	 * catch it.
-	 */
 	int wait_slot_p1 = ivh_wait_register(current, src_cpu, target_cpu, 1);
 	int sca_ret = set_cpus_allowed_ptr(current, cpumask_of(target_cpu));
 	ivh_wait_unregister(wait_slot_p1);
-
-	if (sca_ret == 0) {
-		/* Phase 2: the bare schedule() previously (and solely) instrumented. */
-		wait_slot = ivh_wait_register(current, src_cpu, target_cpu, 2);
-		schedule();
-		ivh_wait_unregister(wait_slot);
-	}
 	u64 wait_elapsed_ns = sched_clock() - wait_start_ns;
 
 	atomic_dec(&ivh_in_schedule);
@@ -13474,12 +13546,12 @@ void bpf_sched_pre_lock_migrate(void)
 			atomic_inc(&ivh_timeout_count);
 
 		trace_printk(
-			"ivh_bare_sched: comm=%s src=%d dst=%d landed=%d "
+			"ivh_sca_migrate: comm=%s src=%d dst=%d landed=%d "
 			"wait_elapsed_us=%llu dst_cap=%lu dst_heartbeat_age_us=%llu "
-			"actually_migrated=%s\n",
+			"sca_ret=%d actually_migrated=%s\n",
 			current->comm, src_cpu, target_cpu, landed_cpu,
 			wait_elapsed_ns / 1000,
-			dst_cap, heartbeat_age / 1000,
+			dst_cap, heartbeat_age / 1000, sca_ret,
 			migrated ? "yes" : "no_landed_elsewhere");
 	}
 

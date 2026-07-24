@@ -23,6 +23,8 @@ static inline void tracefs_print_init(void *inst) { }
 #include <sched.h>
 #include <fcntl.h>
 #include <immintrin.h>
+#include <sys/auxv.h>
+#include <stdint.h>
 
 /*
  * Host-level steal-time ground truth, read from /proc/vcap_info
@@ -72,95 +74,7 @@ static int read_vcap_steal(unsigned long long *steal_out)
         return 0;
 }
 
-/*
- * Live per-vCPU host-preemption bit, from /proc/vcap_preempted
- * (vsched_module.c, preempted_read()) -- one ASCII byte per CPU, byte
- * offset == CPU number, so pread(fd, &c, 1, holder_cpu) fetches exactly the
- * holder's bit: one syscall, one KVM steal_time.preempted read module-side,
- * zero parsing.
- *
- * Unlike is_cpu_preempted() (tick-granular heartbeat: clock_preempt is only
- * refreshed by account_process_tick(), so a busy-but-healthy vCPU reads
- * "preempted" for most of every tick window), the KVM preempted byte is set
- * by the HOST at the instant the vCPU is involuntarily scheduled out and
- * cleared at its next VM-entry: 1 for exactly the stolen window,
- * edge-precise, no guest-tick dependence, no idle false-positives.
- *
- * Same thread-local persistent-fd + pread() pattern as read_vcap_steal()
- * above. Returns 1 = holder's vCPU is host-preempted right now, 0 = it is
- * running (or offline), -1 = interface unavailable (module not loaded) --
- * callers treat anything but 1 as "healthy", degrading to plain spinning.
- */
-static __thread int vcap_preempted_fd = -1;
 
-static int holder_vcpu_preempted(int cpu)
-{
-        char c;
-
-        if (vcap_preempted_fd < 0) {
-                vcap_preempted_fd = open("/proc/vcap_preempted", O_RDONLY);
-                if (vcap_preempted_fd < 0)
-                        return -1;
-        }
-        if (pread(vcap_preempted_fd, &c, 1, cpu) != 1)
-                return -1;
-        return c == '1';
-}
-
-/*
- * Timed hardware wait (tpause), not nanosleep(): nanosleep() HLTs the
- * waiter's own vCPU (inviting the host to steal it right at the
- * wake-to-CS boundary), hands wake-up placement to ordinary CFS (which
- * prefers idle CPUs -- anti-correlated with health), and is a syscall
- * (an incidental IVH trigger while PF_IVH_ELIGIBLE is process-wide).
- * tpause never leaves TASK_RUNNING, never syscalls, never triggers a
- * wake-placement decision, and never gives the host a vCPU-idle window
- * to steal -- it satisfies "must not increase the preempt count" by
- * construction rather than by tuning.
- */
-static unsigned long long tsc_per_ns_x1000 = 3000; /* calibrated at startup, see calibrate_tsc() */
-
-static void calibrate_tsc(void)
-{
-        struct timespec ts0, ts1;
-        unsigned long long tsc0, tsc1, wall_ns;
-
-        clock_gettime(CLOCK_MONOTONIC, &ts0);
-        tsc0 = __rdtsc();
-        struct timespec sleep_ts = { .tv_sec = 0, .tv_nsec = 20000000 }; /* 20ms, one-time startup cost */
-        nanosleep(&sleep_ts, NULL);
-        clock_gettime(CLOCK_MONOTONIC, &ts1);
-        tsc1 = __rdtsc();
-
-        wall_ns = (unsigned long long)(ts1.tv_sec - ts0.tv_sec) * 1000000000ULL
-                  + (ts1.tv_nsec - ts0.tv_nsec);
-        if (wall_ns > 0)
-                tsc_per_ns_x1000 = (tsc1 - tsc0) * 1000ULL / wall_ns;
-}
-
-/* Timed hardware wait for approximately `ns` nanoseconds. IA32_UMWAIT_CONTROL's
- * max_time typically caps a single _tpause() call short of the target, so
- * loop until the real deadline. */
-static void tpause_wait_ns(unsigned long long ns)
-{
-        unsigned long long deadline = __rdtsc() + (ns * tsc_per_ns_x1000) / 1000ULL;
-
-        while (__rdtsc() < deadline)
-                _tpause(0 /* C0.2, fast wake */, deadline);
-}
-
-static int adaptive_spin_enabled = 0; /* 0 = plain spin, 1 = live holder-preempted bit backoff */
-/*
- * Defaults preserved from the older NHextend.c port; overridable at runtime via
- * env vars purely for tuning sweeps (ADAPTIVE_SPIN_BUDGET / _CHUNK_NS / _MAX_NS).
- * With no env set, values are identical to the historical compile-time #defines.
- */
-static int adaptive_spin_budget = 2000;          /* spin iterations between holder-health checks */
-static unsigned long long adaptive_backoff_chunk_ns = 10000ULL; /* 10us tpause slice */
-static unsigned long long adaptive_backoff_max_ns  = 200000ULL; /* per-episode cap */
-#define ADAPTIVE_SPIN_BUDGET adaptive_spin_budget
-#define ADAPTIVE_BACKOFF_CHUNK_NS adaptive_backoff_chunk_ns
-#define ADAPTIVE_BACKOFF_MAX_NS  adaptive_backoff_max_ns
 
 /*
  * Pre-lock migration trigger — call BEFORE attempting grab_lock(), not after.
@@ -171,12 +85,88 @@ static unsigned long long adaptive_backoff_max_ns  = 200000ULL; /* per-episode c
 #ifndef __NR_ivh_cs_enter
 #define __NR_ivh_cs_enter 470
 #endif
+
+/*
+ * RSEQ_SCHED_STATE_FLAG_IVH_DANGER (include/uapi/linux/rseq.h, 2026-07-20):
+ * the kernel publishes this bit in struct rseq_sched_state::state on every
+ * return-to-userspace (rseq_update_cpu_node_id() -> ivh_task_rq_in_danger(),
+ * kernel/sched/fair.c) whenever this thread's current CPU fails IVH's
+ * capacity/time-left gates -- i.e. whenever entering a critical section
+ * right now would actually be a migration candidate. Hand-declared here
+ * (not yet in system headers) to match the kernel uapi exactly.
+ */
+#ifndef RSEQ_SCHED_STATE_FLAG_ON_CPU
+#define RSEQ_SCHED_STATE_FLAG_ON_CPU (1U << 0)
+#endif
+#ifndef RSEQ_SCHED_STATE_FLAG_IVH_DANGER
+#define RSEQ_SCHED_STATE_FLAG_IVH_DANGER (1U << 1)
+#endif
+
+struct rseq_sched_state {
+        __u32 version;
+        __u32 state;
+        __u32 tid;
+};
+
+/*
+ * Per-thread published sched_state block. One instance per worker thread
+ * (each thread registers its own rseq + sched_state_ptr), so this must be
+ * __thread, not a single global -- a global would let threads race on the
+ * same version/state/tid fields and would only reflect whichever thread
+ * registered last.
+ */
+static __thread struct rseq_sched_state ivh_sched_state __attribute__((aligned(64)));
+
+/*
+ * ivh_danger() - read this thread's own advisory danger bit, no syscall.
+ * Returns true (fail-open, "assume danger, make the real syscall") whenever
+ * the feature isn't actually active for this thread -- old kernel without
+ * the bit, failed registration, or -n mode -- so the optimization can only
+ * ever remove syscalls, never silently remove real migrations, on a kernel
+ * that doesn't support it.
+ */
+static bool ivh_sched_state_active;
+
+static inline bool ivh_danger(void)
+{
+        if (!ivh_sched_state_active)
+                return true;
+        return (ivh_sched_state.state & RSEQ_SCHED_STATE_FLAG_IVH_DANGER) != 0;
+}
+
+/*
+ * ivh_cs_enter() itself is now the *authoritative* call, unconditionally
+ * doing the syscall -- callers that want the cheap local pre-check use
+ * ivh_cs_enter_checked() below instead. Kept separate so the one
+ * unconditional call NHextend3 needs (the very first entry before rseq/
+ * sched_state has had a chance to be populated) still exists.
+ */
 static inline void ivh_cs_enter(void)
 {
         syscall(__NR_ivh_cs_enter);
 }
 
-/* Updated version of rseq structure with cr_counter, wait_counter, and timing fields */
+/*
+ * ivh_cs_enter_checked() - the actual optimization: skip the syscall
+ * entirely when this thread's own last-published danger bit is clear.
+ * Returns 1 if the syscall was made, 0 if it was skipped, so callers can
+ * keep separate call/skip counters.
+ */
+static inline int ivh_cs_enter_checked(void)
+{
+        if (!ivh_danger())
+                return 0;
+        syscall(__NR_ivh_cs_enter);
+        return 1;
+}
+
+/* Updated version of rseq structure with cr_counter, wait_counter, timing
+ * fields, and sched_state_ptr (+64: opt-in pointer to a userspace-owned
+ * struct rseq_sched_state, see register_rseq()). Registering with
+ * sizeof < IVH_RSEQ_LEN would silently disable the sched_state_ptr feature
+ * (kernel/rseq.c's rseq_get_sched_state_ptr() checks rseq_len), so
+ * IVH_RSEQ_LEN, not sizeof(struct rseq_abi), is what gets passed to the
+ * rseq() syscall -- see register_rseq(). */
 struct rseq_abi {
         __u32 cpu_id_start;
         __u32 cpu_id;
@@ -190,7 +180,25 @@ struct rseq_abi {
         __u64 last_cs_overall_ns;   /* +40: wall-clock duration of most recent CS (ns) */
         __u64 last_cs_active_ns;    /* +48: unused here; reserved for on-CPU CS time */
         __u64 last_wait_overall_ns; /* +56: wall-clock wait before most recent acquire (ns) */
+        __u64 sched_state_ptr;      /* +64: userspace-owned struct rseq_sched_state* */
 } __attribute__((aligned(4 * sizeof(__u64))));
+
+/*
+ * Registration lengths. offsetof(), not sizeof(): struct rseq_abi's
+ * aligned(32) attribute pads sizeof() up to the next 32-byte multiple (96),
+ * which is NOT the byte offset the kernel's rseq_len checks actually care
+ * about (kernel/rseq.c compares against offsetof(struct rseq, end) and
+ * offsetof(struct rseq, sched_state_ptr) for the real running kernel).
+ *   - IVH_RSEQ_LEN_NO_SCHED_STATE (64): the original extended-ABI size,
+ *     used verbatim when the running kernel doesn't report a feature size
+ *     that includes sched_state_ptr.
+ *   - IVH_RSEQ_LEN_SCHED_STATE (72): includes sched_state_ptr.
+ * The real runtime length always prefers getauxval(AT_RSEQ_FEATURE_SIZE)
+ * when available (register_rseq()) -- these are only the two fallback
+ * values when that isn't.
+ */
+#define IVH_RSEQ_LEN_NO_SCHED_STATE offsetof(struct rseq_abi, sched_state_ptr)
+#define IVH_RSEQ_LEN_SCHED_STATE (offsetof(struct rseq_abi, sched_state_ptr) + sizeof(__u64))
 
 static bool no_rseq;
 static bool extend_wait;
@@ -207,36 +215,69 @@ static pthread_barrier_t pbarrier;
 
 static __thread struct rseq_abi *rseq_map;
 
+/*
+ * register_rseq() has to account for glibc (>= 2.35) already having
+ * auto-registered rseq for this thread at process/thread start, at this
+ * same address, using whatever length getauxval(AT_RSEQ_FEATURE_SIZE)
+ * reported to IT. The kernel only reads sched_state_ptr AT REGISTRATION
+ * TIME (rseq_get_sched_state_ptr(), kernel/rseq.c) and never re-reads it --
+ * so if glibc's registration already "won", writing our sched_state_ptr
+ * into the (already-registered) memory afterward would be silently
+ * ignored. We must unregister glibc's registration and re-register
+ * ourselves with the field populated first. Confirmed live via strace that
+ * glibc on this system pre-registers with exactly the auxval-reported
+ * length, which is what makes the unregister call's rseq_len match.
+ */
 static void register_rseq(void)
 {
         int ret;
+        unsigned long feat_len;
+        size_t reg_len;
+        bool want_sched_state;
 
-        ret = syscall(__NR_rseq, rseq_map, sizeof(struct rseq_abi), 0, 0x53053053);
-        if (ret == 0)
-                return;
+        feat_len = getauxval(AT_RSEQ_FEATURE_SIZE);
+        want_sched_state = feat_len >= IVH_RSEQ_LEN_SCHED_STATE;
+        reg_len = feat_len ? feat_len : IVH_RSEQ_LEN_NO_SCHED_STATE;
 
-        if (errno == EINVAL) {
-                /* Already registered with the same struct — nothing to do */
+        if (want_sched_state) {
+                ivh_sched_state.version = 0;
+                ivh_sched_state.tid = (__u32)syscall(SYS_gettid);
+                rseq_map->sched_state_ptr = (__u64)(uintptr_t)&ivh_sched_state;
+        }
+
+        ret = syscall(__NR_rseq, rseq_map, reg_len, 0, 0x53053053);
+        if (ret == 0) {
+                ivh_sched_state_active = want_sched_state;
                 return;
         }
 
-        if (errno == EBUSY) {
-                /* Registered with a different size — unregister then re-register */
-                ret = syscall(__NR_rseq, rseq_map, sizeof(struct rseq_abi),
-                              RSEQ_FLAG_UNREGISTER, 0x53053053);
+        if (errno == EINVAL || errno == EBUSY) {
+                ret = syscall(__NR_rseq, rseq_map, reg_len, RSEQ_FLAG_UNREGISTER, 0x53053053);
                 if (ret < 0) {
-                        fprintf(stderr, "rseq unregister failed: %m\n");
+                        /*
+                         * Longstanding registration we can't match (glibc
+                         * used a different length or signature) -- can't
+                         * safely take it over. Fail open: sched_state
+                         * stays inactive, ivh_danger() always reports
+                         * danger, every ivh_cs_enter_checked() call site
+                         * still makes the real syscall (old behavior,
+                         * just without the new optimization).
+                         */
+                        ivh_sched_state_active = false;
                         return;
                 }
-                ret = syscall(__NR_rseq, rseq_map, sizeof(struct rseq_abi), 0, 0x53053053);
+                ret = syscall(__NR_rseq, rseq_map, reg_len, 0, 0x53053053);
                 if (ret < 0) {
                         fprintf(stderr, "rseq re-register failed: %m\n");
+                        ivh_sched_state_active = false;
                         return;
                 }
+                ivh_sched_state_active = want_sched_state;
                 return;
         }
 
         fprintf(stderr, "rseq register warning: %m\n");
+        ivh_sched_state_active = false;
 }
 
 static void init_extend_map(void)
@@ -273,16 +314,15 @@ struct thread_data {
         unsigned long long                      sum_migration_ns;
         unsigned long long                      max_migration_ns;
         unsigned long long                      slow_migration_count; /* ivh_cs_enter() > 1ms */
+        /* IVH_DANGER local pre-check: how many ivh_cs_enter attempts were
+         * skipped locally (no syscall) vs actually made, per call site. */
+        unsigned long long                      syscall_skipped_count;
+        unsigned long long                      syscall_made_count;
         /* CS preemption tracking: how often was the lock holder preempted */
         unsigned long long                      cs_preempted_count;  /* CS cycles with >100us off-CPU, GUEST-LEVEL proxy */
         /* Host-level steal-time tracking (ground truth, see read_vcap_steal) */
         unsigned long long                      host_preempted_count;
         unsigned long long                      host_preempted_migrated_count;
-        /* Adaptive-spin (live holder-preempted bit) tracking */
-        unsigned long long                      adaptive_backoffs;
-        unsigned long long                      backoff_wait_ns;
-        unsigned long long                      recheck_migration_count;
-        unsigned long long                      sum_recheck_migration_ns;
         struct data                             *data;
         int                                     cpu;
 };
@@ -419,64 +459,6 @@ static void do_sleep(unsigned usecs)
         nanosleep(&ts, NULL);
 }
 
-/*
- * Called from inside the busy-wait loop body on every iteration; only
- * actually does anything (a real check, costing one syscall) once per
- * ADAPTIVE_SPIN_BUDGET iterations -- the common case (lock free shortly, or
- * holder healthy) never pays for a syscall at all.
- *
- * The lock word encodes the holder's CPU (0 = free, else holder_cpu + 1 --
- * see grab_lock()'s cmpxchg calls), so a waiter can look up *that specific
- * CPU's* live preemption bit instead of spinning blind.
- *
- * No 100us-floor analog and no N-consecutive-check debounce needed (unlike
- * a steal-delta design): reading 1 is a true statement that the holder is
- * off-CPU at this instant, not a noisy cumulative counter. Micro-preemption
- * cost is bounded by the 10us slice + re-check loop instead.
- */
-static int adaptive_backoff_step(struct data *data, unsigned long lock_val,
-                                  int *spin_count, struct thread_data *tdata)
-{
-        int holder_cpu;
-        unsigned long long waited = 0;
-
-        if (!adaptive_spin_enabled || lock_val == 0)
-                return 0;
-
-        if (++(*spin_count) < ADAPTIVE_SPIN_BUDGET)
-                return 0;
-        *spin_count = 0;
-
-        holder_cpu = (int)(lock_val - 1);
-        if (holder_cpu < 0 || holder_cpu >= VCAP_MAX_CPUS)
-                return 0;
-
-        if (holder_vcpu_preempted(holder_cpu) != 1)
-                return 0;
-
-        tdata->adaptive_backoffs++;
-
-        /*
-         * Ride out the preemption in slices: stop as soon as the lock
-         * changes hands (a preempted holder can't release, so a changed
-         * word means our sample was already stale), the holder's vCPU is
-         * running again, or the stale-holder cap trips.
-         */
-        do {
-                tpause_wait_ns(ADAPTIVE_BACKOFF_CHUNK_NS);
-                waited += ADAPTIVE_BACKOFF_CHUNK_NS;
-                rmb();
-                if (data->lock != lock_val || data->done)
-                        break;
-        } while (waited < ADAPTIVE_BACKOFF_MAX_NS &&
-                 holder_vcpu_preempted(holder_cpu) == 1);
-
-        tdata->backoff_wait_ns += waited;
-        return 1;
-}
-
-static int backoff_recheck_enabled = 1; /* re-trigger ivh_cs_enter() for the waiter itself after a backoff */
-
 static void grab_lock(struct thread_data *tdata, struct data *data)
 {
         unsigned long long start_wait, start, end, delta;
@@ -485,20 +467,24 @@ static void grab_lock(struct thread_data *tdata, struct data *data)
         unsigned long long start_active_ns, end_active_ns;
         unsigned long prev;
         unsigned long my_lock_val;
-        int as_spin_count = 0;
-        int had_backoff_this_wait = 0;
         bool contention = false;
 
         {
                 unsigned long long _t0 = get_time_ns();
-                ivh_cs_enter();
+                int made = ivh_cs_enter_checked();
                 unsigned long long _dt = get_time_ns() - _t0;
-                tdata->migration_count++;
-                tdata->sum_migration_ns += _dt;
-                if (_dt > tdata->max_migration_ns)
-                        tdata->max_migration_ns = _dt;
-                if (_dt > 1000000ULL) /* >1ms = migration got stuck in schedule() */
-                        tdata->slow_migration_count++;
+
+                if (!made) {
+                        tdata->syscall_skipped_count++;
+                } else {
+                        tdata->syscall_made_count++;
+                        tdata->migration_count++;
+                        tdata->sum_migration_ns += _dt;
+                        if (_dt > tdata->max_migration_ns)
+                                tdata->max_migration_ns = _dt;
+                        if (_dt > 1000000ULL) /* >1ms = migration got stuck in schedule() */
+                                tdata->slow_migration_count++;
+                }
         }
 
         start_wait = get_time();
@@ -508,26 +494,7 @@ static void grab_lock(struct thread_data *tdata, struct data *data)
         rmb();
         while (data->lock && !data->done) {
                 contention = true;
-                if (adaptive_backoff_step(data, data->lock, &as_spin_count, tdata))
-                        had_backoff_this_wait = 1;
                 rmb();
-        }
-
-        /*
-         * A non-yielding tpause backoff can last long enough that the
-         * pre-wait ivh_cs_enter() above is stale: ordinary guest load
-         * balancing could have moved this thread mid-wait, or the vCPU
-         * health picture could simply have changed. One re-check here
-         * gives the thread about to become the NEXT holder a real chance
-         * to land on a healthy CPU before its critical section starts --
-         * only paid on the rare path that actually backed off.
-         */
-        if (had_backoff_this_wait && backoff_recheck_enabled) {
-                unsigned long long _t0 = get_time_ns();
-                ivh_cs_enter();
-                unsigned long long _dt = get_time_ns() - _t0;
-                tdata->recheck_migration_count++;
-                tdata->sum_recheck_migration_ns += _dt;
         }
 
         tracefs_printf(NULL, "Grab lock\n");
@@ -551,8 +518,6 @@ static void grab_lock(struct thread_data *tdata, struct data *data)
                         if (!extend_wait && unextend())
                                 tdata->extended++;
                         while (data->lock && !data->done) {
-                                if (adaptive_backoff_step(data, data->lock, &as_spin_count, tdata))
-                                        had_backoff_this_wait = 1;
                                 rmb();
                         }
                 }
@@ -723,11 +688,8 @@ int main (int argc, char **argv)
                         loop_spin = atoi(ls);
         }
 
-        while ((ch = getopt(argc, argv, "adwvlnb:")) >= 0) {
+        while ((ch = getopt(argc, argv, "dwvlnb:")) >= 0) {
                 switch (ch) {
-                        case 'a':
-                                adaptive_spin_enabled = 1;
-                                break;
                         case 'd':
                                 no_rseq = true;
                                 break;
@@ -753,8 +715,7 @@ int main (int argc, char **argv)
                                 break;
                         }
                         default:
-                                fprintf(stderr, "usage: NHextend3 [-a|-d|-w|-v|-l|-n] [-b busy_threads] [threads]\n"
-                                                "  -a: enable adaptive spinning (live holder-preempted bit backoff)\n"
+                                fprintf(stderr, "usage: NHextend3 [-d|-w|-v|-l|-n] [-b busy_threads] [threads]\n"
                                                 "  -d: disable rseq\n"
                                                 "  -n: no CPU pinning (threads float across all CPUs, needed for IVH migration)\n"
                                                 "  -w: extend while trying to get lock\n"
@@ -780,19 +741,6 @@ int main (int argc, char **argv)
         if (optind < argc) {
                 fprintf(stderr, "Too many arguments\n");
                 exit(-1);
-        }
-
-        {
-                const char *e;
-                if ((e = getenv("ADAPTIVE_SPIN_BUDGET")))    adaptive_spin_budget = atoi(e);
-                if ((e = getenv("ADAPTIVE_BACKOFF_CHUNK_NS"))) adaptive_backoff_chunk_ns = strtoull(e, NULL, 10);
-                if ((e = getenv("ADAPTIVE_BACKOFF_MAX_NS")))  adaptive_backoff_max_ns = strtoull(e, NULL, 10);
-        }
-
-        if (adaptive_spin_enabled) {
-                calibrate_tsc();
-                fprintf(stderr, "[adaptive] budget=%d chunk_ns=%llu max_ns=%llu\n",
-                        adaptive_spin_budget, adaptive_backoff_chunk_ns, adaptive_backoff_max_ns);
         }
 
         memset(&data, 0, sizeof(data));
@@ -957,8 +905,7 @@ int main (int argc, char **argv)
                 unsigned long long g_mig_count = 0, g_mig_sum = 0, g_mig_max = 0;
                 unsigned long long g_slow = 0, g_cs_preempted = 0;
                 unsigned long long g_host_preempted = 0, g_host_migrated = 0;
-                unsigned long long g_adaptive_backoffs = 0, g_backoff_wait_ns = 0;
-                unsigned long long g_recheck_count = 0, g_recheck_sum_ns = 0;
+                unsigned long long g_syscall_skipped = 0, g_syscall_made = 0;
                 printf("IVH migration stats (ivh_cs_enter duration, NOT included in CS above):\n");
                 printf("  %-6s  %-10s  %-12s  %-12s  %-12s\n",
                        "thread", "calls", "avg_ns", "max_ns", "slow(>1ms)");
@@ -977,10 +924,8 @@ int main (int argc, char **argv)
                         g_cs_preempted += t->cs_preempted_count;
                         g_host_preempted += t->host_preempted_count;
                         g_host_migrated  += t->host_preempted_migrated_count;
-                        g_adaptive_backoffs += t->adaptive_backoffs;
-                        g_backoff_wait_ns   += t->backoff_wait_ns;
-                        g_recheck_count     += t->recheck_migration_count;
-                        g_recheck_sum_ns    += t->sum_recheck_migration_ns;
+                        g_syscall_skipped   += t->syscall_skipped_count;
+                        g_syscall_made      += t->syscall_made_count;
                 }
                 unsigned long long g_mig_cnt = g_mig_count ? g_mig_count : 1;
                 unsigned long long g_cs_cnt  = g_count ? g_count : 1;
@@ -992,6 +937,20 @@ int main (int argc, char **argv)
                 printf("  Stuck (>1ms)        : %llu  (%.4f%% of migrations)\n",
                        g_slow, 100.0 * g_slow / g_mig_cnt);
                 printf("\n");
+                printf("IVH_DANGER local pre-check (RSEQ_SCHED_STATE_FLAG_IVH_DANGER, no syscall when clear):\n");
+                if (!ivh_sched_state_active) {
+                        printf("  INACTIVE for this run (old kernel, or rseq/sched_state registration\n");
+                        printf("  didn't take -- every ivh_cs_enter attempt fell back to a real syscall,\n");
+                        printf("  identical to pre-optimization behavior).\n");
+                } else {
+                        unsigned long long g_attempts = g_syscall_skipped + g_syscall_made;
+                        unsigned long long g_attempts_cnt = g_attempts ? g_attempts : 1;
+                        printf("  Attempts            : %llu  (skipped %llu, syscall made %llu)\n",
+                               g_attempts, g_syscall_skipped, g_syscall_made);
+                        printf("  Syscalls avoided    : %.2f%%\n",
+                               100.0 * (double)g_syscall_skipped / (double)g_attempts_cnt);
+                }
+                printf("\n");
                 printf("CS holder preemption (off-CPU >100us DURING lock hold, GUEST-LEVEL, ru_nivcsw-style proxy):\n");
                 printf("  Preempted CS cycles : %llu / %llu  (%.4f%%)\n",
                        g_cs_preempted, g_count,
@@ -1002,20 +961,6 @@ int main (int argc, char **argv)
                        g_host_preempted, g_count,
                        100.0 * g_host_preempted / g_cs_cnt);
                 printf("  (of which, thread migrated mid-CS): %llu\n", g_host_migrated);
-                printf("\n");
-                printf("Adaptive spin (live holder-preempted bit, %s):\n",
-                       adaptive_spin_enabled ? "enabled" : "disabled");
-                printf("  Backoffs triggered  : %llu\n", g_adaptive_backoffs);
-                if (g_adaptive_backoffs)
-                        printf("  Avg backoff wait    : %llu ns\n",
-                               g_backoff_wait_ns / g_adaptive_backoffs);
-                printf("  Total backoff wait  : %llu ns  (%.2f ms)\n",
-                       g_backoff_wait_ns, g_backoff_wait_ns / 1e6);
-                printf("  Backoff re-check migrations : %llu%s\n", g_recheck_count,
-                       backoff_recheck_enabled ? "" : " (disabled)");
-                if (g_recheck_count)
-                        printf("  Avg re-check migration ns   : %llu\n",
-                               g_recheck_sum_ns / g_recheck_count);
                 printf("\n");
         }
 

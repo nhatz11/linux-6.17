@@ -45,6 +45,28 @@ enum rseq_sched_state_flags {
 	 * Read by any userspace thread with single-copy atomicity semantics.
 	 */
 	RSEQ_SCHED_STATE_FLAG_ON_CPU		= (1U << 0),
+
+	/*
+	 * IVH advisory danger bit (2026-07-20): set by the kernel on the same
+	 * return-to-userspace path as ON_CPU (rseq_update_cpu_node_id() ->
+	 * ivh_task_rq_in_danger(), kernel/sched/fair.c) whenever the calling
+	 * task's current CPU fails IVH's capacity/time-left gates -- i.e.
+	 * whenever a spinlock critical section entered right now would be a
+	 * migration candidate. Cleared (bit absent) otherwise, including on
+	 * any thread not opted into IVH (ivh_universal_eligible=0 or
+	 * ivh_exclude set) or that never registered a sched_state_ptr.
+	 *
+	 * This is advisory only, not the authoritative migration decision --
+	 * it can be stale by up to one return-to-userspace interval, and
+	 * carries no cooldown/lock state. Its only purpose is to let
+	 * userspace skip the sys_ivh_cs_enter() syscall entirely when this
+	 * bit is clear (the common case: most lock attempts are not
+	 * migration candidates), rather than paying syscall overhead on
+	 * every attempt only to be rejected by the kernel's own gates. When
+	 * set, userspace should still make the real syscall to get the
+	 * authoritative, race-checked decision.
+	 */
+	RSEQ_SCHED_STATE_FLAG_IVH_DANGER	= (1U << 1),
 };
 
 /*

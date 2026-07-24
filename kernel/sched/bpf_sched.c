@@ -11,22 +11,30 @@
 
 /*
  * Capacity gate: trigger IVH only when the source vCPU is at or below this
- * fraction of full capacity (scale 0–1024).  Default 512 = 50%: migrate only
- * from severely stolen vCPUs where the gain is unambiguous and a clearly
- * better target is more likely to exist.  Raising toward 900 makes IVH more
- * aggressive (fires at ~12% steal) but risks pool exhaustion under heavy load.
- *   echo 512 > /proc/sys/kernel/ivh_capacity_threshold
+ * fraction of full capacity (scale 0–1024).  Default 1010 (2026-07-20,
+ * updated from the original 512/50% guess): every benchmark-search and
+ * HP-correlation run this session used 1010 -- it fires much closer to the
+ * full-capacity boundary (~1.4% steal) than the original 50% guess, and no
+ * regression from the wider firing range was found across ~15 workloads.
+ * 512 is kept working (still a valid, more conservative value) but is no
+ * longer the empirically-validated default.
+ *   echo 1010 > /proc/sys/kernel/ivh_capacity_threshold
  */
-unsigned long ivh_capacity_threshold = 512UL;
+unsigned long ivh_capacity_threshold = 1010UL;
 
 /*
  * Time-left gate: skip migration when this many nanoseconds remain in the
  * estimated active burst.  Tunable at runtime via sysctl without a rebuild:
  *   echo 250000 > /proc/sys/kernel/ivh_time_left_threshold_ns
- * Default 500 μs — wide enough to absorb EWMA noise and the ~10 ms tick
- * lag in last_preemption, yet short enough to catch most end-of-burst locks.
+ * Default 4 ms (2026-07-20, updated from the original 500 μs guess): this is
+ * the value actually used across every reported win this session (ebizzy,
+ * dbench, hackbench-g4). A sweep down to 50 μs helped short-CS NHextend3
+ * further but cost hackbench some of its margin -- there is no single value
+ * confirmed best for every workload; 4ms is the safer, broadly-validated
+ * choice until the CS-scaled adaptive threshold (state-of-the-art doc §5.1)
+ * is implemented.
  */
-unsigned long ivh_time_left_threshold_ns = 500000UL;
+unsigned long ivh_time_left_threshold_ns = 4000000UL;
 
 /*
  * Migration watchdog timeout (ns): if schedule() does not return within this
@@ -43,10 +51,12 @@ unsigned long ivh_migration_timeout_ns = 500000UL;
  * Concurrency cap: maximum number of threads allowed inside schedule()
  * simultaneously during IVH migration.  Prevents pool exhaustion under
  * heavy steal where many threads pass the gates at once.
- * Default 3.  Set to 0 to disable the cap.
- *   echo 3 > /proc/sys/kernel/ivh_max_concurrent
+ * Default 8 (2026-07-20, updated from the original 3 guess): the value
+ * actually used across every reported win/loss measurement this session.
+ * Set to 0 to disable the cap.
+ *   echo 8 > /proc/sys/kernel/ivh_max_concurrent
  */
-unsigned long ivh_max_concurrent = 3UL;
+unsigned long ivh_max_concurrent = 8UL;
 
 /*
  * schedule_timeout_interruptible duration (ms) for IVH migration.
@@ -69,14 +79,17 @@ unsigned long ivh_sched_timeout_ms = 1UL;
 unsigned long ivh_eval_cooldown_ns = 50000UL;
 
 /*
- * Gate 1+2 "time left" formula toggle, kept for A/B testing against a later
- * tree's formula without a rebuild:
- *   0 (default) = this commit's original rq->ewma_act_ns formula, verbatim.
- *   1           = the later tree's rq->last_active_time formula.
+ * Gate 1+2 "time left" formula toggle, kept for A/B testing against the
+ * original formula without a rebuild:
+ *   0           = this commit's original rq->ewma_act_ns formula, verbatim.
+ *   1 (default) = the later tree's rq->last_active_time formula, updated
+ *                 2026-07-20 -- this is the formula actually used across
+ *                 every reported win/loss measurement this session, and the
+ *                 one fed by current->last_cs_ns (the sys_ivh_cs_enter fix).
  * See ivh_steal_imminent() in kernel/sched/fair.c for both implementations.
- *   echo 1 > /proc/sys/kernel/ivh_time_left_source
+ *   echo 0 > /proc/sys/kernel/ivh_time_left_source
  */
-unsigned long ivh_time_left_source = 0UL;
+unsigned long ivh_time_left_source = 1UL;
 
 /*
  * Destination-selection lock toggle:

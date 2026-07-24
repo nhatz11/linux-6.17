@@ -270,10 +270,15 @@ pv_wait_early(struct pv_node *prev, int loop)
 		return true;
 
 	/*
-	 * IVH (default OFF, sysctl ivh_pv_wait_mechanism): bail out of the hot
-	 * MCS spin early — into ivh_pv_wait()'s non-halting backoff — when the
+	 * IVH (default OFF, sysctl ivh_pv_wait_mechanism != 0): bail out of the
+	 * hot MCS spin early — into ivh_pv_wait() (mechanism 1's non-halting
+	 * TPAUSE backoff, or mechanism 2's real yielding HLT) — when the
 	 * predecessor's vCPU is currently preempted by the host, in addition
-	 * to the stock check above.  vcpu_is_preempted(prev->cpu) reads the
+	 * to the stock check above.  For mechanism 2 in particular, yielding
+	 * the pCPU (HLT) precisely when the predecessor we are waiting on is
+	 * itself descheduled is exactly the behavior we want: stop competing
+	 * with the host for the pCPU it needs to reschedule that predecessor.
+	 * vcpu_is_preempted(prev->cpu) reads the
 	 * live KVM steal bit, and for an MCS queue node prev->cpu is exactly
 	 * "the thing we are waiting on", so this is the in-kernel analogue of
 	 * NHextend3's validated steal-flag check: stop burning a hot pCPU
@@ -282,6 +287,16 @@ pv_wait_early(struct pv_node *prev, int loop)
 	 * caller's for(;;) loop re-checks node->locked regardless; this only
 	 * changes *when* we transition from hot-spin to backoff.  Gated so
 	 * that sysctl==0 reproduces the exact upstream pv_wait_early() check.
+	 *
+	 * As of the mechanism-2 "scoped halt" design (see pv_wait_node()'s
+	 * wait_early-gated continue), this function's return value is no
+	 * longer just an *early-exit hint* for mechanism 2 — it is the SOLE
+	 * gate deciding whether that waiter ever reaches HLT at all. If this
+	 * returns false every time for a given wait cycle (loop exhausts),
+	 * mechanism 2 does not sleep; it loops back and keeps spinning
+	 * instead of falling through to an unconditional halt. Mechanisms 0
+	 * and 1 are unaffected: they still sleep on threshold exhaustion
+	 * regardless of this function's return value on that final check.
 	 */
 	if (!READ_ONCE(ivh_pv_wait_mechanism))
 		return false;
@@ -324,6 +339,47 @@ static void pv_wait_node(struct mcs_spinlock *node, struct mcs_spinlock *prev)
 			}
 			cpu_relax();
 		}
+
+		/*
+		 * IVH mechanism 2 ("scoped halt"): only ever go to sleep (real
+		 * HLT via pv_wait()/ivh_pv_wait()) when pv_wait_early() actually
+		 * fired -- i.e. wait_early == true, meaning the predecessor
+		 * `prev` we are queued behind looks unhealthy (host-preempted
+		 * per vcpu_is_preempted(prev->cpu), or itself MCS-halted per
+		 * prev->state != VCPU_RUNNING; pv_wait_early() folds both, and
+		 * both are genuine "prev is not making progress for us" signals).
+		 * If instead the inner SPIN_THRESHOLD loop merely EXHAUSTED
+		 * while `prev` still looked healthy (wait_early == false), do
+		 * NOT fall through to HLT: loop back to the outer for(;;),
+		 * re-arm SPIN_THRESHOLD, and keep spinning. This degrades to a
+		 * plain MCS busy-poll on node->locked -- bounded by prev's FIFO
+		 * progress exactly like native qspinlock -- rather than paying
+		 * an unwarranted HLT vmexit + host reschedule when nothing is
+		 * actually wrong. pn->state stays VCPU_RUNNING throughout the
+		 * spin, so a concurrent pv_kick_node()'s cmpxchg(HALTED->HASHED)
+		 * fails and correctly leaves us to self-observe node->locked
+		 * (qspinlock.c sets node->locked = 1, store-release, strictly
+		 * before calling pv_kick_node() -- see that function's comment).
+		 *
+		 * Scoped to mechanism 2 ONLY. Mechanisms 0 and 1 keep their
+		 * existing behavior unchanged: fall through and sleep once the
+		 * threshold is spent regardless of wait_early (mechanism 0's
+		 * host-cooperative HLT/kick, mechanism 1's bounded TPAUSE poll).
+		 * The `== 2` conjunct is what preserves that.
+		 *
+		 * Honest caveat: under pure in-guest contention with no host
+		 * preemption anywhere in the chain, this means mechanism 2 never
+		 * yields the pCPU at all here -- it degrades to native qspinlock
+		 * busy-spin, not to mechanism 0's halt-after-threshold. That is
+		 * the intended "yield only when there is real preemption to get
+		 * out of the way of" semantics, but it is a real, measurable
+		 * divergence from mechanism 0 under heavy non-preemption
+		 * contention (more busy-spin CPU, no pCPU yield) -- see
+		 * tools/bpf/docs/ivh_scoped_halt_ipi_mechanism2_plan_2026-07-23.md
+		 * §7 before assuming this is a universal improvement.
+		 */
+		if (!wait_early && READ_ONCE(ivh_pv_wait_mechanism) == 2)
+			continue;
 
 		/*
 		 * Order pn->state vs pn->locked thusly:
@@ -383,6 +439,13 @@ static void pv_kick_node(struct qspinlock *lock, struct mcs_spinlock *node)
 	 * pv_wait_node(). If OTOH this fails, the vCPU was running and will
 	 * observe its next->locked value and advance itself.
 	 *
+	 * Under IVH mechanism 2 ("scoped halt"), a role-C successor is often
+	 * still VCPU_RUNNING here (it never halted at all -- see the
+	 * wait_early-gated continue in pv_wait_node()), in which case this
+	 * cmpxchg simply fails as the "OTOH" case above already describes: no
+	 * hash, no IPI, the spinning waiter self-observes next->locked. This
+	 * is not a new case, just a more common one under mechanism 2.
+	 *
 	 * Matches with smp_store_mb() and cmpxchg() in pv_wait_node()
 	 *
 	 * The write to next->locked in arch_mcs_spin_unlock_contended()
@@ -406,6 +469,37 @@ static void pv_kick_node(struct qspinlock *lock, struct mcs_spinlock *node)
 	 */
 	WRITE_ONCE(lock->locked, _Q_SLOW_VAL);
 	(void)pv_hash(lock, pn);
+
+	/*
+	 * IVH (sysctl ivh_pv_wait_mechanism != 0, i.e. mechanism 1 or 2): the
+	 * successor is waiting in ivh_pv_wait(&pn->state, VCPU_HALTED)
+	 * (arch/x86/kernel/kvm.c) -- mechanism 1 re-checking pn->state each
+	 * TPAUSE nap, mechanism 2 in a real HLT. The try_cmpxchg_relaxed()
+	 * above just published pn->state == VCPU_HASHED with full-barrier
+	 * ordering (smp_mb__before_atomic() + the RMW), so that write is
+	 * already visible to the successor's next READ_ONCE() before this IPI
+	 * is sent -- the IPI only needs to wake the successor (cut mechanism
+	 * 1's current TPAUSE nap short, or un-halt mechanism 2's HLT), it is
+	 * not what makes the new state visible. Do not move this IPI before
+	 * the cmpxchg: doing so would race the wake against the state write
+	 * and merely waste a wake (successor resumes, still observes
+	 * VCPU_HALTED, re-waits) rather than corrupt anything, but it defeats
+	 * the point of adding it.
+	 *
+	 * Gated on the same cmpxchg that already gates the whole slow path:
+	 * a successor still hot-spinning in pv_wait_node()'s SPIN_THRESHOLD
+	 * loop is VCPU_RUNNING, fails the cmpxchg above, and returns before
+	 * reaching here -- no IPI is sent for fast, uncontended handoffs.
+	 *
+	 * A lost/misdelivered IPI is not a hang: pv_wait_node()'s caller loop
+	 * re-checks node->locked in its own for(;;) regardless of how (or
+	 * whether) ivh_pv_wait() returned. Mechanism 1's ivh_pv_wait() always
+	 * returns by IVH_PV_ADAPTIVE_TSC (~1 ms) even with zero IPIs; mechanism
+	 * 2's HLT un-halts on the next timer tick at the latest -- so either
+	 * mechanism makes forward progress with no IPI at all.
+	 */
+	if (READ_ONCE(ivh_pv_wait_mechanism))
+		smp_send_reschedule(pn->cpu);
 }
 
 /*
