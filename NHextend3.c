@@ -127,8 +127,26 @@ static __thread struct rseq_sched_state ivh_sched_state __attribute__((aligned(6
  */
 static bool ivh_sched_state_active;
 
+/*
+ * Diagnostic override (NHEXTEND_IVH_NO_SKIP=1, default 0): force every
+ * ivh_cs_enter_checked() to make the authoritative syscall, bypassing the
+ * RSEQ_SCHED_STATE_FLAG_IVH_DANGER local pre-check entirely. This reproduces
+ * the pre-advisory-bit behavior (kernel-54-era binary: every lock attempt
+ * hits the kernel's own fresh capacity/time-left gate) so a run's
+ * round-to-round consistency can be compared with vs without the stale
+ * advisory skip. The danger bit is only refreshed on return-to-userspace
+ * (tick / syscall return), so in a tight ~1ms-CS userspace loop it can be
+ * stale for a whole quantum -- a clear-but-actually-stale bit suppresses
+ * migrations that the authoritative gate would have made, which can collapse
+ * an otherwise-winning round toward baseline (wash) or worse. Set this to 1
+ * to take that variable out.
+ */
+static int ivh_force_syscall;
+
 static inline bool ivh_danger(void)
 {
+        if (ivh_force_syscall)
+                return true;
         if (!ivh_sched_state_active)
                 return true;
         return (ivh_sched_state.state & RSEQ_SCHED_STATE_FLAG_IVH_DANGER) != 0;
@@ -686,6 +704,10 @@ int main (int argc, char **argv)
 
                 if (ls)
                         loop_spin = atoi(ls);
+
+                const char *ns = getenv("NHEXTEND_IVH_NO_SKIP");
+                if (ns && atoi(ns) != 0)
+                        ivh_force_syscall = 1;
         }
 
         while ((ch = getopt(argc, argv, "dwvlnb:")) >= 0) {

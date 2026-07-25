@@ -1117,11 +1117,94 @@ DEFINE_PER_CPU(u64, ivh_pv_wait_calls);		/* surfaced in /proc/ivh_debug */
  */
 unsigned long ivh_pv_wait_mechanism = 0UL;
 
+/*
+ * Forensic tracing for the mechanism==2 wait/kick path. Default OFF (0);
+ * enable live with `sysctl kernel.ivh_pv_wait_trace=1`, disable the same way.
+ * Never touched by the mechanism logic itself, so leaving it 0 costs one
+ * READ_ONCE + branch per call site -- safe to leave compiled in permanently.
+ *
+ * --- Why this exists, and why it is plain printk(KERN_EMERG ...) and not
+ * trace_printk()/ftrace, a custom per-CPU ring buffer, or pstore ---
+ *
+ * This project had exactly one confirmed hard freeze (2026-07-24): mechanism
+ * 2's old code called raw halt() on a CPU that already had RFLAGS.IF=0. Per
+ * the Intel SDM / AMD APM (see the long comment on the mechanism==2 branch
+ * below) a maskable interrupt cannot un-halt a HLT taken with IF=0 -- only
+ * NMI/SMI/INIT/RESET can. That CPU was gone permanently: no more ticks, no
+ * more IPIs serviced, and (because it was holding up an MCS queue) every
+ * other CPU waiting behind it eventually wedged too. journalctl -k -b -1 for
+ * that boot shows total silence from the moment of the freeze -- not even
+ * BUG()/WARN()/soft-lockup/RCU-stall output, because producing any of that
+ * also requires a CPU that can still run code, which by then none could.
+ *
+ * That failure mode is the design constraint: any instrumentation that
+ * depends on *something running later* -- a kthread flushing a buffer, an
+ * irq_work callback, ftrace's deferred drain, a future reschedule -- is
+ * worthless here, because "later" never comes once every CPU is IF=0-halted.
+ * The only work that survives is whatever the instruction stream already
+ * completed *before* the fatal halt() executes.
+ *
+ * printk()'s ring-buffer append (kernel/printk/printk_ringbuffer.c, the
+ * lockless printk_ringbuffer merged in 5.10) is exactly that: a synchronous,
+ * non-blocking reservation+commit into an in-memory buffer done entirely by
+ * the calling CPU, with no dependency on a console driver, another CPU, or
+ * sleeping -- callable from any context including IRQs-disabled and NMI.
+ * Placed on the line immediately before a halt()/safe_halt(), the record is
+ * durably in the ring buffer before that halt executes; there is nothing
+ * left to lose after the store retires, halted-forever CPU or not.
+ *
+ * Getting it OFF the guest then needs exactly one thing: some CPU, at some
+ * point before or during the freeze, still alive long enough for journald to
+ * drain /dev/kmsg (which is fed directly off this same ring buffer) to disk.
+ * This is not a theoretical hope -- it is what already happened in our one
+ * real incident: vcap's own unrelated per-CPU latency dump (plain pr_info,
+ * no special handling at all) shows up cleanly in `journalctl -k -b -1` for
+ * every CPU right up through the exact instant of the freeze (CPU 14's line
+ * printed; CPU 15's never did). printk already survives this precise freeze
+ * mode today, on this kernel/qemu/journald stack, with zero extra effort.
+ * These trace points ride the same, already-proven path.
+ *
+ * Two alternatives were checked and rejected for this specific failure mode:
+ *   - pstore (CONFIG_PSTORE=y) has no backend compiled in on this build
+ *     (CONFIG_PSTORE_RAM and CONFIG_PSTORE_BLK are both unset; runtime
+ *     /sys/module/pstore/parameters/backend reads "(null)") -- it persists
+ *     nothing across the hypervisor's forced reset today. Wiring up a
+ *     ramoops region needs a reserved-memory boot param / QEMU change, out
+ *     of scope for a code-only fix, and unnecessary given the above.
+ *   - The NMI-driven hardlockup detector is compiled in
+ *     (CONFIG_HARDLOCKUP_DETECTOR_PERF=y) but reads 0 at runtime
+ *     (/proc/sys/kernel/nmi_watchdog), almost certainly because this nested/
+ *     cloud KVM guest has no usable vPMU to drive the perf event it needs.
+ *     It is not a safety net here; do not assume it will fire.
+ *
+ * KERN_EMERG, not _INFO/_DEBUG: journald reads /dev/kmsg, which is fed off
+ * the ring buffer regardless of level, so level does not gate whether next
+ * boot's `journalctl -k -b -1` captures the line -- that part is already
+ * satisfied at any level. EMERG is used anyway so these lines (a) are
+ * impossible to miss/grep past among IVH's/vcap's routine _INFO chatter, and
+ * (b) get console_verbose()-style priority for anyone watching a live serial
+ * console at the moment it happens.
+ *
+ * Left OFF by default because mechanism==2's wait path is hot (every
+ * contended lock acquisition that reaches it): tracing every call at high
+ * lock-contention rates can itself perturb timing and flood the log/journal
+ * faster than journald can drain it. Turn on only when actively chasing a
+ * suspected repeat of this failure, not for routine use.
+ */
+unsigned long ivh_pv_wait_trace = 0UL;
+
 #ifdef CONFIG_SYSCTL
 static const struct ctl_table ivh_pv_sysctls[] = {
 	{
 		.procname	= "ivh_pv_wait_mechanism",
 		.data		= &ivh_pv_wait_mechanism,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_pv_wait_trace",
+		.data		= &ivh_pv_wait_trace,
 		.maxlen		= sizeof(unsigned long),
 		.mode		= 0644,
 		.proc_handler	= proc_doulongvec_minmax,
@@ -1135,6 +1218,24 @@ static int __init ivh_pv_sysctl_init(void)
 }
 late_initcall(ivh_pv_sysctl_init);
 #endif /* CONFIG_SYSCTL */
+
+/*
+ * Trace point for the mechanism==2 wait/kick path -- see the long comment on
+ * ivh_pv_wait_trace above for why this is plain printk(KERN_EMERG ...) and
+ * not trace_printk()/ftrace/pstore. No-op (one READ_ONCE + branch) unless
+ * `sysctl kernel.ivh_pv_wait_trace` is nonzero. raw_smp_processor_id() (not
+ * smp_processor_id()) because this fires from contexts -- IRQs disabled,
+ * inside the halt sequence itself -- where the preemption-enabled debug
+ * check smp_processor_id() performs would be a spurious warning, not a bug.
+ */
+#define ivh_pv_trace(fmt, ...)						\
+	do {								\
+		if (unlikely(READ_ONCE(ivh_pv_wait_trace)))		\
+			printk(KERN_EMERG "ivh_trace: cpu=%d mech=%lu irqs_disabled=%d " \
+			       fmt "\n", raw_smp_processor_id(),	\
+			       READ_ONCE(ivh_pv_wait_mechanism),	\
+			       irqs_disabled(), ##__VA_ARGS__);	\
+	} while (0)
 
 static __always_inline void ivh_pv_backoff(void)
 {
@@ -1241,17 +1342,56 @@ static void ivh_pv_wait(u8 *ptr, u8 val)
 	 * and only then halt; safe_halt()'s sti;hlt is atomic (one-instruction
 	 * sti interrupt shadow), so a kick landing between the re-check and the
 	 * halt is delivered right after the hlt begins and un-halts us -- it
-	 * cannot be lost. In the plain halt() (already-irqs-disabled) branch the
-	 * pending IPI un-halts the CPU even though IF=0 (HLT resumes on any
-	 * pending interrupt regardless of the IF flag; the interrupt simply
-	 * stays pending until IRQs are re-enabled) -- so no hang there either.
+	 * cannot be lost.
 	 *
-	 * Backstop if the IPI is ever lost/misdelivered: a halted CPU still
-	 * un-halts on the next timer tick (HLT participates in the normal
-	 * interrupt/tick infrastructure), whereupon the PV slowpath's own
-	 * for(;;) re-checks node->locked / lock->locked and retries. That bound
-	 * (one tick) is tighter and more robust than mechanism==1's explicit
-	 * IVH_PV_ADAPTIVE_TSC deadline.
+	 * *** DO NOT halt() here when IRQs are ALREADY disabled. ***
+	 *
+	 * An earlier revision of this branch mirrored the mechanism==0 sequence
+	 * byte-for-byte, including its bare halt() for the irqs_disabled() case,
+	 * on the (WRONG) premise that "HLT resumes on any pending interrupt
+	 * regardless of the IF flag".  It does not.  Both Intel SDM Vol.2 ("An
+	 * *enabled* interrupt (including NMI and SMI), a debug exception, the
+	 * BINIT# signal, the INIT# signal, or the RESET# signal will resume
+	 * execution") and the AMD APM ("...or an *unmasked* external interrupt")
+	 * are explicit: with RFLAGS.IF=0 a maskable interrupt is recognized and
+	 * left pending in the IRR but does NOT un-halt the core.  Only
+	 * NMI/SMI/INIT/RESET do.
+	 *
+	 * KVM faithfully reproduces that: a vCPU blocked on a HLT exit is only
+	 * made runnable by kvm_arch_vcpu_runnable() (arch/x86/kvm/x86.c), whose
+	 * maskable-interrupt term is gated on kvm_arch_interrupt_allowed() ->
+	 * vmx_interrupt_blocked()/svm_interrupt_blocked(), i.e. on the *guest's*
+	 * RFLAGS.IF.  With IF=0 the only unconditional wake left in that
+	 * function is vcpu->arch.pv.pv_unhalted -- which is set by exactly one
+	 * thing: the KVM_HC_KICK_CPU hypercall (KVM_FEATURE_PV_UNHALT).
+	 *
+	 * That is precisely the wake vehicle mechanism==2 drops in favour of
+	 * smp_send_reschedule().  A RESCHEDULE_VECTOR IPI is maskable, so it can
+	 * never un-halt an IF=0 HLT.  Neither can the LAPIC timer tick, so the
+	 * "next tick is a backstop" reasoning fails for the same reason.  The
+	 * result was an unrecoverable dead vCPU: it stops answering reschedule,
+	 * TLB-shootdown and smp_call_function IPIs, stops taking the tick (so no
+	 * soft-lockup/RCU-stall report ever prints), keeps its qspinlock queue
+	 * position forever, and drags every CPU that waits on it down with it --
+	 * a silent whole-VM freeze with no oops.  This is exactly why upstream's
+	 * kvm_wait(), which this sequence was copied from, is only ever wired up
+	 * when KVM_FEATURE_PV_UNHALT is present (see kvm_spinlock_init()).
+	 *
+	 * So mechanism 2 halts ONLY on the path where it can guarantee IF=1 at
+	 * the HLT (local_irq_disable + safe_halt's atomic sti;hlt).  When the
+	 * caller already had IRQs off -- which is the common case, since every
+	 * spin_lock_irqsave()/spin_lock_irq()/hardirq-context lock reaches
+	 * queued_spin_lock_slowpath() -> pv_wait() that way -- we must not
+	 * block at all, and instead fall through to the bounded non-halting
+	 * poll below.  TPAUSE *does* wake on a masked pending interrupt (unlike
+	 * HLT), and the deadline bounds it even with zero interrupts, so that
+	 * path is always self-recovering.  Yielding the pCPU is a nice-to-have;
+	 * an unwakeable vCPU is fatal.
+	 *
+	 * Backstop for the safe_halt() path if the IPI is ever lost or
+	 * misdelivered: there IF really is 1, so the next timer tick un-halts
+	 * us, whereupon the PV slowpath's own for(;;) re-checks node->locked /
+	 * lock->locked and retries.
 	 *
 	 * "Scoped halt" (2026-07-23): this branch itself is unchanged, but for
 	 * a role-C queued MCS waiter (kernel/locking/qspinlock_paravirt.h's
@@ -1272,19 +1412,25 @@ static void ivh_pv_wait(u8 *ptr, u8 val)
 	 * contention for a role-C waiter -- it degrades to native qspinlock
 	 * spin in that case, not to mechanism 0's unconditional halt.
 	 */
-	if (READ_ONCE(ivh_pv_wait_mechanism) == 2) {
-		if (irqs_disabled()) {
-			if (READ_ONCE(*ptr) == val)
-				halt();
+	if (READ_ONCE(ivh_pv_wait_mechanism) == 2 && !irqs_disabled()) {
+		local_irq_disable();
+		if (READ_ONCE(*ptr) == val) {
+			ivh_pv_trace("mech2 HALT enter (safe_halt, IF=1 at hlt)");
+			safe_halt();		/* sti;hlt -- HLT taken with IF=1 */
+			ivh_pv_trace("mech2 HALT exit (woke)");
 		} else {
-			local_irq_disable();
-			if (READ_ONCE(*ptr) == val)
-				safe_halt();
-			else
-				local_irq_enable();
+			ivh_pv_trace("mech2 no-halt (condition cleared before halt)");
+			local_irq_enable();
 		}
 		return;
 	}
+	/*
+	 * mechanism==2 with IRQs already disabled by an outer context falls
+	 * through to the bounded poll below on purpose: see the IF=0 HLT
+	 * discussion above.  Never halt() here.
+	 */
+	if (unlikely(READ_ONCE(ivh_pv_wait_mechanism) == 2))
+		ivh_pv_trace("mech2 FALLTHROUGH to bounded poll (irqs already disabled on entry)");
 
 	/*
 	 * sysctl ON: IVH's own non-hypervisor-cooperative substitute. Bounded,
@@ -1355,9 +1501,27 @@ static void ivh_pv_kick(int cpu)
 	 * A lost or spurious IPI is not a hang: pv_wait_head_or_lock()'s
 	 * outer for(;;) always re-attempts the trylock/hash dance on return
 	 * from pv_wait(). Mechanism 1's ivh_pv_wait() always returns by
-	 * IVH_PV_ADAPTIVE_TSC; mechanism 2's HLT un-halts on the next timer
-	 * tick at the latest — either way, no wake is required for progress.
+	 * IVH_PV_ADAPTIVE_TSC; mechanism 2's IF=1 safe_halt() un-halts on the
+	 * next timer tick at the latest — either way, no wake is required for
+	 * progress.
+	 *
+	 * The hypercall kick is issued IN ADDITION to the IPI (never instead of
+	 * it) because the sysctl is live-toggleable: a waiter that went to sleep
+	 * while the mechanism was 0 is parked in a bare halt() with RFLAGS.IF=0
+	 * (upstream's sequence, above), and *only* KVM_HC_KICK_CPU's pv_unhalted
+	 * can wake that — a maskable RESCHEDULE_VECTOR IPI provably cannot (see
+	 * ivh_pv_wait()'s mechanism==2 comment). Without this, merely writing a
+	 * new value to ivh_pv_wait_mechanism on a busy system strands every
+	 * currently-halted waiter and freezes the VM. Kicking an already-running
+	 * vCPU is harmless (upstream relies on the same property), and this is
+	 * the PV slow path, not the fast path.
 	 */
+	if (kvm_para_has_feature(KVM_FEATURE_PV_UNHALT)) {
+		ivh_pv_trace("KICK target_cpu=%d via hypercall (PV_UNHALT)", cpu);
+		ivh_pv_hypercall_kick(cpu);
+	}
+
+	ivh_pv_trace("KICK target_cpu=%d via smp_send_reschedule (RESCHEDULE_VECTOR IPI)", cpu);
 	smp_send_reschedule(cpu);
 }
 

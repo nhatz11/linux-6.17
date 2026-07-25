@@ -76,6 +76,14 @@ static inline bool vcpu_is_preempted(long cpu)
  *   1 - IVH's own non-hypervisor-cooperative substitute: TPAUSE-based
  *       backoff (never halts, never issues a wake hypercall) plus the
  *       steal-bit-gated early bailout in pv_wait_early().
+ *   2 - "scoped halt + IPI wake": a real, host-visible HLT yield woken by
+ *       smp_send_reschedule(), entered only when pv_wait_early() says the
+ *       thing we are queued behind is genuinely not running.  NOTE: a
+ *       maskable IPI cannot un-halt a HLT taken with RFLAGS.IF=0, so this
+ *       mode halts ONLY via safe_halt() on the IRQs-were-enabled path; a
+ *       waiter that arrives with IRQs already off degrades to mechanism 1's
+ *       bounded poll instead.  See ivh_pv_wait() in arch/x86/kernel/kvm.c —
+ *       do not "restore symmetry" with mechanism 0's bare halt() there.
  *
  * This only ever branches inside the already-registered, permanently
  * installed ivh_pv_wait()/ivh_pv_kick() callbacks (arch/x86/kernel/kvm.c)
