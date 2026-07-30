@@ -23,7 +23,26 @@
 #include <linux/export.h>
 #include <linux/sched.h>
 #include <linux/sched/clock.h>
+#include <linux/log2.h>
 #include <linux/bpf_sched.h>
+
+/*
+ * IVH critical-section stamp (Build 1, tools/bpf/docs/
+ * ivh_tsc_full_redesign_build_plan_2026-07-29.md sec 3.2).
+ *
+ * The storage, the knobs and the counters all live in arch/x86/kernel/kvm.c
+ * inside its CONFIG_PARAVIRT_SPINLOCKS block, which is the same home the TSC
+ * heartbeat's counters already use and the same guard /proc/ivh_debug already
+ * reads them under.  This file, by contrast, is built on every SMP
+ * architecture, so the include and every use of it is guarded and the
+ * non-x86/non-KVM build gets no-op stubs -- the same "arch may override"
+ * shape kernel/sched/sched.h already applies to ivh_tsc_beat_publish().
+ */
+#if defined(CONFIG_X86) && defined(CONFIG_KVM_GUEST) && \
+    defined(CONFIG_PARAVIRT_SPINLOCKS)
+#include <asm/ivh_tsc_beat.h>
+#define IVH_HAVE_CS_BEAT 1
+#endif
 
 /*
  * cs_enter / cs_exit — helpers called around lock_depth transitions.
@@ -73,6 +92,80 @@ DEFINE_PER_CPU(u64, ivh_obs_total_holds);
 DEFINE_PER_CPU(u64, ivh_obs_stolen_holds);
 EXPORT_PER_CPU_SYMBOL_GPL(ivh_obs_total_holds);
 EXPORT_PER_CPU_SYMBOL_GPL(ivh_obs_stolen_holds);
+
+/*
+ * Observe-only timing stats, same gate (ivh_observe) and same posture as the
+ * hold counters above -- always compiled, never sysctl-gated, fed regardless
+ * of migration eligibility. Two halves of the same story, so ivh_exec -v can
+ * show what a mechanism actually changed:
+ *
+ *   ivh_obs_cs_time_total_ns  - time SPENT HOLDING a raw spinlock, summed
+ *     over outermost holds. Denominator is ivh_obs_total_holds (every
+ *     observed hold contributes, contended or not). Fed from cs_exit()
+ *     below, reusing the delta cumulative_cs_time already computes -- no
+ *     extra sched_clock() read.
+ *   ivh_obs_wait_total_ns     - time spent WAITING to acquire, summed over
+ *     contended acquisitions only. Fed from the qspinlock slowpath
+ *     (kernel/locking/qspinlock.c), which is where genuine contention is
+ *     first observable; its own denominator is ivh_obs_wait_events, NOT
+ *     ivh_obs_total_holds -- see the comment there for why the uncontended
+ *     fast path is excluded from the average rather than counted as zero.
+ *
+ * Defined here rather than in qspinlock.c so all five ivh_obs_* counters
+ * live together and are declared as one group in linux/bpf_sched.h;
+ * qspinlock.c is also conditional on CONFIG_QUEUED_SPINLOCKS, this file is
+ * not, and fair.c's /proc/ivh_debug reader is unconditional.
+ */
+DEFINE_PER_CPU(u64, ivh_obs_cs_time_total_ns);
+DEFINE_PER_CPU(u64, ivh_obs_wait_total_ns);
+DEFINE_PER_CPU(u64, ivh_obs_wait_events);
+EXPORT_PER_CPU_SYMBOL_GPL(ivh_obs_cs_time_total_ns);
+EXPORT_PER_CPU_SYMBOL_GPL(ivh_obs_wait_total_ns);
+EXPORT_PER_CPU_SYMBOL_GPL(ivh_obs_wait_events);
+
+/*
+ * Observe-only CS-hold-time DISTRIBUTION, same gate (ivh_observe), same feed
+ * site (cs_exit()) and same reused cs_ns delta as ivh_obs_cs_time_total_ns
+ * above -- no second sched_clock() read.
+ *
+ * Why a histogram at all: a running sum+count can only ever produce a mean,
+ * and the mean is exactly the wrong statistic here. Real workloads
+ * (hackbench/ebizzy/dbench) average 120-295ns per hold, but the holds that
+ * matter to IVH are the ones caught by host steal, which run three or more
+ * orders of magnitude longer (IVH_HOT_STEAL_FLOOR_NS alone is 100us). Those
+ * are a fraction of a percent of holds, so they are invisible in the average
+ * and only show up in the tail. p90/p95 need the shape of the distribution,
+ * not its first moment.
+ *
+ * Why log2 bucketing: it is the cheapest possible way to bin a duration in a
+ * hot path -- ilog2() on x86 is a single BSR/LZCNT, no division, no floating
+ * point, no per-sample storage, and the fixed 32-entry array means the whole
+ * thing is O(1) space per CPU. The cost is resolution: a percentile can only
+ * be reported as the power-of-2 RANGE that contains it, never an exact
+ * nanosecond value. That approximation is standard and is what every
+ * histogram-based percentile carries (Prometheus histogram_quantile, HDR
+ * histogram, bpftrace's hist()); ivh_exec -v states it in its output.
+ *
+ * Bucket layout, IVH_OBS_CS_HIST_BUCKETS entries, index i:
+ *   i == 0                : 0-1 ns       (ilog2(1) == 0, and cs_ns == 0 is
+ *                                         folded in here -- see cs_exit())
+ *   0 < i < 31            : 2^i .. 2^(i+1)-1 ns
+ *   i == 31 (top bucket)  : >= 2^31 ns (~2.1s), SATURATING -- anything
+ *                           longer lands here rather than running off the
+ *                           end of the array
+ * So bucket 23 is 8.4ms-16.7ms: 32 buckets covers nanoseconds through
+ * multi-second holds, which is well past both the ~300ns common case and the
+ * 100us steal floor, with room for genuine pathological outliers (a hold that
+ * spans several host scheduling quanta) instead of piling them into a
+ * meaningless "overflow" count.
+ *
+ * Kernel side exposes the RAW per-bucket counts only (/proc/ivh_debug, see
+ * fair.c); walking the cumulative distribution to find p90/p95 is done in
+ * userspace by ivh_exec.c, consistent with how the existing averages are
+ * computed there from raw sums rather than in the kernel.
+ */
+DEFINE_PER_CPU(u64, ivh_obs_cs_hist[IVH_OBS_CS_HIST_BUCKETS]);
+EXPORT_PER_CPU_SYMBOL_GPL(ivh_obs_cs_hist);
 
 /*
  * ivh_hot_note_wait_event - per-task contended-wait EWMA feed, called from
@@ -272,9 +365,51 @@ static __always_inline void ivh_pre_lock(raw_spinlock_t *lock)
 	bpf_sched_pre_lock_migrate();
 }
 
-static __always_inline void cs_enter(void)
+/*
+ * cs_enter()/cs_exit() take the lock pointer as of Build 1 (build plan sec
+ * 3.2.2).  All ten wrapper call sites already have `lock` in scope, so this
+ * costs nothing at any of them, and it is what makes the pointer-matched
+ * stamp clear below possible at all -- see task_struct::cs_beat_lock in
+ * <linux/sched.h> for the _raw_spin_unlock_bh() ordering hole it closes.
+ * The argument is unused when the CS stamp is not compiled in.
+ */
+static __always_inline void cs_enter(raw_spinlock_t *lock)
 {
 	if (current->lock_depth == 1) {
+#ifdef IVH_HAVE_CS_BEAT
+		/*
+		 * Publish this CPU's CS stamp for the whole outermost hold.
+		 *
+		 * Gated on ivh_cs_preempt_src so the default build path is
+		 * bit-for-bit unchanged: at src == 0 this is one READ_ONCE of a
+		 * read-mostly global and one predicted branch, and no rdtsc.
+		 *
+		 * PLACED HERE DELIBERATELY, ACCEPTING FOUR KNOWN LIMITATIONS.
+		 * cs_enter() runs only at lock_depth == 1 (outermost holds
+		 * only), only from !in_interrupt() call sites, and only for
+		 * IVH-eligible or observed tasks; and _raw_spin_unlock_bh()
+		 * clears late.  For holder IDENTITY all four are disqualifying
+		 * and that is why identity lives at the qspinlock layer instead
+		 * (<linux/ivh_lock_holder.h>).  For the STAMP, three of the four
+		 * are merely coverage gaps: an unstamped holder reads
+		 * stamp == 0, which ivh_cs_age() turns into "not in a CS" and
+		 * every consumer turns into "don't act" -- the safe direction.
+		 * Only the fourth is a live wrong answer, and the pointer match
+		 * in cs_exit() is what neutralises it.
+		 *
+		 * NOTE the eligibility gate below is deliberately NOT applied
+		 * to the stamp.  The CPU whose hold a remote queue head needs
+		 * to reason about is very often running ineligible code, and a
+		 * stamp that only exists for IVH-managed tasks would answer
+		 * "not in a critical section" for most of the kernel's real
+		 * holds -- a systematically false negative rather than a gap.
+		 */
+		if (unlikely(READ_ONCE(ivh_cs_preempt_src))) {
+			ivh_cs_beat_publish();
+			current->cs_beat_lock = lock;
+			this_cpu_inc(ivh_cs_publishes);
+		}
+#endif
 		current->cs_start_ts = sched_clock();
 		current->cs_wall_start_ts = current->cs_start_ts;
 		/* 2026-07-20: PF_IVH_ELIGIBLE no longer consulted here --
@@ -289,12 +424,73 @@ static __always_inline void cs_enter(void)
 	}
 }
 
-static __always_inline void cs_exit(void)
+static __always_inline void cs_exit(raw_spinlock_t *lock)
 {
 	if (current->lock_depth == 0 && current->cs_start_ts) {
 		u64 now = sched_clock();
+		/* Hold length of this outermost CS, computed once and reused by
+		 * both cumulative_cs_time and the observe-only sum below. */
+		u64 cs_ns = now - current->cs_start_ts;
+
+#ifdef IVH_HAVE_CS_BEAT
+		if (unlikely(READ_ONCE(ivh_cs_preempt_src))) {
+			unsigned int bucket;
+
+			/*
+			 * Clear ONLY IF THE RECORDED LOCK STILL MATCHES.
+			 *
+			 * _raw_spin_unlock_bh() runs this after the real
+			 * unlock (in-tree comment at that call site), so by the
+			 * time we get here this CPU may already be inside a
+			 * different critical section that has published its own
+			 * stamp over ours.  An unconditional clear would wipe
+			 * that live stamp and make a genuinely held lock read
+			 * as "nobody is in a critical section" -- a live wrong
+			 * answer, not a stale one, and precisely the failure
+			 * mode a remote queue head cannot detect.
+			 *
+			 * ivh_cs_clear_mismatch is the direct measurement of
+			 * how often that ordering actually bites.  It has never
+			 * been measured in this tree; if it turns out to be
+			 * common, that is a Build 2 finding about where the
+			 * stamp belongs, not a Build 1 failure.
+			 */
+			if (current->cs_beat_lock == (void *)lock) {
+				ivh_cs_beat_clear();
+				current->cs_beat_lock = NULL;
+			} else {
+				this_cpu_inc(ivh_cs_clear_mismatch);
+			}
+
+			/*
+			 * The POPULATION-CORRECT CS-hold-time distribution, and
+			 * the reason it is a second histogram rather than a
+			 * reuse of ivh_obs_cs_hist below.
+			 *
+			 * ivh_obs_cs_hist is incremented only under
+			 * current->ivh_observe, i.e. only for tasks launched
+			 * under `ivh_exec -v`.  Calibrating the CS-stamp
+			 * threshold from its p99.9 would therefore calibrate
+			 * against the BENCHMARK's critical-section distribution
+			 * rather than the kernel's -- which is exactly the
+			 * mistake this histogram exists to prevent.  This one
+			 * is fed from every outermost release that gets here,
+			 * gated only on ivh_cs_preempt_src.
+			 *
+			 * Same log2 bucketing, same clamping at both ends, same
+			 * "raw counts only, percentiles are computed in
+			 * userspace off a before/after delta" contract as
+			 * ivh_obs_cs_hist: a lifetime percentile computed in
+			 * the kernel would be wrong for a scoped run.
+			 */
+			bucket = cs_ns ? ilog2(cs_ns) : 0;
+			if (bucket >= IVH_CS_HOLD_HIST_BUCKETS)
+				bucket = IVH_CS_HOLD_HIST_BUCKETS - 1;
+			this_cpu_inc(ivh_cs_hold_hist[bucket]);
+		}
+#endif
 		current->last_cs_ns = now - current->cs_wall_start_ts;
-		current->cumulative_cs_time += now - current->cs_start_ts;
+		current->cumulative_cs_time += cs_ns;
 		current->cs_start_ts = 0;
 		current->cs_wall_start_ts = 0;
 		/*
@@ -332,9 +528,39 @@ static __always_inline void cs_exit(void)
 			 * concurrent IVH-eligible traffic.
 			 */
 			if (current->ivh_observe) {
+				unsigned int bucket;
+
 				this_cpu_inc(ivh_obs_total_holds);
 				if (stolen)
 					this_cpu_inc(ivh_obs_stolen_holds);
+				/* Every observed hold contributes, contended or
+				 * not -- total_holds is the matching denominator. */
+				this_cpu_add(ivh_obs_cs_time_total_ns, cs_ns);
+				/*
+				 * Same hold, same cs_ns, binned by magnitude so
+				 * ivh_exec -v can report p90/p95 and not just the
+				 * mean (see IVH_OBS_CS_HIST_BUCKETS above). Both
+				 * ends are clamped explicitly rather than trusted:
+				 *   cs_ns == 0 -- ilog2(0) is undefined (fls64(0)
+				 *     - 1 == -1 here), which would index the array
+				 *     at [-1]. A zero-length hold is real (two
+				 *     sched_clock() reads inside one coarse tick)
+				 *     and belongs at the bottom, so fold it into
+				 *     bucket 0 with the 1ns holds.
+				 *   ilog2(cs_ns) >= BUCKETS -- saturate into the
+				 *     top bucket. Every hold is counted exactly
+				 *     once, so the bucket sum stays equal to
+				 *     total_holds and userspace's percentile walk
+				 *     has a trustworthy denominator.
+				 * Preempted and non-preempted holds go into the
+				 * same histogram on purpose: the whole point is
+				 * where the combined tail sits, so the stolen
+				 * holds are not split out here.
+				 */
+				bucket = cs_ns ? ilog2(cs_ns) : 0;
+				if (bucket >= IVH_OBS_CS_HIST_BUCKETS)
+					bucket = IVH_OBS_CS_HIST_BUCKETS - 1;
+				this_cpu_inc(ivh_obs_cs_hist[bucket]);
 			}
 		}
 	}
@@ -456,7 +682,7 @@ noinline int __lockfunc _raw_spin_trylock(raw_spinlock_t *lock)
 	int ret = __raw_spin_trylock(lock);
 	if (ret && !in_interrupt()) {
 		current->lock_depth++;
-		cs_enter();
+		cs_enter(lock);
 	}
 	return ret;
 }
@@ -470,7 +696,7 @@ noinline int __lockfunc _raw_spin_trylock_bh(raw_spinlock_t *lock)
 	int ret = __raw_spin_trylock_bh(lock);
 	if (ret && track) {
 		current->lock_depth++;
-		cs_enter();
+		cs_enter(lock);
 	}
 	return ret;
 }
@@ -484,7 +710,7 @@ noinline void __lockfunc _raw_spin_lock(raw_spinlock_t *lock)
 	__raw_spin_lock(lock);
 	if (!in_interrupt()) {
 		current->lock_depth++;
-		cs_enter();
+		cs_enter(lock);
 	}
 }
 EXPORT_SYMBOL(_raw_spin_lock);
@@ -499,7 +725,7 @@ noinline unsigned long __lockfunc _raw_spin_lock_irqsave(raw_spinlock_t *lock)
 	flags = __raw_spin_lock_irqsave(lock);
 	if (!in_interrupt()) {
 		current->lock_depth++;
-		cs_enter();
+		cs_enter(lock);
 	}
 	return flags;
 }
@@ -513,7 +739,7 @@ noinline void __lockfunc _raw_spin_lock_irq(raw_spinlock_t *lock)
 	__raw_spin_lock_irq(lock);
 	if (!in_interrupt()) {
 		current->lock_depth++;
-		cs_enter();
+		cs_enter(lock);
 	}
 }
 EXPORT_SYMBOL(_raw_spin_lock_irq);
@@ -527,7 +753,7 @@ noinline void __lockfunc _raw_spin_lock_bh(raw_spinlock_t *lock)
 	__raw_spin_lock_bh(lock);
 	if (track) {
 		current->lock_depth++;
-		cs_enter();
+		cs_enter(lock);
 	}
 }
 EXPORT_SYMBOL(_raw_spin_lock_bh);
@@ -538,7 +764,7 @@ noinline void __lockfunc _raw_spin_unlock(raw_spinlock_t *lock)
 {
 	if (!in_interrupt()) {
 		current->lock_depth--;
-		cs_exit();
+		cs_exit(lock);
 	}
 	__raw_spin_unlock(lock);
 }
@@ -550,7 +776,7 @@ noinline void __lockfunc _raw_spin_unlock_irqrestore(raw_spinlock_t *lock, unsig
 {
 	if (!in_interrupt()) {
 		current->lock_depth--;
-		cs_exit();
+		cs_exit(lock);
 	}
 	__raw_spin_unlock_irqrestore(lock, flags);
 }
@@ -562,7 +788,7 @@ noinline void __lockfunc _raw_spin_unlock_irq(raw_spinlock_t *lock)
 {
 	if (!in_interrupt()) {
 		current->lock_depth--;
-		cs_exit();
+		cs_exit(lock);
 	}
 	__raw_spin_unlock_irq(lock);
 }
@@ -576,7 +802,7 @@ noinline void __lockfunc _raw_spin_unlock_bh(raw_spinlock_t *lock)
 	/* decrement after unlock; cs_exit measures slightly past actual release */
 	if (!in_interrupt()) {
 		current->lock_depth--;
-		cs_exit();
+		cs_exit(lock);
 	}
 }
 EXPORT_SYMBOL(_raw_spin_unlock_bh);

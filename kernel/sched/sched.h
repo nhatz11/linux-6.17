@@ -113,12 +113,91 @@ extern int sched_rr_timeslice;
 extern void set_custom_capacity(unsigned long custom_capacity, int cpu);
 extern void get_steal_and_preemptions(int cpunum, u64 *preempt, u64 *steals_time);
 extern void get_max_latency(int cpunum, u64 *max_latency);
+/* IVH inferred (REF_TSC-derived) steal time -- the side-by-side comparator
+ * feed for /proc/vcap_steal_compare. Deliberately a SEPARATE accessor from
+ * get_steal_and_preemptions() above, whose wire format is frozen. */
+extern void get_inferred_steal(int cpunum, u64 *inferred, u64 *samples, u64 *skipped);
+extern void get_real_steal(int cpunum, u64 *steal);
+extern void ivh_ref_accumulate(void);
+/*
+ * IVH Part C: the tick-only stamp and the vcap-free capacity number.  Called
+ * from account_process_tick() (kernel/sched/cputime.c) immediately after
+ * ivh_ref_accumulate(), and implemented in kernel/sched/core.c beside it for
+ * the same reason -- both are tick-driven signal producers that want the
+ * sysctl globals and the rq block in scope.
+ */
+extern void ivh_vact_tick(void);
+/* Side-by-side comparator feed for the module's /proc/ivh_vact_compare.  Ships
+ * in Build 1 even though nothing in-tree calls it, because adding a kernel
+ * accessor later costs a build and a reboot while reformatting in the module
+ * costs an rmmod/insmod -- the same lesson get_inferred_steal() records. */
+extern void get_vact_compare(int cpunum, u64 *last_preempt_ns, u64 *last_active_ns,
+			     u64 *preemptions, unsigned long *capacity,
+			     u64 *jumps, u64 *idle_explained);
 extern void set_avg_latency(int cpunum, u64 avg_latency);
 extern void set_ewma_act_ns(int cpu, u64 ewma_act_ns);
 extern int  get_average_capacity_all(void);
 extern void set_average_capacity_all(int av_capacity);
 extern void reset_max_latency(u64 max_latency);
 extern int  is_cpu_preempted(int cpunum);
+
+/*
+ * IVH per-CPU TSC heartbeat.  The real implementation is x86-only (it is
+ * built on rdtsc()); everything else gets the no-op below so that the generic
+ * tick path in kernel/sched/cputime.c stays buildable.  Standard "arch may
+ * override" idiom: the arch header #defines its own function name.
+ */
+#ifdef CONFIG_X86
+#include <asm/ivh_tsc_beat.h>
+#endif
+#ifndef ivh_tsc_beat_publish
+static inline void ivh_tsc_beat_publish(void) { }
+#endif
+/*
+ * Part C's raw-TSC primitives, same "arch may override" idiom.  Off x86 the
+ * whole tick-only IVH stamp degenerates harmlessly: ivh_raw_tsc() is always 0,
+ * so every tick sees old == 0, takes the unseeded branch, and never detects a
+ * jump.  ivh_vact_capacity therefore stays at its initial 1024 ("perfectly
+ * healthy"), which is the value that changes no decision -- and in any case
+ * both consuming sysctls default to 0, so nothing reads it.
+ */
+#ifndef ivh_raw_tsc
+static inline u64 ivh_raw_tsc(void) { return 0; }
+#endif
+#ifndef ivh_tsc_cycles_to_ns
+static inline u64 ivh_tsc_cycles_to_ns(u64 cycles) { return 0; }
+#endif
+#ifndef ivh_tsc_ns_to_cycles
+static inline u64 ivh_tsc_ns_to_cycles(u64 ns) { return 0; }
+#endif
+/*
+ * IVH lock-path non-idle halt accounting (see <asm/ivh_tsc_beat.h> for the
+ * full root-cause comment).  Same "arch may override" idiom as the heartbeat:
+ * the counters are raw TSC cycles, so off x86 the correction is a no-op and
+ * ivh_ref_accumulate() is a no-op too.
+ */
+#ifndef ivh_lock_halt_begin
+static inline void ivh_lock_halt_begin(bool poll) { }
+static inline void ivh_lock_halt_end(void) { }
+static inline void ivh_lock_halt_flush(u64 now) { }
+#endif
+/*
+ * ivh_ref_halt_correct -- how much of the lock path's own halted time
+ * ivh_ref_accumulate() subtracts before booking the remainder as steal:
+ *   0 (default) = subtract nothing; behavior is bit-identical to before the
+ *                 correction existed, but the counters are still collected so
+ *                 /proc/ivh_debug shows how much phantom steal this
+ *                 configuration is producing.
+ *   1           = subtract pv_wait()'s real HLT time only.
+ *   2           = subtract HLT *and* the bounded TPAUSE/PAUSE poll.
+ * ivh_ref_trace -- 0 = off; N = one KERN_INFO line per CPU every N accumulate
+ *                 samples (i.e. every N ticks that produced a usable delta).
+ */
+extern unsigned long ivh_ref_halt_correct;
+extern unsigned long ivh_ref_carry;
+extern unsigned long ivh_ref_trace;
+extern unsigned long ivh_ref_steal_enabled;
+extern unsigned long ivh_steal_source;
 extern int  migrate_task_to_async_fair(void *data);
 extern void ivh_scan_stuck_waiters(void); /* EXPERIMENT: bare-schedule() hang diagnosis, 2026-06-30 */
 
@@ -1372,6 +1451,114 @@ struct rq {
     u64                     preemptions;
     u64                     max_latency;
     u64                     avg_latency;
+
+    /*
+     * IVH inferred steal time (Plan 2, tools/bpf/docs/
+     * ivh_tsc_heartbeat_refcycles_build_plans_2026-07-26.md sec 3):
+     * (TSC delta) - (REF_TSC delta) - (idle delta) = time this vCPU was
+     * neither executing nor voluntarily halted, i.e. stolen -- computed
+     * entirely in-guest, with no dependence on the kvm_steal_time struct.
+     *
+     * Written only by ivh_ref_accumulate() on the OWNING CPU from the
+     * scheduler tick, read remotely at ~1 Hz by get_inferred_steal() /
+     * get_steal_and_preemptions().  Six u64 in struct rq rather than a
+     * separate percpu struct precisely because that access pattern is
+     * identical to preemptions/max_latency right above -- unlike Plan 1's
+     * heartbeat, which is written per spin iteration and therefore had to
+     * get its own cacheline.
+     */
+    u64                     ivh_ref_prev_tsc;      /* rdtsc() at last accumulate; 0 == unseeded */
+    u64                     ivh_ref_prev_ref;      /* REF_TSC counter at last accumulate */
+    u64                     ivh_ref_prev_idle_ns;  /* idle+iowait ns at last accumulate */
+    u64                     ivh_ref_steal_ns;      /* THE OUTPUT: cumulative inferred steal, monotonic */
+    u64                     ivh_ref_samples;       /* accumulates that produced a usable delta */
+    u64                     ivh_ref_skipped;       /* accumulates that bailed (-EBUSY, unseeded, ...) */
+
+    /*
+     * Lock-path non-idle halt correction (2026-07-27 root cause; see the long
+     * comment on struct ivh_lock_halt in <asm/ivh_tsc_beat.h>).  The prev_*
+     * pair is delta state exactly like ivh_ref_prev_tsc/_ref/_idle_ns above
+     * and MUST be re-seeded by ivh_ref_reset_seed() on the same three paths.
+     * The _ns pair is cumulative observability, collected regardless of
+     * ivh_ref_halt_correct so the size of the phantom-steal term is visible
+     * without changing behavior.
+     */
+    u64                     ivh_ref_prev_hlt_c;    /* per-CPU cumulative HLT cycles at last accumulate */
+    u64                     ivh_ref_prev_poll_c;   /* per-CPU cumulative poll cycles at last accumulate */
+    u64                     ivh_ref_hlt_ns;        /* cumulative lock-path HLT, ns */
+    u64                     ivh_ref_poll_ns;       /* cumulative lock-path bounded poll, ns */
+    s64                     ivh_ref_debt_c;        /* ivh_ref_carry: signed residual, <= 0, floored at one interval */
+
+    /*
+     * ---------------------------------------------------------------------
+     * IVH Part C: the TICK-ONLY stamp and the vcap-free capacity number
+     * (Build 1, tools/bpf/docs/
+     * ivh_tsc_full_redesign_build_plan_2026-07-29.md sec 3.5).
+     * ---------------------------------------------------------------------
+     *
+     * WHY A DEDICATED STAMP AND NOT struct ivh_tsc_beat.  An earlier design
+     * note proposed detecting preemption EVENTS by checking the age of the
+     * shared heartbeat at its own tick publish site.  That cannot work: the
+     * heartbeat is not tick-only.  It is also written from pv_init_node(),
+     * from both qspinlock spin loops, and from three halt-exit sites.  A
+     * stamp refreshed from the spin loops has no gap to detect -- the very
+     * coverage that makes it a good PREDECESSOR LIVENESS signal destroys it
+     * as a PREEMPTION EVENT detector.  This stamp is written from exactly one
+     * place, account_process_tick(), so its only sources of gaps are genuine
+     * host preemption and genuine guest idle, which is precisely the property
+     * the algorithm needs.
+     *
+     * WHY NO HALT CORRECTION IS NEEDED, which is Part C's structural
+     * advantage over reusing rq->ivh_ref_steal_ns: a lock-path safe_halt()
+     * runs with IF=1, so the LAPIC timer still fires during it and
+     * account_process_tick() runs and republishes the stamp.  There is no gap
+     * for the jump detector to find and therefore nothing analogous to
+     * ivh_ref_halt_correct to build.  That is a claim to CHECK, not assume --
+     * ivh_vact_jumps should not correlate with ivh_ref_hlt_ns rising.
+     *
+     * WHY IT IS HERE AND NOT ON ITS OWN CACHELINE, unlike the heartbeat: this
+     * block is written only by the owning CPU from the tick and read remotely
+     * at low rate, which is the identical access pattern to
+     * preemptions/max_latency a few lines above and the identical reason
+     * ivh_ref_* sits here too.
+     *
+     * EVERYTHING IS RAW TSC CYCLES.  There is no nanosecond variant.  An
+     * earlier planning round compared raw cycles against a nanosecond
+     * sched_clock() value, which is a literal unit-mismatch bug; matching the
+     * heartbeat's units also means the two signals can be read against each
+     * other with nothing in between.  Conversion to ns happens at the point
+     * of use in Gate 2 and in the /proc printer, nowhere else.
+     */
+    u64                     ivh_vact_stamp;           /* rdtsc() at the last TICK publish; 0 == unseeded */
+    u64                     ivh_vact_idle_exit_tsc;   /* rdtsc() beside rq->last_idle_tp in account_idle_time() */
+    u64                     ivh_vact_burst_start_tsc; /* S1: start of the current active burst */
+    u64                     ivh_vact_last_preempt_tsc;/* reproduces rq->last_preemption, in cycles */
+    u64                     ivh_vact_last_active_c;   /* reproduces rq->last_active_time, in cycles */
+    u64                     ivh_vact_preemptions;     /* reproduces rq->preemptions */
+    u64                     ivh_vact_win_start_tsc;   /* tumbling-window start */
+    u64                     ivh_vact_win_used_c;      /* window accumulator: executing */
+    u64                     ivh_vact_win_stolen_c;    /* window accumulator: gone */
+    /*
+     * THE OUTPUT, 0..1024, the rq->cpu_capacity replacement.  Initialised to
+     * 1024 ("perfectly healthy") at rq init rather than 0, because IVH_CAP_FLOOR
+     * is 850 and ivh_capacity_threshold is 1010 against a 1024 scale: a CPU
+     * that has not yet completed a window must not look fully stolen, and the
+     * replacement has to produce numbers on the SAME scale or both thresholds
+     * silently change meaning.  Hence also (used * 1024) / (used + stolen)
+     * rather than any other normalisation.
+     *
+     * Deliberately its own rq field rather than a write into
+     * rq->cpu_capacity_custom: that field only reaches rq->cpu_capacity via
+     * update_cpu_capacity(), which runs at LOAD BALANCE cadence
+     * (sg->sgc->next_update), so a tick-rate number routed through it would
+     * throw away its own resolution.  Writing rq->cpu_capacity directly would
+     * be overwritten on the next balance pass.  A dedicated field also leaves
+     * the vcap path completely untouched and therefore still usable as the
+     * comparator baseline, which the whole of sec 3.8 depends on.
+     */
+    unsigned long           ivh_vact_capacity;
+    u64                     ivh_vact_jumps;           /* diagnostics: gaps attributed to real preemption */
+    u64                     ivh_vact_idle_explained;  /* diagnostics: gaps explained by idle */
 
     struct __call_single_data preempt_migrate;
     u64                       wakeup_stamp;

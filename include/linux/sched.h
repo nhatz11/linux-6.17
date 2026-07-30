@@ -1453,6 +1453,29 @@ struct task_struct {
 	u64				last_cs_ns;
 
 	/*
+	 * cs_beat_lock: the raw_spinlock_t whose outermost hold published this
+	 * CPU's ivh_cs_beat stamp (Build 1, tools/bpf/docs/
+	 * ivh_tsc_full_redesign_build_plan_2026-07-29.md sec 3.2.2).  Written
+	 * only when ivh_cs_preempt_src != 0; NULL otherwise and by default.
+	 *
+	 * It exists to close one specific live-wrong-answer hole, not for
+	 * bookkeeping.  _raw_spin_unlock_bh() (kernel/locking/spinlock.c) runs
+	 * its cs_exit() AFTER the real unlock -- there is an in-tree comment
+	 * saying so -- so between the release and the cs_exit() this CPU may
+	 * already have entered a DIFFERENT critical section.  An unconditional
+	 * stamp clear there would wipe the new hold's stamp and make a genuinely
+	 * held lock read as "nobody is in a critical section".  Clearing only
+	 * when the recorded lock pointer still matches turns that into a no-op,
+	 * and ivh_cs_clear_mismatch counts how often the ordering actually
+	 * bites -- which is a number this project has never had.
+	 *
+	 * A void * rather than raw_spinlock_t * because it is only ever
+	 * compared for identity and never dereferenced, and because
+	 * <linux/sched.h> has no business depending on the spinlock type here.
+	 */
+	void				*cs_beat_lock;
+
+	/*
 	 * Hot Threads per-task contention/preemption classifier (see
 	 * linux/bpf_sched.h, kernel/locking/spinlock.c). Two independent,
 	 * event-driven EWMAs in IVH_HOTLOCK_SCALE fixed point (0..1<<SCALE):

@@ -23,7 +23,34 @@
  * always-compiled cs_enter()/cs_exit() bookkeeping (kernel/locking/
  * spinlock.c), fed for this process because ivh_observe is set on it, not a
  * separate BPF trampoline attached to the whole system's raw-spinlock fast
- * path. (2026-07-20: replaces an earlier BPF-based version of this tool.
+ * path. Alongside that, -v reports the two halves of the timing story --
+ * ivh_obs_cs_time_total_ns (how long locks are HELD, from the same
+ * cs_enter()/cs_exit() pair) and ivh_obs_wait_total_ns/ivh_obs_wait_events
+ * (how long acquisition WAITS, from the qspinlock slowpath,
+ * kernel/locking/qspinlock.c) -- so a run can show whether a mechanism
+ * actually shortened critical sections or contention rather than only moving
+ * host preemption around. Note the two averages have different denominators
+ * on purpose: CS time averages over every observed hold, wait time only over
+ * acquisitions that were actually contended (uncontended fast-path
+ * acquisitions never enter the slowpath and are excluded from the
+ * denominator, not averaged in as zero) -- see the long comment above
+ * ivh_obs_wait_begin() in kernel/locking/qspinlock.c.
+ *
+ * 2026-07-25: -v also reports the TAIL of the CS-hold-time distribution
+ * (p50/p90/p95), read from ivh_obs_cs_hist, the kernel's log2-bucketed
+ * histogram of the very same per-hold cs_ns that feeds cs_time_total_ns
+ * (kernel/locking/spinlock.c). The average alone hides exactly the holds that
+ * matter: real workloads average a couple hundred nanoseconds per hold, but a
+ * hold actually caught by host steal runs past the 100us
+ * IVH_HOT_STEAL_FLOOR_NS -- three orders of magnitude out, at well under 1% of
+ * holds, so it moves the mean essentially not at all and only shows up in the
+ * tail. Preempted and non-preempted holds are mixed in one histogram on
+ * purpose: the question is where the combined worst case sits. The kernel
+ * exposes raw bucket counts only; the cumulative-distribution walk that turns
+ * them into percentiles happens here, off the before/after delta, for the same
+ * reason the averages are computed here rather than read from the kernel's
+ * lifetime *_avg_ns lines. (2026-07-20: replaces
+ * an earlier BPF-based version of this tool.
  * That version's fentry/fexit hooks on the _raw_spin_lock and
  * _raw_spin_unlock family fired for every caller system-wide, inflating a
  * true ~12s hackbench run to ~16-21s, and its shadow per-task depth
@@ -82,8 +109,10 @@ static void usage(const char *argv0)
 {
 	fprintf(stderr,
 		"usage: %s [-v|--stats] [-n|--no-ivh] <prog> [args...]\n"
-		"  -v, --stats    also report host-preemption of the wrapped\n"
-		"                 process's real kernel lock holds on exit\n"
+		"  -v, --stats    also report host-preemption, average CS hold\n"
+		"                 time, average contended-acquisition wait time,\n"
+		"                 and the CS-hold-time tail (p50/p90/p95) for the\n"
+		"                 wrapped process's real kernel lock holds on exit\n"
 		"  -n, --no-ivh   set ivh_exclude -- wrapped process stays IVH-off\n"
 		"                 even if ivh_universal_eligible is on globally. Stats\n"
 		"                 (-v) still work if combined, since they don't\n"
@@ -95,11 +124,74 @@ static void usage(const char *argv0)
 /* Stats mode (/proc/ivh_debug delta)                                  */
 /* ------------------------------------------------------------------ */
 
-static int read_obs_counters(unsigned long long *total, unsigned long long *stolen)
+/* Must match IVH_OBS_CS_HIST_BUCKETS in include/linux/bpf_sched.h. A kernel
+ * with a different bucket count is detected at parse time (the line simply
+ * won't yield this many fields) and degrades like any other missing counter,
+ * rather than silently reporting percentiles off a misaligned axis. */
+#define IVH_OBS_CS_HIST_BUCKETS 32
+
+/* One snapshot of the kernel's observe-only counters. Only the raw totals
+ * are read; averages are computed from the before/after DELTA, never from
+ * the kernel's own *_avg_ns lines (those are lifetime averages, useful when
+ * reading /proc directly but wrong for a scoped run). Same rule applies to
+ * cs_hist: the percentile is computed from the per-bucket delta, so it
+ * describes this run and not the machine's uptime. */
+struct obs_counters {
+	unsigned long long total_holds;
+	unsigned long long stolen_holds;
+	unsigned long long cs_time_ns;
+	unsigned long long wait_events;
+	unsigned long long wait_ns;
+	unsigned long long cs_hist[IVH_OBS_CS_HIST_BUCKETS];
+	int have_timing;	/* 0 on a kernel without the timing counters */
+	int have_hist;		/* 0 on a kernel without ivh_obs_cs_hist */
+};
+
+/* Lower/upper nanosecond bound of log2 bucket b, rendered for printing.
+ * Bucket b covers 2^b .. 2^(b+1)-1 ns, except b == 0 (0-1 ns, which also
+ * absorbs zero-length holds) and the top bucket, which saturates and is
+ * therefore open-ended -- see kernel/locking/spinlock.c. */
+static void hist_bucket_str(int b, char *buf, size_t n)
+{
+	unsigned long long lo = (b == 0) ? 0ULL : 1ULL << b;
+
+	if (b == IVH_OBS_CS_HIST_BUCKETS - 1)
+		snprintf(buf, n, ">= %llu", lo);
+	else
+		snprintf(buf, n, "%llu-%llu", lo, (1ULL << (b + 1)) - 1ULL);
+}
+
+/* Index of the bucket containing the pct'th percentile of a distribution of
+ * `total` samples: walk buckets low to high accumulating counts, stop at the
+ * first bucket whose running total reaches pct% of the whole. Integer-only
+ * (cum * 100 >= total * pct) to avoid a rounding wobble deciding which side
+ * of a boundary a percentile lands on. Returns -1 for an empty histogram. */
+static int hist_percentile_bucket(const unsigned long long *hist,
+				  unsigned long long total, unsigned int pct)
+{
+	unsigned long long cum = 0;
+	int b;
+
+	if (!total)
+		return -1;
+	for (b = 0; b < IVH_OBS_CS_HIST_BUCKETS; b++) {
+		cum += hist[b];
+		if (cum * 100ULL >= total * (unsigned long long)pct)
+			return b;
+	}
+	return IVH_OBS_CS_HIST_BUCKETS - 1;	/* unreachable: cum == total */
+}
+
+static int read_obs_counters(struct obs_counters *c)
 {
 	FILE *f;
-	char line[256];
+	/* Wide enough for the whole ivh_obs_cs_hist line in one fgets(): 32
+	 * u64s at 20 digits plus separators is under 700 bytes. A short buffer
+	 * would split that line and the tail would be re-parsed as a bogus
+	 * record, so this is sized deliberately, not by habit. */
+	char line[1024];
 	int got_total = 0, got_stolen = 0;
+	int got_cs = 0, got_wait_ev = 0, got_wait_ns = 0;
 
 	f = fopen("/proc/ivh_debug", "r");
 	if (!f) {
@@ -107,17 +199,47 @@ static int read_obs_counters(unsigned long long *total, unsigned long long *stol
 		return -1;
 	}
 
-	*total = 0;
-	*stolen = 0;
+	memset(c, 0, sizeof(*c));
 	while (fgets(line, sizeof(line), f)) {
 		unsigned long long v;
 
 		if (sscanf(line, "ivh_obs_total_holds: %llu", &v) == 1) {
-			*total = v;
+			c->total_holds = v;
 			got_total = 1;
 		} else if (sscanf(line, "ivh_obs_stolen_holds: %llu", &v) == 1) {
-			*stolen = v;
+			c->stolen_holds = v;
 			got_stolen = 1;
+		} else if (sscanf(line, "ivh_obs_cs_time_total_ns: %llu", &v) == 1) {
+			c->cs_time_ns = v;
+			got_cs = 1;
+		} else if (sscanf(line, "ivh_obs_wait_events: %llu", &v) == 1) {
+			c->wait_events = v;
+			got_wait_ev = 1;
+		} else if (sscanf(line, "ivh_obs_wait_total_ns: %llu", &v) == 1) {
+			c->wait_ns = v;
+			got_wait_ns = 1;
+		} else if (!strncmp(line, "ivh_obs_cs_hist:", 16)) {
+			/* One line, IVH_OBS_CS_HIST_BUCKETS space-separated
+			 * counts in bucket order. Parsed positionally with
+			 * strtoull rather than sscanf so a kernel printing a
+			 * different number of buckets is caught (have_hist
+			 * stays 0) instead of being read into the wrong bins.
+			 * The preceding "# ivh_obs_cs_hist bucket i = ..."
+			 * comment line documents the boundaries for anyone
+			 * reading /proc by hand; it can't match here because
+			 * of the leading '#'. */
+			char *p = line + 16;
+			int b;
+
+			for (b = 0; b < IVH_OBS_CS_HIST_BUCKETS; b++) {
+				char *end;
+
+				c->cs_hist[b] = strtoull(p, &end, 10);
+				if (end == p)
+					break;
+				p = end;
+			}
+			c->have_hist = (b == IVH_OBS_CS_HIST_BUCKETS);
 		}
 	}
 	fclose(f);
@@ -127,18 +249,21 @@ static int read_obs_counters(unsigned long long *total, unsigned long long *stol
 				"(old kernel?)\n");
 		return -1;
 	}
+	/* Timing counters are newer than the hold counters -- degrade to the
+	 * host-preemption section alone rather than failing outright. */
+	c->have_timing = got_cs && got_wait_ev && got_wait_ns;
 	return 0;
 }
 
 static int run_with_stats(char **cmd, int eligible)
 {
-	unsigned long long total_before, stolen_before;
-	unsigned long long total_after, stolen_after;
+	struct obs_counters before, after;
 	unsigned long long total, stolen;
+	unsigned long long cs_ns, wait_ev, wait_ns;
 	pid_t child;
 	int wstatus;
 
-	if (read_obs_counters(&total_before, &stolen_before))
+	if (read_obs_counters(&before))
 		return 1;
 
 	child = fork();
@@ -172,14 +297,17 @@ static int run_with_stats(char **cmd, int eligible)
 	while (waitpid(child, &wstatus, 0) < 0 && errno == EINTR)
 		;
 
-	if (read_obs_counters(&total_after, &stolen_after)) {
+	if (read_obs_counters(&after)) {
 		/* Still report the workload's own exit status even if we
 		 * can't report stats. */
 		goto done;
 	}
 
-	total = total_after - total_before;
-	stolen = stolen_after - stolen_before;
+	total = after.total_holds - before.total_holds;
+	stolen = after.stolen_holds - before.stolen_holds;
+	cs_ns = after.cs_time_ns - before.cs_time_ns;
+	wait_ev = after.wait_events - before.wait_events;
+	wait_ns = after.wait_ns - before.wait_ns;
 
 	printf("\n");
 	printf("HOST-level steal during real kernel lock holds "
@@ -191,6 +319,103 @@ static int run_with_stats(char **cmd, int eligible)
 	       "IVH_HOT_STEAL_FLOOR_NS)\n");
 	printf("  (global counters, not TGID-scoped -- see source comment "
 	       "if anything else was concurrently eligible/observed)\n");
+
+	if (!before.have_timing || !after.have_timing) {
+		printf("\n");
+		printf("(no CS/wait timing: kernel lacks ivh_obs_cs_time_total_ns/"
+		       "ivh_obs_wait_* counters)\n");
+		goto done;
+	}
+
+	printf("\n");
+	printf("CS and contention timing on the same real kernel lock holds:\n");
+	printf("  Total CS hold time : %llu ns  (avg: %llu ns over %llu holds)\n",
+	       cs_ns, total ? cs_ns / total : 0ULL, total);
+	printf("  Total wait time    : %llu ns  (avg: %llu ns over %llu contended "
+	       "acquisitions)\n",
+	       wait_ns, wait_ev ? wait_ns / wait_ev : 0ULL, wait_ev);
+	printf("  (CS time averages over EVERY observed hold; wait time only over\n");
+	printf("   acquisitions that entered the qspinlock slowpath -- uncontended\n");
+	printf("   fast-path acquisitions are excluded from that denominator, not\n");
+	printf("   counted as zero-wait, so the fast path stays free of any probe)\n");
+
+	/* Tail of the CS-hold-time distribution. Degrades the same way the
+	 * timing block above does: an older kernel simply has no cs_hist line,
+	 * so say so once and move on rather than failing the run. */
+	if (before.have_hist && after.have_hist) {
+		unsigned long long hist[IVH_OBS_CS_HIST_BUCKETS];
+		unsigned long long hist_total = 0;
+		int b, p50, p90, p95, top = -1;
+		/* 48 bytes: the widest real rendering is bucket 30,
+		 * "1073741824-2147483647" (21 chars), but sized so the
+		 * compiler can prove no truncation without knowing b's range. */
+		char b50[48], b90[48], b95[48], btop[48];
+
+		for (b = 0; b < IVH_OBS_CS_HIST_BUCKETS; b++) {
+			hist[b] = after.cs_hist[b] - before.cs_hist[b];
+			hist_total += hist[b];
+			if (hist[b])
+				top = b;
+		}
+
+		/* hist_total is the histogram's own denominator rather than
+		 * `total` above: both count the same holds, but using the
+		 * distribution's own sum keeps the percentile walk internally
+		 * consistent even if the two lines were read a hair apart. */
+		p50 = hist_percentile_bucket(hist, hist_total, 50);
+		p90 = hist_percentile_bucket(hist, hist_total, 90);
+		p95 = hist_percentile_bucket(hist, hist_total, 95);
+
+		printf("\n");
+		printf("  CS hold time distribution (log2-bucketed, N=%llu holds):\n",
+		       hist_total);
+		if (hist_total) {
+			hist_bucket_str(p50, b50, sizeof(b50));
+			hist_bucket_str(p90, b90, sizeof(b90));
+			hist_bucket_str(p95, b95, sizeof(b95));
+			hist_bucket_str(top, btop, sizeof(btop));
+			printf("    p50: ~%s ns\n", b50);
+			printf("    p90: ~%s ns\n", b90);
+			printf("    p95: ~%s ns\n", b95);
+			printf("    max bucket reached: %s ns\n", btop);
+
+			/* Every populated bucket from p95 onward: p50/p90/p95
+			 * collapse the tail to 3 numbers, which hides the actual
+			 * shape of exactly the region host preemption would show
+			 * up in. Walk from the p95 bucket (not p95+1) so the
+			 * boundary bucket's own count is visible for context, up
+			 * through `top`; empty buckets in that range are skipped
+			 * rather than printed as zero, since a log2 histogram over
+			 * a wide dynamic range is naturally sparse out there and a
+			 * long run of zero lines would bury the real entries. */
+			if (p95 < top) {
+				char brange[48];
+
+				printf("    buckets p95..max (nonzero only):\n");
+				for (b = p95; b <= top; b++) {
+					if (!hist[b])
+						continue;
+					hist_bucket_str(b, brange, sizeof(brange));
+					printf("      %-24s %12llu holds  (%.4f%%)\n",
+					       brange, hist[b],
+					       100.0 * (double)hist[b] / (double)hist_total);
+				}
+			}
+		} else {
+			printf("    (no holds observed in this window)\n");
+		}
+		printf("    (BUCKET-BOUNDARY APPROXIMATIONS, not exact percentiles: a\n");
+		printf("     log2 histogram can only place a percentile inside the\n");
+		printf("     power-of-2 range containing it -- the same caveat every\n");
+		printf("     histogram-based percentile carries, e.g. Prometheus\n");
+		printf("     histogram_quantile or HDR histogram)\n");
+		printf("    (host-preempted and clean holds are mixed in one\n");
+		printf("     distribution on purpose -- this is the combined worst case)\n");
+	} else {
+		printf("\n");
+		printf("  (no CS hold time distribution: kernel lacks "
+		       "ivh_obs_cs_hist)\n");
+	}
 
 done:
 	if (WIFEXITED(wstatus))

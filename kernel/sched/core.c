@@ -39,6 +39,14 @@
 #include <linux/sched/rt.h>
 #include <linux/bpf_sched.h>
 #include <linux/blkdev.h>
+/* IVH inferred steal time (Plan 2) -- kernel-created REF_TSC perf counters,
+ * their hotplug callbacks, and the ns<->cycle conversions. */
+#include <linux/cpuhotplug.h>
+#include <linux/math64.h>
+#include <linux/perf_event.h>
+#ifdef CONFIG_X86
+#include <asm/tsc.h>		/* rdtsc(), tsc_khz */
+#endif
 #include <linux/context_tracking.h>
 #include <linux/cpuset.h>
 #include <linux/delayacct.h>
@@ -187,14 +195,132 @@ __read_mostly unsigned int sysctl_sched_nr_migrate = SCHED_NR_MIGRATE_BREAK;
 //IVH
 
 int average_capacity_all = 0;
+
+/*
+ * ivh_steal_source -- which number get_steal_and_preemptions() returns.
+ *   0 (default) = paravirt_steal_clock(), i.e. host ground truth, unchanged.
+ *   1           = rq->ivh_ref_steal_ns, the in-guest REF_TSC-derived value.
+ *
+ * DO NOT set this to 1 until sec 3.7's acceptance criterion has actually been
+ * met on this machine: across a >=30-minute run under both hackbench and the
+ * spinlock workload, on every CPU, |delta_ppm| in /proc/vcap_steal_compare
+ * stays inside a band chosen from the first run's spread, and `skipped` stays
+ * a negligible fraction of `samples`.  Expect delta_ppm to be persistently
+ * NEGATIVE -- the clamps in ivh_ref_accumulate() bias the inferred value low
+ * on purpose.  A persistently POSITIVE delta means idle is being
+ * under-subtracted and is a bug, not noise.
+ *
+ * Note what this knob does NOT touch: ivh_this_cpu_steal_ns() in cs_enter()/
+ * cs_exit() (kernel/locking/spinlock.c) stays exact host ground truth
+ * unconditionally.  That is the yardstick IVH is evaluated against and must
+ * never become an inferred number.
+ */
+unsigned long ivh_steal_source = 0UL;
+
+/*
+ * ---------------------------------------------------------------------------
+ * Lock-path non-idle halt correction (2026-07-27)
+ * ---------------------------------------------------------------------------
+ *
+ * Full root-cause writeup is on struct ivh_lock_halt in
+ * <asm/ivh_tsc_beat.h>.  In one sentence: ivh_ref_accumulate()'s
+ * "subtract the halted time" term only knows about halts taken from the IDLE
+ * LOOP, so every HLT/TPAUSE that ivh_pv_wait() takes from inside the qspinlock
+ * slowpath is booked as steal -- which is invisible at ivh_steal_source=0 and
+ * catastrophic at ivh_steal_source=1, because vcap turns it into a collapsed
+ * rq->cpu_capacity and IVH's Gate 1 then stops rejecting anything.
+ *
+ * Both knobs default to 0 = "collect the numbers, change nothing", so this
+ * patch reproduces the previous behavior bit-for-bit until someone opts in.
+ *   ivh_ref_halt_correct: 0 none, 1 HLT only, 2 HLT + bounded poll.
+ *   ivh_ref_trace:        0 off, N = one line per CPU every N usable samples.
+ *
+ * The per-CPU accumulator is defined HERE and not in arch/x86/kernel/kvm.c
+ * beside ivh_tsc_beat, even though every write site is in kvm.c: kvm.c's
+ * definitions sit inside #ifdef CONFIG_PARAVIRT_SPINLOCKS, while
+ * ivh_ref_accumulate() below and /proc/ivh_debug (fair.c) want the counters on
+ * any CONFIG_X86 build.  With the storage here, a kernel without PV spinlocks
+ * simply never writes them and the correction is a constant zero.
+ */
+unsigned long ivh_ref_halt_correct = 0UL;
+unsigned long ivh_ref_trace = 0UL;
+/*
+ * ivh_ref_carry -- 0 (default) discard the negative residual on every tick,
+ * i.e. today's behavior; 1 carry it, bounded, into the next interval.  This is
+ * a SEPARATE defect from the halt accounting and it is the larger of the two:
+ * measured 63-74% under-report of real steal under load on this host.  Full
+ * reasoning at the use site in ivh_ref_accumulate().
+ */
+unsigned long ivh_ref_carry = 0UL;
+#ifdef CONFIG_X86
+DEFINE_PER_CPU_ALIGNED(struct ivh_lock_halt, ivh_lock_halt);
+EXPORT_PER_CPU_SYMBOL_GPL(ivh_lock_halt);
+#endif
+
 //get accurate steal time and preemptions
 void get_steal_and_preemptions(int cpunum,u64* preempt,u64* steals_time){
         struct rq *rq = cpu_rq(cpunum);
         *preempt= rq->preemptions;
+        if (READ_ONCE(ivh_steal_source)) {
+                /*
+                 * Same contract as the paravirt path below and it is
+                 * load-bearing: cumulative-since-boot nanoseconds, remotely
+                 * callable, and MONOTONICALLY NON-DECREASING.  Every consumer
+                 * (NHextend.c's read_vcap_steal() and friends) deltas this
+                 * across a window, so a single backward step underflows a u64
+                 * in userspace and reports a multi-exabyte "steal".
+                 * ivh_ref_accumulate() only ever ADDS a clamped non-negative
+                 * quantity, which is what makes that safe.
+                 */
+                *steals_time = READ_ONCE(rq->ivh_ref_steal_ns);
+                return;
+        }
 #ifdef CONFIG_PARAVIRT
         *steals_time= paravirt_steal_clock(cpunum);
 #else
         *steals_time= 0;
+#endif
+}
+
+/*
+ * Side-by-side comparator feed for /proc/vcap_steal_compare
+ * (custom_modules/vsched_module.c).  Exists so the inferred number can be
+ * watched against the real one for a long run BEFORE ivh_steal_source is ever
+ * moved off 0 -- /proc/vcap_info's 4-lines-per-CPU format is frozen and
+ * cannot carry a fifth field (a 5th field crashed `vcap` with
+ * std::invalid_argument on 2026-07-13), so this is a separate file fed by a
+ * separate accessor.
+ */
+void get_inferred_steal(int cpunum, u64 *inferred, u64 *samples, u64 *skipped)
+{
+        struct rq *rq = cpu_rq(cpunum);
+
+        *inferred = READ_ONCE(rq->ivh_ref_steal_ns);
+        *samples  = READ_ONCE(rq->ivh_ref_samples);
+        *skipped  = READ_ONCE(rq->ivh_ref_skipped);
+}
+
+/*
+ * Host ground truth, ALWAYS, regardless of ivh_steal_source.
+ *
+ * Two reasons this exists rather than the comparator just calling
+ * paravirt_steal_clock() itself, as the build plan assumed it could:
+ *   - it cannot.  paravirt_steal_clock() is static_call(pv_steal_clock),
+ *     and pv_steal_clock is DEFINE_STATIC_CALL'd without any
+ *     EXPORT_STATIC_CALL*, so the trampoline is not reachable from a module.
+ *   - get_steal_and_preemptions() is no longer a substitute either, because
+ *     it is now switchable.  Once ivh_steal_source is 1 it returns the
+ *     INFERRED number, and a comparator built on it would be comparing the
+ *     inferred value against itself and reporting a perfect delta_ppm of 0
+ *     forever.  That is precisely the kind of self-confirming measurement
+ *     this comparator exists to avoid.
+ */
+void get_real_steal(int cpunum, u64 *steal)
+{
+#ifdef CONFIG_PARAVIRT
+        *steal = paravirt_steal_clock(cpunum);
+#else
+        *steal = 0;
 #endif
 }
 //get average capacity of all cores in the system, set by vCapacity, used by the bpf hooks
@@ -243,11 +369,861 @@ void set_ewma_act_ns(int cpu, u64 ewma_act_ns)
 EXPORT_SYMBOL(set_custom_capacity);
 EXPORT_SYMBOL(set_ewma_act_ns);
 EXPORT_SYMBOL(get_steal_and_preemptions);
+EXPORT_SYMBOL(get_inferred_steal);
+EXPORT_SYMBOL(get_real_steal);
 EXPORT_SYMBOL(get_max_latency);
 EXPORT_SYMBOL(set_avg_latency);
 EXPORT_SYMBOL(reset_max_latency);
 EXPORT_SYMBOL(get_average_capacity_all);
 EXPORT_SYMBOL(set_average_capacity_all);
+
+/*
+ * ===========================================================================
+ * IVH inferred steal time -- REF_TSC + idle correction behind an unchanged
+ * vcap interface.  Plan 2 of
+ * tools/bpf/docs/ivh_tsc_heartbeat_refcycles_build_plans_2026-07-26.md.
+ * ===========================================================================
+ *
+ * The arithmetic, in one line:
+ *
+ *   stolen = (TSC elapsed) - (REF_TSC elapsed) - (idle+iowait elapsed)
+ *
+ * TSC advances for wall time whether or not this vCPU is scheduled by the
+ * host.  REF_TSC (Intel fixed counter 2, CPU_CLK_UNHALTED.REF) advances at
+ * the same rate but ONLY while this vCPU is actually executing unhalted --
+ * KVM hardware-gates the guest PMU across every VM exit via the atomic
+ * PERF_GLOBAL_CTRL switch (arch/x86/kvm/vmx/vmx.c), so a descheduled vCPU
+ * accumulates none of it.  The difference is therefore "wall time this vCPU
+ * was not executing", which is halted time plus stolen time; subtract the
+ * halted time and what is left is steal.  No calibration constant appears
+ * anywhere in that, which is the whole appeal -- but it depends on REF_TSC
+ * and TSC sharing a timebase, so a port to another host must re-verify the
+ * MEASURED ref-cycles rate against tsc_khz (measured 2.160 G/sec against a
+ * 2200 MHz TSC on this box), NOT merely which PMU encoding got selected.
+ *
+ * Structural constraint that is not negotiable: perf_event_read_local()
+ * returns -EINVAL if a per-CPU event's cpu != smp_processor_id(), and vcap
+ * reads every CPU from one thread.  So the read CANNOT happen inside
+ * get_steal_and_preemptions(); it must run on the owning CPU and publish a
+ * plain u64 into struct rq, which get_steal_and_preemptions() then reads
+ * remotely exactly as it already reads rq->preemptions.
+ */
+#if defined(CONFIG_X86) && defined(CONFIG_PERF_EVENTS)
+
+/*
+ * ivh_ref_steal_enabled -- gate on CREATING the counters at all, default 0.
+ *
+ * This is not a convenience knob, it is the mitigation for a real conflict
+ * that neither feasibility report surfaced.  There is exactly ONE REF_TSC
+ * counter: Intel fixed counter 2.  On this CPU family the alternate encoding
+ * 0x013c (CPU_CLK_UNHALTED.REF_TSC_P) is constrained to the SAME fixed
+ * counter 2 by intel_glc_event_constraints, so there is no second way to get
+ * a REF_TSC count either.  A permanent, pinned, per-CPU kernel counter
+ * occupies it on every CPU for the life of the boot -- and userspace
+ * `perf stat -e ref-cycles`, the exact command that validated this design in
+ * the first place, then simply never gets the counter and reports
+ * <not counted>.  Nothing is corrupted (CPU-context pinned events are
+ * scheduled before anything flexible, so ours wins and stays correct), but
+ * the ability to sanity-check the mechanism with the tool that established it
+ * would be gone.
+ *
+ * With this defaulting to 0, "turn it off, run perf stat -e ref-cycles, turn
+ * it back on" is a working workflow:
+ *   sysctl kernel.ivh_ref_steal_enabled=0 ; perf stat -e ref-cycles ...
+ *   sysctl kernel.ivh_ref_steal_enabled=1
+ *
+ * Nothing else on this guest competes for a counter today and nothing will:
+ * nmi_watchdog reads 0 because kvm_guest_init() calls
+ * hardlockup_detector_disable() unconditionally on every KVM guest
+ * (arch/x86/kernel/kvm.c) -- it is NOT evidence about the vPMU, which is
+ * fully functional here.  If the hardlockup detector is ever force-enabled it
+ * takes a GP counter, not fixed 2, and the two coexist.
+ */
+unsigned long ivh_ref_steal_enabled = 0UL;
+
+static DEFINE_PER_CPU(struct perf_event *, ivh_ref_event);
+/* Serialises sysctl enable/disable against itself and against hotplug. */
+static DEFINE_MUTEX(ivh_ref_mutex);
+static int ivh_ref_cpuhp_state;
+
+static struct perf_event_attr ivh_ref_attr = {
+	.type		= PERF_TYPE_HARDWARE,
+	.config		= PERF_COUNT_HW_REF_CPU_CYCLES,
+	.size		= sizeof(struct perf_event_attr),
+	/*
+	 * pinned: this counter must NOT be multiplexed.  A rotated-out counter
+	 * silently under-counts, and under-counted REF_TSC reads as steal --
+	 * i.e. multiplexing would manufacture exactly the quantity we are
+	 * trying to measure, invisibly.
+	 */
+	.pinned		= 1,
+	.disabled	= 0,
+	/* Count all guest execution, user and kernel alike. */
+	.exclude_user	= 0,
+	.exclude_kernel	= 0,
+	.exclude_hv	= 0,
+	/* perf_event_read_local() returns -EOPNOTSUPP on an inherit event. */
+	.inherit	= 0,
+	/* Counting only: no sample period, no overflow interrupt, no NMI. */
+	.sample_period	= 0,
+};
+
+/*
+ * Zero the per-CPU delta state so the next accumulate re-seeds instead of
+ * computing a delta across a gap during which the counter was not running.
+ * Every path that can create such a gap must call this: first creation, a
+ * sysctl disable/re-enable cycle, and CPU offline/online.  Skipping it on any
+ * one of them produces a single enormous phantom steal step, which -- because
+ * the output is monotonic and cumulative -- is then baked in permanently.
+ */
+static void ivh_ref_reset_seed(int cpu)
+{
+	struct rq *rq = cpu_rq(cpu);
+
+	rq->ivh_ref_prev_tsc     = 0;
+	rq->ivh_ref_prev_ref     = 0;
+	rq->ivh_ref_prev_idle_ns = 0;
+	/* Same trap, same three paths: a delta taken across a gap in which the
+	 * lock-path halt counters kept advancing would subtract a lump of halt
+	 * that no d_tsc in this window ever included. */
+	rq->ivh_ref_prev_hlt_c   = 0;
+	rq->ivh_ref_prev_poll_c  = 0;
+	/* Debt earned before a gap describes an interval that no longer has a
+	 * counterpart; carrying it across would silently swallow real steal
+	 * after every enable/disable or hotplug cycle. */
+	rq->ivh_ref_debt_c       = 0;
+}
+
+static int ivh_ref_event_create(int cpu)
+{
+	struct perf_event *ev;
+
+	if (per_cpu(ivh_ref_event, cpu))
+		return 0;
+
+	ev = perf_event_create_kernel_counter(&ivh_ref_attr, cpu, NULL, NULL, NULL);
+	if (IS_ERR(ev)) {
+		pr_err("IVH: REF_TSC counter creation failed on CPU %d (%ld)\n",
+		       cpu, PTR_ERR(ev));
+		return PTR_ERR(ev);
+	}
+
+	ivh_ref_reset_seed(cpu);
+	per_cpu(ivh_ref_event, cpu) = ev;
+	return 0;
+}
+
+/*
+ * Drop this CPU's pointer with IRQs disabled, from this CPU.
+ *
+ * This is the teardown race, and it is the one place this whole feature could
+ * use freed memory: ivh_ref_accumulate() runs from account_process_tick() in
+ * hardirq context with IRQs already off, so once this has run on the target
+ * CPU there can be no in-flight tick still holding the old pointer, and
+ * perf_event_release_kernel() is safe to call afterwards.  Clearing the
+ * pointer from the releasing CPU instead would leave exactly that window
+ * open.
+ */
+static void ivh_ref_clear_local(void *unused)
+{
+	this_cpu_write(ivh_ref_event, NULL);
+}
+
+static void ivh_ref_event_release(int cpu)
+{
+	struct perf_event *ev = per_cpu(ivh_ref_event, cpu);
+
+	if (!ev)
+		return;
+
+	if (cpu_online(cpu))
+		smp_call_function_single(cpu, ivh_ref_clear_local, NULL, 1);
+	else
+		per_cpu(ivh_ref_event, cpu) = NULL;
+
+	perf_event_release_kernel(ev);
+	ivh_ref_reset_seed(cpu);
+}
+
+static int ivh_ref_cpu_online(unsigned int cpu)
+{
+	mutex_lock(&ivh_ref_mutex);
+	if (READ_ONCE(ivh_ref_steal_enabled))
+		ivh_ref_event_create(cpu);
+	mutex_unlock(&ivh_ref_mutex);
+
+	/* Never fail an online just because a counter was unavailable: this is
+	 * observability, and a CPU that cannot get fixed counter 2 should show
+	 * up as samples==0 in /proc/vcap_steal_compare, not refuse to come up.
+	 * ivh_ref_event_create() has already logged the reason. */
+	return 0;
+}
+
+/*
+ * Runs ON the dying CPU (CPUHP_AP_ONLINE_DYN is above CPUHP_AP_PERF_X86_ONLINE
+ * in the hotplug enum, so on teardown we go first and the x86 PMU is still up;
+ * on bringup the PMU is up before we are asked to create).  No IPI needed --
+ * we are already the CPU whose tick could be using the pointer -- but IRQs
+ * must be off across the store for the same reason ivh_ref_clear_local() does
+ * it that way.
+ */
+static int ivh_ref_cpu_offline(unsigned int cpu)
+{
+	mutex_lock(&ivh_ref_mutex);
+	ivh_ref_event_release(cpu);
+	/* Unconditionally, even if there was no event: the next online must
+	 * re-seed rather than compute a delta across the offline gap, which
+	 * would be a single giant phantom steal permanently baked into a
+	 * cumulative, monotonic output.  This is trap 3 of the three the build
+	 * plan calls out in sec 4. */
+	ivh_ref_reset_seed(cpu);
+	mutex_unlock(&ivh_ref_mutex);
+	return 0;
+}
+
+/*
+ * ivh_ref_accumulate - fold one tick's worth of REF_TSC into rq->ivh_ref_steal_ns.
+ *
+ * Called from account_process_tick() (kernel/sched/cputime.c) on the owning
+ * CPU with IRQs already disabled.
+ */
+void ivh_ref_accumulate(void)
+{
+	struct perf_event *ev = this_cpu_read(ivh_ref_event);
+	struct rq *rq = this_rq();
+	int cpu = smp_processor_id();
+	u64 ref, tsc, idle_us, iowait_us, idle_ns;
+	u64 d_tsc, d_ref, d_idle_ns, d_idle_c, steal_c;
+	u64 hlt_c, poll_c, d_hlt_c, d_poll_c, sub_c;
+	unsigned long correct, trace;
+
+	if (!ev || !READ_ONCE(ivh_ref_steal_enabled))
+		return;
+	if (unlikely(!tsc_khz)) {
+		rq->ivh_ref_skipped++;
+		return;
+	}
+
+	/*
+	 * -EBUSY here means "pinned event is not currently oncpu", -EINVAL
+	 * "not this CPU's event".  Either way we have no reading, so bail
+	 * WITHOUT touching the prev_* snapshot: the next successful sample then
+	 * spans the gap with all three quantities measured across the same
+	 * interval, which stays self-consistent.  Counting these matters --
+	 * `skipped` climbing is the signature of the counter being stolen or
+	 * multiplexed, and sec 3.7's acceptance criterion tests it explicitly.
+	 */
+	if (perf_event_read_local(ev, &ref, NULL, NULL)) {
+		rq->ivh_ref_skipped++;
+		return;
+	}
+	tsc = rdtsc();
+
+	/*
+	 * Close any lock-path halt/nap that is IN FLIGHT right now, at exactly
+	 * the `tsc` this sample is taken at, and re-open it there.
+	 *
+	 * This is not an optimisation, it is what keeps the four quantities
+	 * commensurable.  The timer interrupt is itself one of the things that
+	 * un-halts a mechanism-2 waiter (see ivh_pv_wait()), so the common case
+	 * is precisely "this tick is running INSIDE an unfinished halt": without
+	 * the flush, d_tsc would contain the whole halt while d_hlt_c contained
+	 * none of it, the difference would be booked as steal, and the matching
+	 * correction would arrive on the next tick where the non-negative clamp
+	 * throws it away.  Net effect would be an over-report that no amount of
+	 * averaging removes.
+	 *
+	 * Cheap and unconditional: one load, one predicted branch when nothing
+	 * is in flight.
+	 */
+	ivh_lock_halt_flush(tsc);
+	hlt_c  = raw_cpu_read(ivh_lock_halt.hlt_cycles);
+	poll_c = raw_cpu_read(ivh_lock_halt.poll_cycles);
+
+	/*
+	 * Trap 1 of three that silently manufacture phantom steal: reading
+	 * only get_cpu_idle_time_us() and missing every iowait episode.
+	 * tick_nohz_stop_idle() (kernel/time/tick-sched.c) puts each idle
+	 * episode into idle_sleeptime OR iowait_sleeptime EXCLUSIVELY -- a
+	 * literal `if (nr_iowait_cpu(...) > 0) ... else ...` -- so the total
+	 * halted time needs BOTH accumulators.  Summing them does not
+	 * double-count the currently-in-progress episode either, which is the
+	 * obvious worry: the two pass complementary compute_delta predicates
+	 * (!nr_iowait_cpu(cpu) vs nr_iowait_cpu(cpu)) down to
+	 * get_cpu_sleep_time_us(), so at most one of them ever adds the pending
+	 * delta.  The sum is the correct total.
+	 *
+	 * Trap 2: NOT kcpustat_cpu(cpu).cpustat[CPUTIME_IDLE].  The nohz
+	 * catch-up path that fills it, account_idle_ticks(), is tick-quantized
+	 * (ticks * TICK_NSEC) -- +/-1 ms per idle episode at HZ=1000, landing
+	 * directly in the inferred steal.  These two are derived from
+	 * ktime_get() at idle entry/exit and have real resolution.
+	 *
+	 * Both return (u64)-1 when !tick_nohz_active, in which case idle time
+	 * is simply not obtainable and the whole subtraction is meaningless --
+	 * every idle nanosecond would be reported as steal.  Bail loudly into
+	 * `skipped` rather than quietly returning a wrong number.  (This case
+	 * is not reachable on this guest -- CONFIG_NO_HZ_COMMON=y and idle
+	 * dynticks are active -- but the failure it would cause is exactly the
+	 * kind that gets mistaken for a real measurement.)
+	 */
+	idle_us   = get_cpu_idle_time_us(cpu, NULL);
+	iowait_us = get_cpu_iowait_time_us(cpu, NULL);
+	if (unlikely(idle_us == (u64)-1 || iowait_us == (u64)-1)) {
+		rq->ivh_ref_skipped++;
+		return;
+	}
+	idle_ns = (idle_us + iowait_us) * NSEC_PER_USEC;
+
+	if (unlikely(!rq->ivh_ref_prev_tsc)) {
+		rq->ivh_ref_skipped++;
+		goto seed;			/* first sample: no delta yet */
+	}
+
+	d_tsc = tsc - rq->ivh_ref_prev_tsc;
+	d_ref = ref - rq->ivh_ref_prev_ref;
+	/*
+	 * get_cpu_idle_time_us()'s own kerneldoc warns it "is partially broken
+	 * due to the counter of iowait tasks that can be remotely updated" and
+	 * that BACKWARD values are observable across two consecutive reads.
+	 * Clamp the idle delta at the subtraction, not downstream: an unclamped
+	 * backward read wraps to ~2^64 ns and would then be pushed through
+	 * mul_u64_u32_div(), whose 64x32/32 decomposition silently truncates
+	 * when the true product exceeds u64.  Cheaper and far clearer to refuse
+	 * the negative here.
+	 */
+	d_idle_ns = (idle_ns > rq->ivh_ref_prev_idle_ns) ?
+		    idle_ns - rq->ivh_ref_prev_idle_ns : 0;
+	d_idle_c  = mul_u64_u32_div(d_idle_ns, tsc_khz, USEC_PER_SEC);
+
+	/*
+	 * Both clamps are mandatory and they are what enforces the
+	 * monotonicity get_steal_and_preemptions()'s consumers depend on:
+	 * ivh_ref_steal_ns only ever has a non-negative quantity added to it,
+	 * so it cannot step backwards no matter how badly the three
+	 * independently-sampled quantities disagree.  The price is a systematic
+	 * UNDER-report of steal, never an over-report -- which is the correct
+	 * direction to fail for a signal that gates migrations, and it is why
+	 * delta_ppm in /proc/vcap_steal_compare is expected to sit negative.
+	 *
+	 * "Expected to sit negative" turned out to understate it by two orders
+	 * of magnitude under load -- see the ivh_ref_carry block below, which is
+	 * the opt-in repair for exactly this. These two lines remain the
+	 * ivh_ref_carry == 0 behavior, unchanged.
+	 */
+	steal_c = (d_tsc > d_ref) ? d_tsc - d_ref : 0;
+	steal_c = (steal_c > d_idle_c) ? steal_c - d_idle_c : 0;
+
+	/*
+	 * The fourth term: halted time this vCPU spent in the LOCK path rather
+	 * than in the idle loop, which d_idle_c above cannot see and which
+	 * REF_TSC stopped counting for just the same.  Clamped the same way and
+	 * for the same reason as d_idle_ns -- a backward step is impossible on a
+	 * monotonic per-CPU cumulative counter, EXCEPT across a live write of
+	 * ivh_ref_halt_correct from 2 to 1 (poll_cycles stops being included),
+	 * which the clamp turns into a single zero-delta tick instead of a wrap.
+	 *
+	 * Both deltas are computed and published to rq->ivh_ref_{hlt,poll}_ns
+	 * unconditionally, even at ivh_ref_halt_correct == 0, so that
+	 * /proc/ivh_debug answers "how much phantom steal is this configuration
+	 * producing" WITHOUT changing what get_steal_and_preemptions() returns.
+	 * That is the measurement the two-alone-are-fine/combined-is-broken
+	 * result needs and could not previously get.
+	 */
+	d_hlt_c  = (hlt_c  > rq->ivh_ref_prev_hlt_c)  ? hlt_c  - rq->ivh_ref_prev_hlt_c  : 0;
+	d_poll_c = (poll_c > rq->ivh_ref_prev_poll_c) ? poll_c - rq->ivh_ref_prev_poll_c : 0;
+	rq->ivh_ref_hlt_ns  += mul_u64_u32_div(d_hlt_c,  USEC_PER_SEC, tsc_khz);
+	rq->ivh_ref_poll_ns += mul_u64_u32_div(d_poll_c, USEC_PER_SEC, tsc_khz);
+
+	correct = READ_ONCE(ivh_ref_halt_correct);
+	sub_c  = (correct >= 1) ? d_hlt_c  : 0;
+	sub_c += (correct >= 2) ? d_poll_c : 0;
+
+	/*
+	 * -------------------------------------------------------------------
+	 * The residual carry (ivh_ref_carry), and why it is not cosmetic.
+	 * -------------------------------------------------------------------
+	 *
+	 * MEASURED, 2026-07-27, this host, /proc/vcap_steal_compare against a
+	 * 12 s hackbench run: on the eight heavily-stolen vCPUs the inferred
+	 * value came in 63-74% BELOW paravirt_steal_clock() -- every run, every
+	 * configuration, mechanism 2 and mechanism 3 alike.  At idle over the
+	 * same 10 s window the two agree to within 1-2%.  The bias is therefore
+	 * not a constant offset that a consumer could calibrate out; it scales
+	 * with the workload's idle/run transition rate, which is precisely the
+	 * axis vcap's capacity map is supposed to resolve.
+	 *
+	 * The cause is the pair of non-negative clamps.  d_tsc, d_ref, d_idle_c
+	 * are three independently-sampled quantities with independent jitter --
+	 * get_cpu_idle_time_us()'s own kerneldoc admits to non-monotonicity, and
+	 * it is truncated to microseconds against a 1 ms tick.  On the ticks
+	 * where the idle term overshoots, the excess is clamped away and
+	 * FORGOTTEN; on the ticks where it undershoots, the shortfall is booked
+	 * as steal and KEPT.  Discarding one tail while keeping the other is a
+	 * rectifier, and its output bias grows with the jitter rate -- which is
+	 * the load dependence we measured.
+	 *
+	 * Carrying the negative residual into the next interval instead of
+	 * discarding it makes the estimator unbiased over any window longer than
+	 * the jitter, WITHOUT weakening the monotonicity guarantee that
+	 * get_steal_and_preemptions()'s consumers depend on: what is carried is
+	 * an internal signed remainder, while ivh_ref_steal_ns still only ever
+	 * has a non-negative quantity added to it.
+	 *
+	 * The debt is FLOORED at one interval's worth of cycles.  Unbounded debt
+	 * would let a genuine systematic error (a REF_TSC that does not share
+	 * the TSC timebase, say) build a reservoir that swallows real steal
+	 * events for minutes afterwards -- turning a calibration bug into an
+	 * invisible one.  A one-interval floor absorbs sampling jitter, which is
+	 * what it is for, and cannot absorb a sustained rate error.
+	 *
+	 * Default OFF.  This changes the number vcap consumes, so it must be
+	 * validated against /proc/vcap_steal_compare (delta_ppm should move from
+	 * -600000ish toward 0 under load) before it is trusted, exactly as
+	 * ivh_steal_source itself was supposed to be.
+	 */
+	if (READ_ONCE(ivh_ref_carry)) {
+		s64 raw = (s64)d_tsc - (s64)d_ref - (s64)d_idle_c - (s64)sub_c
+			  + rq->ivh_ref_debt_c;
+
+		if (raw > 0) {
+			steal_c = (u64)raw;
+			rq->ivh_ref_debt_c = 0;
+		} else {
+			steal_c = 0;
+			rq->ivh_ref_debt_c = (raw < -(s64)d_tsc) ? -(s64)d_tsc : raw;
+		}
+	} else {
+		steal_c = (steal_c > sub_c) ? steal_c - sub_c : 0;
+		rq->ivh_ref_debt_c = 0;
+	}
+
+	rq->ivh_ref_steal_ns += mul_u64_u32_div(steal_c, USEC_PER_SEC, tsc_khz);
+	rq->ivh_ref_samples++;
+
+	/*
+	 * Per-tick forensics, off by default (ivh_ref_trace == 0), sampled one
+	 * line per CPU every N usable samples so a full benchmark run can be
+	 * traced without the log itself becoming the workload.  Everything
+	 * needed to redo the arithmetic by hand is on the line, in raw cycles,
+	 * plus the cumulative outputs so a before/after delta can be taken the
+	 * same way ivh_exec -v already does for /proc/ivh_debug.
+	 *
+	 * KERN_INFO, deliberately NOT the KERN_EMERG that ivh_pv_wait_trace
+	 * (arch/x86/kernel/kvm.c) uses.  That one exists to survive a total
+	 * all-CPUs-halted freeze and is expected to be enabled for seconds; this
+	 * one is expected to be enabled for the duration of a benchmark, where
+	 * EMERG's console priority would perturb the very timing being measured.
+	 * Same ring buffer, same journalctl -k, same off-by-default posture.
+	 */
+	trace = READ_ONCE(ivh_ref_trace);
+	if (unlikely(trace) && !(rq->ivh_ref_samples % trace))
+		printk(KERN_INFO
+		       "ivh_ref_trace: cpu=%d d_tsc=%llu d_ref=%llu d_idle_c=%llu "
+		       "d_hlt_c=%llu d_poll_c=%llu sub_c=%llu debt_c=%lld steal_c=%llu "
+		       "steal_ns=%llu hlt_ns=%llu poll_ns=%llu samples=%llu skipped=%llu\n",
+		       cpu, d_tsc, d_ref, d_idle_c, d_hlt_c, d_poll_c, sub_c,
+		       rq->ivh_ref_debt_c,
+		       steal_c, rq->ivh_ref_steal_ns, rq->ivh_ref_hlt_ns,
+		       rq->ivh_ref_poll_ns, rq->ivh_ref_samples,
+		       rq->ivh_ref_skipped);
+seed:
+	rq->ivh_ref_prev_tsc     = tsc;
+	rq->ivh_ref_prev_ref     = ref;
+	rq->ivh_ref_prev_idle_ns = idle_ns;
+	rq->ivh_ref_prev_hlt_c   = hlt_c;
+	rq->ivh_ref_prev_poll_c  = poll_c;
+}
+
+#ifdef CONFIG_SYSCTL
+/*
+ * Enable/disable creates and releases the per-CPU counters for real, so that
+ * writing 0 genuinely hands fixed counter 2 back to the rest of the system
+ * (see the long comment on ivh_ref_steal_enabled).
+ *
+ * Ordering on enable: create the events FIRST, publish the flag LAST.  A tick
+ * that sees the flag before the pointer exists just returns; a tick that sees
+ * the pointer before the flag also just returns, and the seed was reset at
+ * creation, so whichever way the race lands the first real sample is a seed.
+ *
+ * Ordering on disable: clear the flag FIRST, release LAST, and the release
+ * itself synchronises against in-flight ticks via an IRQs-disabled IPI (see
+ * ivh_ref_clear_local()).
+ */
+static int ivh_ref_proc_steal_enabled(const struct ctl_table *table, int write,
+				      void *buffer, size_t *lenp, loff_t *ppos)
+{
+	unsigned long val = READ_ONCE(ivh_ref_steal_enabled);
+	struct ctl_table tmp = *table;
+	int ret, cpu;
+
+	tmp.data = &val;
+	ret = proc_doulongvec_minmax(&tmp, write, buffer, lenp, ppos);
+	if (ret || !write)
+		return ret;
+
+	val = !!val;
+
+	cpus_read_lock();
+	mutex_lock(&ivh_ref_mutex);
+
+	if (val && !ivh_ref_steal_enabled) {
+		for_each_online_cpu(cpu)
+			ivh_ref_event_create(cpu);
+		WRITE_ONCE(ivh_ref_steal_enabled, 1);
+		pr_info("IVH: REF_TSC steal inference ENABLED (fixed counter 2 is now occupied on every CPU; `perf stat -e ref-cycles` will report <not counted> until this is set back to 0)\n");
+	} else if (!val && ivh_ref_steal_enabled) {
+		WRITE_ONCE(ivh_ref_steal_enabled, 0);
+		for_each_online_cpu(cpu)
+			ivh_ref_event_release(cpu);
+		pr_info("IVH: REF_TSC steal inference DISABLED, fixed counter 2 released\n");
+	}
+
+	mutex_unlock(&ivh_ref_mutex);
+	cpus_read_unlock();
+	return 0;
+}
+
+/*
+ * Refuse to make the inferred value production unless the counters are
+ * actually running.  Without this, `sysctl kernel.ivh_steal_source=1` with
+ * ivh_ref_steal_enabled==0 would make get_steal_and_preemptions() return a
+ * frozen ivh_ref_steal_ns forever -- vcap would see zero steal on every CPU
+ * and quietly stop adjusting capacity, with no error anywhere.
+ */
+static int ivh_ref_proc_steal_source(const struct ctl_table *table, int write,
+				     void *buffer, size_t *lenp, loff_t *ppos)
+{
+	unsigned long val = READ_ONCE(ivh_steal_source);
+	struct ctl_table tmp = *table;
+	int ret;
+
+	tmp.data = &val;
+	ret = proc_doulongvec_minmax(&tmp, write, buffer, lenp, ppos);
+	if (ret || !write)
+		return ret;
+
+	if (val > 1) {
+		pr_err("IVH: refusing ivh_steal_source=%lu: valid values are 0 (paravirt_steal_clock, host truth) and 1 (inferred REF_TSC)\n",
+		       val);
+		return -EINVAL;
+	}
+	if (val && !READ_ONCE(ivh_ref_steal_enabled)) {
+		pr_err("IVH: refusing ivh_steal_source=1 while ivh_ref_steal_enabled=0: the inferred counter is not running, so it would return a frozen value forever. Enable it first and validate against /proc/vcap_steal_compare.\n");
+		return -EINVAL;
+	}
+
+	WRITE_ONCE(ivh_steal_source, val);
+	return 0;
+}
+
+/*
+ * Reject anything above 2 rather than silently treating it as 2: the value is
+ * a mode selector, not a magnitude, and "3 means the strongest correction" is
+ * exactly the kind of assumption that quietly survives into a result table.
+ */
+static int ivh_ref_proc_halt_correct(const struct ctl_table *table, int write,
+				     void *buffer, size_t *lenp, loff_t *ppos)
+{
+	unsigned long val = READ_ONCE(ivh_ref_halt_correct);
+	struct ctl_table tmp = *table;
+	int ret;
+
+	tmp.data = &val;
+	ret = proc_doulongvec_minmax(&tmp, write, buffer, lenp, ppos);
+	if (ret || !write)
+		return ret;
+
+	if (val > 2) {
+		pr_err("IVH: refusing ivh_ref_halt_correct=%lu: valid values are 0 (subtract nothing, counters still collected), 1 (subtract pv_wait HLT time) and 2 (subtract HLT + bounded TPAUSE/PAUSE poll)\n",
+		       val);
+		return -EINVAL;
+	}
+
+	WRITE_ONCE(ivh_ref_halt_correct, val);
+	return 0;
+}
+
+static const struct ctl_table ivh_ref_sysctls[] = {
+	{
+		.procname	= "ivh_ref_steal_enabled",
+		.data		= &ivh_ref_steal_enabled,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= ivh_ref_proc_steal_enabled,
+	},
+	{
+		.procname	= "ivh_steal_source",
+		.data		= &ivh_steal_source,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= ivh_ref_proc_steal_source,
+	},
+	{
+		.procname	= "ivh_ref_halt_correct",
+		.data		= &ivh_ref_halt_correct,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= ivh_ref_proc_halt_correct,
+	},
+	{
+		.procname	= "ivh_ref_carry",
+		.data		= &ivh_ref_carry,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_ref_trace",
+		.data		= &ivh_ref_trace,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+};
+#endif /* CONFIG_SYSCTL */
+
+/*
+ * late_initcall, matching ivh_debug_proc_init() (fair.c) and
+ * ivh_pv_sysctl_init() (arch/x86/kernel/kvm.c).  CPUHP_AP_ONLINE_DYN so the
+ * online callback runs on the target CPU with the PMU already up; with
+ * ivh_ref_steal_enabled defaulting to 0 the callback that fires here for every
+ * already-online CPU is a no-op, and no counter is claimed until someone asks.
+ */
+static int __init ivh_ref_steal_init(void)
+{
+	int ret;
+
+	ret = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, "ivh/ref:online",
+				ivh_ref_cpu_online, ivh_ref_cpu_offline);
+	if (ret < 0) {
+		pr_err("IVH: cpuhp_setup_state for REF_TSC steal failed (%d)\n", ret);
+		return 0;
+	}
+	ivh_ref_cpuhp_state = ret;
+
+#ifdef CONFIG_SYSCTL
+	register_sysctl_init("kernel", ivh_ref_sysctls);
+#endif
+	return 0;
+}
+late_initcall(ivh_ref_steal_init);
+
+#else /* !(CONFIG_X86 && CONFIG_PERF_EVENTS) */
+
+/*
+ * The arithmetic is built on rdtsc()/tsc_khz against
+ * PERF_COUNT_HW_REF_CPU_CYCLES, both of which are x86 concepts, so elsewhere
+ * the inferred value simply never advances and get_steal_and_preemptions()
+ * keeps returning host truth (ivh_steal_source has no way to be set to 1
+ * because its sysctl is not registered).
+ */
+void ivh_ref_accumulate(void) { }
+
+#endif /* CONFIG_X86 && CONFIG_PERF_EVENTS */
+
+/*
+ * ===========================================================================
+ * IVH Part C -- the tick-only stamp, the preemption-event series and the
+ * vcap-free capacity number.  Build 1, tools/bpf/docs/
+ * ivh_tsc_full_redesign_build_plan_2026-07-29.md sec 3.5.
+ * ===========================================================================
+ *
+ * WHAT THIS REPLACES, AND WHAT IT DELIBERATELY DOES NOT.  An earlier audit
+ * claimed three live vcap outputs.  Re-verified against this tree, only ONE
+ * of them is actually consumed by a migration decision:
+ *
+ *   rq->cpu_capacity (fed from cpu_capacity_custom)  -- LIVE.  Gate 1 in
+ *	ivh_steal_imminent(), and GATE_CAPACITY_LOW / GATE_NOT_BETTER in
+ *	tools/bpf/MY_ivh_atc.bpf.c.
+ *   average_capacity_all                             -- NOT live.  It is
+ *	passed into the BPF hook and stored into process_cpu()'s ctx, and that
+ *	function's body never reads it.  Its only readers are inside
+ *	search_latency(), behind test32.
+ *   rq->avg_latency                                  -- NOT live.  Same
+ *	story, and it has no in-kernel reader at all.
+ *
+ * search_latency() is reached only from test32, attached to
+ * SEC("sched/cfs_latency_select") -- a hook that is declared in
+ * <linux/sched_hook_defs.h> and CALLED FROM NOWHERE IN THE KERNEL.  The
+ * loader attaches it, so it is loaded, verified, and permanently idle.  So
+ * the last two are not "deferred" and not "caveated": there is no code path
+ * that consumes them, and they come back into scope only if
+ * cfs_latency_select is ever given a call site.
+ *
+ * The one thing this shrinkage does NOT simplify away is Gate 2:
+ * rq->last_preemption and rq->last_active_time really are live inputs at the
+ * default ivh_time_left_source == 1, and both are written purely from real
+ * paravirt_steal_clock() in steal_account_process_time() regardless of
+ * ivh_steal_source.  That is the whole of the known open gap, and
+ * ivh_vact_last_preempt_tsc / ivh_vact_last_active_c are its replacements.
+ *
+ * Also worth naming because it LOOKS like it needs replacing and does not:
+ * rq->clock_preempt is written from sched_clock() at the tick and read by
+ * is_cpu_preempted().  It is already a tick heartbeat with zero steal
+ * dependency.  Leave it alone.
+ */
+
+/*
+ * ivh_vact_tick - one tick's worth of Part C.
+ *
+ * Called from account_process_tick() (kernel/sched/cputime.c) on the owning
+ * CPU with IRQs already disabled, immediately after ivh_ref_accumulate() and
+ * BEFORE the vtime_accounting_enabled_this_cpu() early return -- the same
+ * placement, and for the same reason, as rq->clock_preempt and
+ * ivh_ref_accumulate() itself: the sample must be taken on every tick on
+ * every CPU regardless of which accounting flavour is live.
+ *
+ * Costs one rdtsc, a handful of arithmetic and no branches worth naming, on a
+ * path that already does two rdtsc-equivalents.  Deliberately NOT gated on
+ * ivh_cap_source / ivh_preempt_event_source, and that is the same decision
+ * ivh_lock_halt_begin()'s comment records: a signal that is only produced
+ * once someone has decided to trust it can never be compared against the
+ * signal it is replacing, so the comparison that decides whether to trust it
+ * would be impossible.  Producing it always and CONSUMING it never (both
+ * source sysctls default to 0) is what makes sec 3.8's comparators real.
+ */
+void ivh_vact_tick(void)
+{
+	struct rq *rq = this_rq();
+	u64 now = ivh_raw_tsc();
+	u64 old = rq->ivh_vact_stamp;
+	u64 used = 0, window_c;
+	s64 age;
+
+	rq->ivh_vact_stamp = now;		/* the publish, always */
+
+	if (unlikely(!old)) {
+		/* First tick on this CPU: nothing to measure across yet. */
+		rq->ivh_vact_burst_start_tsc = now;
+		rq->ivh_vact_win_start_tsc   = now;
+		goto window;
+	}
+
+	age = (s64)(now - old);
+	if (likely(age <= (s64)READ_ONCE(ivh_vact_jump_threshold))) {
+		/* Normal ticking: the whole interval was executing. */
+		used = (u64)age;
+		goto window;
+	}
+
+	/*
+	 * A gap.  Exactly two explanations, and telling them apart is the
+	 * entire content of this function.
+	 *
+	 * The idle test is `idle_exit_tsc >= old`, SIGNED: "the idle exit
+	 * happened at or after the stamp we are about to overwrite" is exactly
+	 * "the gap is explained by idle".  Signed so that a small cross-source
+	 * skew reads as ordered rather than wrapping into a huge positive --
+	 * the same discipline ivh_beat_age() already applies.
+	 */
+	if ((s64)(rq->ivh_vact_idle_exit_tsc - old) >= 0) {
+		/*
+		 * The CPU went idle after publishing `old` and came back at
+		 * idle_exit_tsc.  Not preemption -- do not count an event, do
+		 * not close the burst as though something took the CPU away.
+		 *
+		 * S1 RESETS TO THE IDLE EXIT, NOT TO `now`, and this is the
+		 * only reason ivh_vact_idle_exit_tsc has to exist at all.
+		 * account_idle_ticks() does NOT call account_process_tick()
+		 * (verified), so the stamp is not republished while idle time
+		 * is being accounted, and the first post-idle tick is
+		 * comparing against the PRE-idle stamp.  Resetting S1 to `now`
+		 * would silently discard the whole interval between idle exit
+		 * and that first post-idle tick, systematically undercounting
+		 * every post-idle burst by up to one tick period -- which on a
+		 * frequently-idling CPU is most of the burst.
+		 */
+		rq->ivh_vact_burst_start_tsc = rq->ivh_vact_idle_exit_tsc;
+		rq->ivh_vact_idle_explained++;
+		/*
+		 * The part of the gap after the idle exit was real execution.
+		 * Idle itself is neither used nor stolen: it must not inflate
+		 * the denominator, or a mostly-idle vCPU would read as heavily
+		 * stolen and every one of them would drop below IVH_CAP_FLOOR.
+		 */
+		if ((s64)(now - rq->ivh_vact_idle_exit_tsc) > 0)
+			used = now - rq->ivh_vact_idle_exit_tsc;
+	} else {
+		/*
+		 * Genuine host preemption: close the burst, open a new one.
+		 * `old` -- not `now` -- is the last instant we have positive
+		 * evidence this vCPU was executing, so it is the correct end of
+		 * the burst that just ended.
+		 */
+		rq->ivh_vact_last_active_c    = old - rq->ivh_vact_burst_start_tsc;
+		rq->ivh_vact_last_preempt_tsc = now;
+		rq->ivh_vact_burst_start_tsc  = now;
+		rq->ivh_vact_preemptions++;
+		rq->ivh_vact_win_stolen_c    += (u64)age;
+		rq->ivh_vact_jumps++;
+	}
+
+window:
+	rq->ivh_vact_win_used_c += used;
+
+	/*
+	 * Tumbling window, not an EWMA.  vcap's own capacity_perc is an EWMA
+	 * over its sampling loop, so a structured divergence between the two is
+	 * EXPECTED in one specific direction and is the first thing to check
+	 * (sec 4.2); sweeping ivh_vact_window_ns is the cheap first response
+	 * and costs nothing.  A tumbling window is chosen here because it is
+	 * the form whose output can be reasoned about exactly -- "of the last
+	 * N ms, this fraction was executing" -- which is what a comparator
+	 * needs.  An EWMA's disagreement with another EWMA of a different time
+	 * constant is not diagnosable.
+	 *
+	 * (used * 1024) / (used + stolen) and nothing else: IVH_CAP_FLOOR is
+	 * 850 and ivh_capacity_threshold is 1010 against a 1024 scale, so any
+	 * other normalisation silently changes what both thresholds mean.
+	 */
+	window_c = ivh_tsc_ns_to_cycles(READ_ONCE(ivh_vact_window_ns));
+	if (window_c && (s64)(now - rq->ivh_vact_win_start_tsc) >= (s64)window_c) {
+		u64 tot = rq->ivh_vact_win_used_c + rq->ivh_vact_win_stolen_c;
+
+		rq->ivh_vact_capacity = tot ?
+			(unsigned long)div64_u64(rq->ivh_vact_win_used_c *
+						 SCHED_CAPACITY_SCALE, tot) :
+			SCHED_CAPACITY_SCALE;
+
+		rq->ivh_vact_win_start_tsc  = now;
+		rq->ivh_vact_win_used_c     = 0;
+		rq->ivh_vact_win_stolen_c   = 0;
+	}
+}
+
+/*
+ * Side-by-side comparator feed for the module's /proc/ivh_vact_compare.
+ *
+ * Exported now, in Build 1, even though no in-tree caller exists yet, for the
+ * reason get_inferred_steal()'s own comment records one paragraph up: the
+ * module can format this for free, but it needs a kernel accessor to read it,
+ * and adding an accessor is a kernel build and therefore a reboot.  Shipping
+ * the accessor AND the raw dump in /proc/ivh_debug together means every later
+ * reformatting is an rmmod/insmod that costs nothing.
+ *
+ * Durations are converted to ns here so the module and /proc/vcap_info speak
+ * one unit; the absolute preemption timestamp is returned as "ns since the
+ * last detected preemption event" rather than as a raw TSC value, because a
+ * raw TSC is not comparable with rq->last_preemption's sched_clock() base and
+ * printing the two side by side would invite exactly that comparison.
+ */
+void get_vact_compare(int cpunum, u64 *last_preempt_ns, u64 *last_active_ns,
+		      u64 *preemptions, unsigned long *capacity,
+		      u64 *jumps, u64 *idle_explained)
+{
+	struct rq *rq = cpu_rq(cpunum);
+	u64 lp = READ_ONCE(rq->ivh_vact_last_preempt_tsc);
+	s64 since = lp ? (s64)(ivh_raw_tsc() - lp) : -1;
+
+	*last_preempt_ns = (since > 0) ? ivh_tsc_cycles_to_ns((u64)since) : 0;
+	*last_active_ns  = ivh_tsc_cycles_to_ns(READ_ONCE(rq->ivh_vact_last_active_c));
+	*preemptions     = READ_ONCE(rq->ivh_vact_preemptions);
+	*capacity        = READ_ONCE(rq->ivh_vact_capacity);
+	*jumps           = READ_ONCE(rq->ivh_vact_jumps);
+	*idle_explained  = READ_ONCE(rq->ivh_vact_idle_explained);
+}
+EXPORT_SYMBOL_GPL(get_vact_compare);
 
 /* lhp tick-time lockholder classification — per-CPU snapshot */
 DEFINE_PER_CPU(struct lhp_classify_snapshot, lhp_last_class);
@@ -9007,6 +9983,20 @@ void __init sched_init(void)
 		rq->sd = NULL;
 		rq->rd = NULL;
 		rq->cpu_capacity = SCHED_CAPACITY_SCALE;
+		/*
+		 * IVH Part C output, seeded to "perfectly healthy" rather than
+		 * left at 0.  A CPU that has not yet completed a tumbling
+		 * window must not read as fully stolen: IVH_CAP_FLOOR is 850
+		 * and ivh_capacity_threshold is 1010 on the same 1024 scale, so
+		 * a zero here would make every unseeded vCPU simultaneously
+		 * "never a valid migration destination" and "always in danger
+		 * as a source" -- which is exactly the collapsed-capacity
+		 * signature of the phantom-steal bug, arrived at by a different
+		 * route.  Same constant as rq->cpu_capacity above on purpose:
+		 * the replacement must live on the same scale or both
+		 * thresholds silently change meaning.
+		 */
+		rq->ivh_vact_capacity = SCHED_CAPACITY_SCALE;
 		rq->balance_callback = &balance_push_callback;
 		rq->active_balance = 0;
 		rq->next_balance = jiffies;

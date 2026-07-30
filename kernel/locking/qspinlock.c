@@ -22,6 +22,7 @@
 #include <linux/mutex.h>
 #include <linux/prefetch.h>
 #include <linux/sched.h>
+#include <linux/sched/clock.h>
 #include <asm/byteorder.h>
 #include <asm/qspinlock.h>
 #include <trace/events/lock.h>
@@ -83,6 +84,77 @@
 static DEFINE_PER_CPU_ALIGNED(struct qnode, qnodes[_Q_MAX_NODES]);
 
 /*
+ * ---------------------------------------------------------------------
+ * Observe-only wait-time stats (ivh_observe, see kernel/locking/spinlock.c
+ * and PR_SET_IVH_ELIGIBLE in kernel/sys.c). The companion to the CS-hold
+ * timing fed from cs_exit(): how long an observed task spends WAITING to
+ * acquire a real kernel raw spinlock, so ivh_exec -v can show whether a
+ * mechanism (native / PV+adaptive spinning / IVH) actually shortens
+ * contention rather than just moving it around.
+ *
+ * Placement: this file is compiled TWICE -- once as
+ * native_queued_spin_lock_slowpath() and again, via the #include at the
+ * bottom under _GEN_PV_LOCK_SLOWPATH, as __pv_queued_spin_lock_slowpath().
+ * One instrumentation of queued_spin_lock_slowpath() therefore covers both
+ * the native and the PV-substituted path, which is exactly what comparing
+ * across mechanisms needs. The helpers themselves are defined inside the
+ * _GEN_PV_LOCK_SLOWPATH guard so they are emitted only once.
+ *
+ * FAST PATH: uncontended acquisitions never call this function at all --
+ * queued_spin_lock()'s inline cmpxchg has already succeeded. Nothing is
+ * added there, so the hottest path in the kernel costs literally zero
+ * extra instructions, not even a dead branch. The consequence is a
+ * deliberate accounting decision: uncontended acquisitions are EXCLUDED
+ * FROM THE DENOMINATOR ENTIRELY rather than averaged in as zero-wait.
+ * ivh_obs_wait_events counts slowpath entries only, so "average wait time"
+ * means "average wait, given that we had to wait" -- a number that tracks
+ * the mechanism under test instead of being crushed towards zero by the
+ * millions of uncontended acquisitions a workload also performs (which
+ * would make it a contention-*rate* proxy in disguise). This is also why
+ * wait_events is a dedicated counter and not ivh_obs_total_holds: the two
+ * do not correspond one-to-one anyway (total_holds counts only outermost
+ * lock_depth 0->1->0 transitions in task context, while a slowpath entry
+ * can happen at any nesting level).
+ *
+ * Gating matches the existing ivh_obs_* pair exactly: current->ivh_observe
+ * only. It is independent of ivh_universal_eligible and of ivh_exclude, so
+ * ivh_exec -v -n (observed but migration-excluded) still measures, which is
+ * the whole point of the -n comparison run.
+ *
+ * in_interrupt() is excluded for the same reason wait_depth is below:
+ * a hardirq/softirq that lands mid-wait and takes its own lock is not this
+ * task's contention, and attributing it here would inflate the average
+ * with unrelated work.
+ *
+ * Nesting and re-entrancy need no per-task state: the timestamp is a plain
+ * function-local, so a nested slowpath entry (lock B taken while spinning
+ * for, or holding, lock A) carries its own start on its own stack frame.
+ * Zero is the "not observing" sentinel; a sched_clock() of exactly 0 is
+ * only reachable in the first nanosecond of boot and merely drops a sample.
+ * ---------------------------------------------------------------------
+ */
+static __always_inline u64 ivh_obs_wait_begin(void)
+{
+	if (!current->ivh_observe || in_interrupt())
+		return 0;
+	return sched_clock();
+}
+
+/*
+ * Called at the point the lock has actually been acquired (every exit path
+ * out of the slowpath is an acquisition). Like cs_exit()'s own timestamp,
+ * this reads the clock a few instructions past the true acquisition; the
+ * bias is constant and identical across the mechanisms being compared.
+ */
+static __always_inline void ivh_obs_wait_end(u64 start)
+{
+	if (start) {
+		this_cpu_add(ivh_obs_wait_total_ns, sched_clock() - start);
+		this_cpu_inc(ivh_obs_wait_events);
+	}
+}
+
+/*
  * Generate the native code for queued_spin_unlock_slowpath(); provide NOPs for
  * all the PV callbacks.
  */
@@ -133,6 +205,9 @@ static __always_inline u32  __pv_wait_head_or_lock(struct qspinlock *lock,
 void __lockfunc queued_spin_lock_slowpath(struct qspinlock *lock, u32 val)
 {
 	struct mcs_spinlock *prev, *next, *node;
+	/* Observe-only wait timing: entry here IS the point of genuine
+	 * contention -- the inline fast-path cmpxchg has already failed. */
+	u64 ivh_wait_start = ivh_obs_wait_begin();
 	u32 old, tail;
 	int idx;
 
@@ -141,8 +216,11 @@ void __lockfunc queued_spin_lock_slowpath(struct qspinlock *lock, u32 val)
 	if (pv_enabled())
 		goto pv_queue;
 
-	if (virt_spin_lock(lock))
+	if (virt_spin_lock(lock)) {
+		/* test-and-set fallback acquired it */
+		ivh_obs_wait_end(ivh_wait_start);
 		return;
+	}
 
 	/*
 	 * Wait for in-progress pending->locked hand-overs with a bounded
@@ -220,7 +298,30 @@ void __lockfunc queued_spin_lock_slowpath(struct qspinlock *lock, u32 val)
 	 * 0,1,0 -> 0,0,1
 	 */
 	clear_pending_set_locked(lock);
+	/*
+	 * IVH ownership-transfer site A3 (build plan sec 3.3.4).
+	 *
+	 * Two things about this site that a future reader will otherwise get
+	 * wrong.  First, it is RUNTIME-DEAD under PV spinlocks -- the top of
+	 * this function does `if (pv_enabled()) goto pv_queue;`, which skips
+	 * the whole pending-bit section -- but it is COMPILED, and it becomes
+	 * live again on a `nopvspin` boot.  A nopvspin comparison run with this
+	 * site unstamped would silently report every lock as "unknown holder",
+	 * which is the kind of result that looks like a finding and is actually
+	 * a missing line of code.  Second, clear_pending_set_locked() is a
+	 * plain WRITE_ONCE in the _Q_PENDING_BITS == 8 variant that is live
+	 * here (NR_CPUS=8192 < 16K), NOT an RMW -- so the ordering argument is
+	 * store->store under x86-TSO, exactly as __ivh_lock_set_holder() says.
+	 *
+	 * This file is compiled TWICE (see the _GEN_PV_LOCK_SLOWPATH block at
+	 * the bottom: once natively, once as __pv_queued_spin_lock_slowpath),
+	 * so this one edit covers both variants.  There is no omission to
+	 * "fix" in the PV copy.
+	 */
+	ivh_lock_set_holder(lock);
 	lockevent_inc(lock_pending);
+	/* acquired via the pending bit; waiting done */
+	ivh_obs_wait_end(ivh_wait_start);
 	return;
 
 	/*
@@ -385,8 +486,21 @@ locked:
 	 *       PENDING will make the uncontended transition fail.
 	 */
 	if ((val & _Q_TAIL_MASK) == tail) {
-		if (atomic_try_cmpxchg_relaxed(&lock->val, &val, _Q_LOCKED_VAL))
+		if (atomic_try_cmpxchg_relaxed(&lock->val, &val, _Q_LOCKED_VAL)) {
+			/*
+			 * IVH ownership-transfer site A4 (build plan sec
+			 * 3.3.4): queue head, uncontended.  Note the primitive
+			 * is atomic_try_cmpxchg_RELAXED -- this is one of the
+			 * two sites that falsify the earlier planning record's
+			 * "every acquire site is an _acquire RMW, so the RMW
+			 * fences the following store" claim.  The conclusion
+			 * survives, the reason does not: what makes a plain
+			 * WRITE_ONCE after this safe is store->store ordering
+			 * under x86-TSO.
+			 */
+			ivh_lock_set_holder(lock);
 			goto release; /* No contention */
+		}
 	}
 
 	/*
@@ -395,6 +509,19 @@ locked:
 	 * ensuring we'll see a @next.
 	 */
 	set_locked(lock);
+	/*
+	 * IVH ownership-transfer site A5 (build plan sec 3.3.4): queue head,
+	 * contended.  set_locked() is `WRITE_ONCE(lock->locked, _Q_LOCKED_VAL)`
+	 * (kernel/locking/qspinlock.h) -- NOT an RMW at all, which is the
+	 * second site falsifying the old ordering rationale.  See A4 above.
+	 *
+	 * Stamped BEFORE arch_mcs_spin_unlock_contended() below on purpose:
+	 * that store is what releases our successor, and once it lands the
+	 * successor is free to start consulting the holder table about this
+	 * very lock.  Publishing our identity first means the worst it can see
+	 * is a slightly stale "unknown", never a wrong CPU.
+	 */
+	ivh_lock_set_holder(lock);
 
 	/*
 	 * contended path; wait for next if not observed yet, release.
@@ -410,6 +537,10 @@ release:
 	/* lock acquired; MCS queue spinning done */
 	if (!in_interrupt())
 		current->wait_depth--;
+	/* Covers every goto release: (no-node fallback, post-init trylock,
+	 * uncontended cmpxchg) as well as the contended fallthrough -- all of
+	 * them are acquisitions. */
+	ivh_obs_wait_end(ivh_wait_start);
 	/*
 	 * release the node
 	 */

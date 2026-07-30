@@ -270,7 +270,128 @@ u64 __weak ivh_this_cpu_steal_ns(void)
 	return 0;
 }
 
+/*
+ * ---------------------------------------------------------------------------
+ * IVH Part C source-selection knobs (Build 1, tools/bpf/docs/
+ * ivh_tsc_full_redesign_build_plan_2026-07-29.md sec 3.6).
+ * ---------------------------------------------------------------------------
+ *
+ * ivh_cap_source and ivh_preempt_event_source are DELIBERATELY TWO KNOBS, not
+ * one, and that is not tidiness -- it is the direct lesson of the bimodal
+ * phantom-steal bug.  They are independent replacements with independent
+ * failure modes, and the discipline this whole build is organised around is
+ * that no two new signals become authoritative at the same time.  That bug
+ * was diagnosable ONLY because "either alone is fine, combined is broken" had
+ * been established as a fact; establishing the same fact cheaply for these
+ * two costs a couple of extra measurement windows, which is minutes, against
+ * a rebuild+reboot, which is not.
+ *
+ * Both use the three-valued shape ivh_pv_preempt_src established:
+ *   0 = the existing real-steal-derived value (default; bit-identical to
+ *       today, and the replacement is not even consulted)
+ *   1 = shadow: compute both, compare, log, keep returning the existing one
+ *   2 = the Part C value is authoritative
+ */
+unsigned long ivh_cap_source = 0UL;
+
+unsigned long ivh_preempt_event_source = 0UL;
+
+/*
+ * Tick-stamp staleness threshold, in RAW TSC CYCLES.  3,300,000 = 1.5 ms at
+ * 2200 MHz, recalibrated from the live tsc_khz at late_initcall
+ * (arch/x86/kernel/kvm.c), with the literal as the pre-calibration fallback.
+ *
+ * 1500 us is chosen, not guessed: it is the same number as
+ * IVH_BEAT_THRESHOLD_US and the same number as the `> 1500000` ns in
+ * is_cpu_preempted(), so Part C's jump detector is a CONTROLLED COMPARISON
+ * against the preemption signal this tree already has rather than a new
+ * signal with a new tuning surface.  A divergence between ivh_vact_jumps and
+ * rq->preemptions is then a bug to be explained, not a difference to be
+ * shrugged at.  Sysctl, sweepable.
+ */
+unsigned long ivh_vact_jump_threshold = 3300000UL;
+
+/*
+ * Tumbling-window length for the capacity ratio, in NANOSECONDS (converted to
+ * cycles at the point of use, so this knob stays readable and host-portable).
+ * 100 ms starts near vcap's own update period; check main.cpp's loop period
+ * before committing to it.
+ */
+unsigned long ivh_vact_window_ns = 100000000UL;
+
+/*
+ * Run the dual migration-decision evaluation (sec 3.8).  Default off.
+ *
+ * This is the knob that discharges constraint #2 -- "any boot containing a
+ * TSC-vs-real comparison must ship, in that same build, whatever is needed to
+ * answer *does IVH make the same migration decisions with the TSC signal as
+ * with the real one*".  Counters on the raw signals do not answer that
+ * question; only evaluating the actual gate twice does.
+ *
+ * Off by default because the destination-set half costs an O(nr_cpus) walk
+ * per evaluation.  That walk sits on a path which already takes a global
+ * raw_spin_lock_irqsave, crosses a BPF trampoline and does a full CPU scan,
+ * so it is affordable inside a measurement window and unaffordable as a
+ * permanent tax -- hence a knob rather than a compile-time choice.
+ */
+unsigned long ivh_decision_shadow = 0UL;
+
 #ifdef CONFIG_SYSCTL
+/*
+ * Both source selectors share one validating handler shape, and it is the
+ * shape ivh_pv_proc_preempt_src() (arch/x86/kernel/kvm.c) established: parse
+ * into a LOCAL, validate, and publish to the global only once the value is
+ * known good, so no concurrent reader ever observes a transiently invalid
+ * setting.  For a three-valued knob whose values mean "off / measure / trust",
+ * a value of 3 silently landing in the global would be indistinguishable at
+ * every read site from 2, i.e. a typo would flip a signal to authoritative.
+ *
+ * Deliberately NO cross-knob rejection between these two.  Setting both to 2
+ * at once is the FIRST COMBINATION of sec 3.10's flip order -- an explicitly
+ * planned phase, not a mistake to be blocked.  What the plan asks for is that
+ * it happen after each has been proved alone, and no sysctl handler can check
+ * "has a human read the histograms yet".  The guard that belongs in code is
+ * the one that rejects a configuration that could only ever be a silent
+ * no-op, which is why the CS-side knobs have one and these do not.
+ */
+static int ivh_proc_source_common(const struct ctl_table *table, int write,
+				  void *buffer, size_t *lenp, loff_t *ppos,
+				  unsigned long *target, const char *name)
+{
+	unsigned long val = READ_ONCE(*target);
+	struct ctl_table tmp = *table;
+	int ret;
+
+	tmp.data = &val;
+	ret = proc_doulongvec_minmax(&tmp, write, buffer, lenp, ppos);
+	if (ret || !write)
+		return ret;
+
+	if (val > 2) {
+		pr_err("IVH: refusing %s=%lu: valid values are 0 (real steal-derived value, default), 1 (shadow compare) and 2 (Part C authoritative)\n",
+		       name, val);
+		return -EINVAL;
+	}
+
+	WRITE_ONCE(*target, val);
+	return 0;
+}
+
+static int ivh_proc_cap_source(const struct ctl_table *table, int write,
+			       void *buffer, size_t *lenp, loff_t *ppos)
+{
+	return ivh_proc_source_common(table, write, buffer, lenp, ppos,
+				      &ivh_cap_source, "ivh_cap_source");
+}
+
+static int ivh_proc_preempt_event_source(const struct ctl_table *table, int write,
+					 void *buffer, size_t *lenp, loff_t *ppos)
+{
+	return ivh_proc_source_common(table, write, buffer, lenp, ppos,
+				      &ivh_preempt_event_source,
+				      "ivh_preempt_event_source");
+}
+
 static const struct ctl_table ivh_sysctls[] = {
 	{
 		.procname	= "ivh_capacity_threshold",
@@ -401,6 +522,48 @@ static const struct ctl_table ivh_sysctls[] = {
 	{
 		.procname	= "ivh_hot_preempt_ewma_k_fall",
 		.data		= &ivh_hot_preempt_ewma_k_fall,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	/*
+	 * Build 1 (build plan sec 3.6), scheduler-side knobs.  The two source
+	 * selectors default to 0, so Part C is computed on every tick and
+	 * consumed by nothing; ivh_decision_shadow defaults to 0, so the dual
+	 * evaluation and its O(nr_cpus) walk never run.  The remaining two are
+	 * parameters of a signal nobody reads at those defaults.
+	 */
+	{
+		.procname	= "ivh_cap_source",
+		.data		= &ivh_cap_source,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= ivh_proc_cap_source,
+	},
+	{
+		.procname	= "ivh_preempt_event_source",
+		.data		= &ivh_preempt_event_source,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= ivh_proc_preempt_event_source,
+	},
+	{
+		.procname	= "ivh_vact_jump_threshold",
+		.data		= &ivh_vact_jump_threshold,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_vact_window_ns",
+		.data		= &ivh_vact_window_ns,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_decision_shadow",
+		.data		= &ivh_decision_shadow,
 		.maxlen		= sizeof(unsigned long),
 		.mode		= 0644,
 		.proc_handler	= proc_doulongvec_minmax,

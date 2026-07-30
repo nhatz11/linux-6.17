@@ -231,6 +231,25 @@ void account_idle_time(u64 cputime)
 	else
 		cpustat[CPUTIME_IDLE] += cputime;
 	rq->last_idle_tp = sched_clock();
+	/*
+	 * IVH Part C: the same instant in the same units as everything else
+	 * Part C stores (raw TSC cycles).  This is the ONLY reason
+	 * ivh_vact_idle_exit_tsc exists: account_idle_ticks() does not call
+	 * account_process_tick(), so the tick stamp is not republished while
+	 * idle time is being accounted, and the first post-idle tick's
+	 * gap-detection is comparing against the PRE-idle stamp.  Without a
+	 * timestamp for when idle actually ended, ivh_vact_tick() could only
+	 * reset the burst start to `now` and would systematically undercount
+	 * every post-idle burst by up to one tick period.  See the S1 reset in
+	 * kernel/sched/core.c.
+	 *
+	 * Unconditional, matching rq->last_idle_tp immediately above: one
+	 * rdtsc on a path that already takes a sched_clock() reading is not a
+	 * measurable cost, and a gated version would make the idle explanation
+	 * unavailable across exactly the live sysctl flip during which it is
+	 * most needed.
+	 */
+	rq->ivh_vact_idle_exit_tsc = ivh_raw_tsc();
 }
 
 
@@ -501,6 +520,70 @@ void account_process_tick(struct task_struct *p, int user_tick)
 	u64 cputime, steal;
 
 	this_rq()->clock_preempt = sched_clock();
+	/*
+	 * IVH TSC heartbeat, Phase 1 write site: the exact cadence and the exact
+	 * publish point as clock_preempt, so that ivh_beat_stale() is a
+	 * controlled comparison against is_cpu_preempted() rather than a new
+	 * signal.  Swapping sched_clock() for rdtsc() changes the clock SOURCE,
+	 * not the RESOLUTION -- the resolution is set by the write frequency
+	 * (HZ), which is why Phase 1 is instrumentation and Phase 2 (the publish
+	 * from inside the qspinlock spin loops themselves) is the actual
+	 * proposal.
+	 *
+	 * KNOWN BLIND SPOT, inherited deliberately: this function does not run
+	 * on a CPU in nohz idle (CONFIG_NO_HZ_COMMON=y here), so an idle vCPU's
+	 * stamp ages without bound and reads as preempted.  That is exactly the
+	 * blind spot the kernel's own is_cpu_preempted() has, and keeping it is
+	 * what makes Phase 1 controlled; it is NOT the tick-*granularity* effect
+	 * the older HZ=250-era comments describe (at HZ=1000 the 1 ms tick is
+	 * below the 1.5 ms threshold, so sampling phase alone cannot produce a
+	 * false positive on a ticking CPU).  At pv_wait_early()'s call site the
+	 * predecessor is spinning with preemption disabled, not idle, so the
+	 * blind spot may never fire there -- that question is itself a finding,
+	 * and ivh_beat_age_hist_running[]'s tail is where it would show up.
+	 * The two fixes if it does are (a) publish from the idle entry/exit path
+	 * or (b) take max(beat, rq->last_idle_tp) the way
+	 * tools/bpf/MY_ivh_atc.bpf.c already does.  Diagnose from the histogram
+	 * before applying either.
+	 */
+	ivh_tsc_beat_publish();
+
+	/*
+	 * IVH inferred steal time (Plan 2, kernel/sched/core.c).  Owning-CPU
+	 * hook: perf_event_read_local() rejects a per-CPU event read from any
+	 * other CPU, so the REF_TSC sample has to be taken here and published
+	 * into struct rq for get_steal_and_preemptions() to read remotely.
+	 * This site already runs with IRQs disabled, which
+	 * perf_event_read_local() wants anyway.
+	 *
+	 * Placed before the vtime_accounting_enabled_this_cpu() early return
+	 * for the same reason clock_preempt is: the sample must be taken on
+	 * every tick on every CPU regardless of which accounting flavour is
+	 * live.  Whole thing is a single load-and-branch until
+	 * kernel.ivh_ref_steal_enabled is set, and the counters do not even
+	 * exist until then.
+	 */
+	ivh_ref_accumulate();
+
+	/*
+	 * IVH Part C tick-only stamp + jump detection (kernel/sched/core.c).
+	 *
+	 * Placed here for the same reason clock_preempt and ivh_ref_accumulate()
+	 * are -- before the vtime_accounting_enabled_this_cpu() early return --
+	 * because the sample must be taken on every tick on every CPU
+	 * regardless of accounting flavour.  A stamp that skipped some ticks
+	 * would produce gaps that the jump detector cannot distinguish from
+	 * host preemption, which is the one thing this signal exists to
+	 * measure.
+	 *
+	 * THIS IS THE ONLY WRITE SITE FOR rq->ivh_vact_stamp, and that is the
+	 * whole design.  The shared TSC heartbeat could not be reused for this
+	 * precisely because it is also written from pv_init_node(), from both
+	 * qspinlock spin loops and from three halt-exit sites -- a stamp
+	 * refreshed from the spin loops has no gap left to detect.  Do not add
+	 * a second publisher.
+	 */
+	ivh_vact_tick();
 
 	if (vtime_accounting_enabled_this_cpu())
 		return;

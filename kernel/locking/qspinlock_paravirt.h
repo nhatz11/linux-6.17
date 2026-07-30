@@ -6,6 +6,15 @@
 #include <linux/hash.h>
 #include <linux/memblock.h>
 #include <linux/debug_locks.h>
+#include <linux/log2.h>
+/*
+ * IVH TSC heartbeat storage/knobs/counters.  x86-only, and this file is
+ * already x86-only in practice for the same reason: it dereferences
+ * ivh_pv_wait_mechanism, which only arch/x86 defines.  arch/powerpc's
+ * pseries PARAVIRT_SPINLOCKS uses its own arch/powerpc/lib/qspinlock.c and
+ * never includes this header, so nothing else is affected.
+ */
+#include <asm/ivh_tsc_beat.h>
 
 /*
  * Implement paravirt qspinlocks; the general idea is to halt the vcpus instead
@@ -90,7 +99,37 @@ static inline bool pv_hybrid_queued_unfair_trylock(struct qspinlock *lock)
 
 		if (!(val & _Q_LOCKED_PENDING_MASK) &&
 		    try_cmpxchg_acquire(&lock->locked, &old, _Q_LOCKED_VAL)) {
+			/*
+			 * IVH ownership-transfer site A6 (build plan sec
+			 * 3.3.4): PV lock stealing.
+			 */
+			ivh_lock_set_holder(lock);
 			lockevent_inc(pv_lock_stealing);
+			/*
+			 * ...and a plain per-CPU counter beside it, because
+			 * lockevent_inc() above compiles to NOTHING on this
+			 * build (CONFIG_LOCK_EVENT_COUNTS is not set; see the
+			 * same note on the ivh_beat_* counters in
+			 * <asm/ivh_tsc_beat.h>).
+			 *
+			 * This is not redundancy, it is the only way to answer
+			 * a question Build 1 must answer.  ivh_cs_head_check()
+			 * below can make the queue head break out of its spin
+			 * early, and doing so runs clear_pending() sooner than
+			 * it otherwise would -- reopening the very window this
+			 * function steals through.  Without a live steal count
+			 * the question "did the early bail reopen the stealing
+			 * window, and by how much" is unanswerable and would
+			 * force a rebuild purely to add a counter, which is
+			 * precisely the failure this build is shaped to avoid.
+			 *
+			 * Unconditional rather than gated on ivh_cs_preempt_src
+			 * on purpose: the steal rate at src == 0 is the
+			 * BASELINE the src == 1 and src == 2 rates are compared
+			 * against, and a counter that only exists once the
+			 * feature is on has no baseline to be compared to.
+			 */
+			this_cpu_inc(ivh_lock_steals);
 			return true;
 		}
 		if (!(val & _Q_TAIL_MASK) || (val & _Q_PENDING_MASK))
@@ -257,12 +296,314 @@ static struct pv_node *pv_unhash(struct qspinlock *lock)
 }
 
 /*
+ * IVH TSC heartbeat: shadow comparator and (at ivh_pv_preempt_src == 2) the
+ * live substitute for vcpu_is_preempted() at pv_wait_early()'s call site.
+ *
+ * NAMED is_wait_preempted() rather than the older ivh_prev_is_preempted()
+ * purely so that it and its Build 1 sibling is_cs_preempted()
+ * (<asm/ivh_tsc_beat.h>) read as a pair at their call sites.  They answer
+ * genuinely different questions and the names are the cheapest place to say
+ * so: this one is "has the vCPU we are queued behind stopped proving it is
+ * executing", refreshed at >= 1 kHz from the tick plus per-spin-iteration
+ * from the spin loops; the other is "is the CPU that OWNS this lock inside a
+ * critical section, and is something wrong with it".  The rename was done in
+ * one shot in Build 1 and must not be revisited later -- renaming across a
+ * boot boundary would make every before/after diff harder to read for no
+ * benefit.
+ *
+ * See arch/x86/include/asm/qspinlock.h for the storage and the knobs, and
+ * tools/bpf/docs/ivh_tsc_heartbeat_refcycles_build_plans_2026-07-26.md sec 2
+ * for why this is a portability argument and not a performance one.
+ *
+ * Cost when ivh_pv_preempt_src == 0 (the default) is one READ_ONCE of a
+ * read-mostly global plus one perfectly-predicted branch, on a path that
+ * already does READ_ONCE(ivh_pv_wait_mechanism) two lines above -- the same
+ * "safe to leave compiled in permanently" posture ivh_pv_wait_trace already
+ * documents in arch/x86/kernel/kvm.c.  Nothing below is reached at src == 0,
+ * including the rdtsc.
+ *
+ * src == 1 is the measurement mode and is the one that matters: compute both
+ * signals, bin the heartbeat age into the histogram selected by what the HOST
+ * says, count the 2x2 agreement matrix -- and still RETURN THE KVM BIT, so
+ * behavior is unchanged and the numbers are collected under the real
+ * workload rather than a synthetic one.  Only src == 2 changes what
+ * pv_wait_early() decides.
+ *
+ * ONE rdtsc, not two: ivh_beat_age() is called once and both the verdict and
+ * the histogram sample are derived from that single reading.  Calling
+ * ivh_beat_stale() as well would take a second, later reading, and the
+ * histogram would then be describing a different event from the one the
+ * verdict was taken on.
+ */
+static inline bool is_wait_preempted(int cpu)
+{
+	bool kvm = vcpu_is_preempted(cpu);
+	unsigned long src = READ_ONCE(ivh_pv_preempt_src);
+	s64 age, min_age;
+	bool beat;
+	int bucket;
+
+	if (likely(!src))
+		return kvm;
+
+	age  = ivh_beat_age(cpu);
+	beat = age > (s64)READ_ONCE(ivh_pv_beat_threshold);
+
+	/*
+	 * Cross-vCPU TSC drift guard (build plan sec 2.8).  Track the minimum
+	 * age this reader has ever seen.  On offset-aligned TSCs it parks near
+	 * zero and stays there; a minimum that climbs monotonically over hours
+	 * is the drift signature.  Drift is dangerous precisely because it is
+	 * silent and one-directional -- it never faults, it just makes one vCPU
+	 * look permanently preempted to one set of neighbours.  Costs one
+	 * compare, and the store is taken only when a new minimum is found.
+	 */
+	min_age = raw_cpu_read(ivh_beat_min_age);
+	if (age < min_age)
+		raw_cpu_write(ivh_beat_min_age, age);
+
+	/*
+	 * Log2-bucketed age histogram, split by the HOST's verdict, same raw
+	 * layout as ivh_obs_cs_hist (kernel/locking/spinlock.c): bucket i is
+	 * 2^i..2^(i+1)-1 cycles, bucket 0 absorbs zero and every negative age
+	 * (small negative TSC skew reads as "fresher than now", which belongs
+	 * at the bottom, not off the end of the array), and the top bucket
+	 * saturates.  Both ends clamped explicitly rather than trusted:
+	 * ilog2(0) would index [-1].
+	 *
+	 * This pair IS the threshold-tuning method.  The threshold is wherever
+	 * the two distributions separate; if the _running tail overlaps the
+	 * _preempted body, the signal does not work at this write cadence and
+	 * that is the result.
+	 */
+	bucket = (age > 0) ? ilog2((u64)age) : 0;
+	if (bucket >= IVH_BEAT_AGE_HIST_BUCKETS)
+		bucket = IVH_BEAT_AGE_HIST_BUCKETS - 1;
+	if (kvm)
+		this_cpu_inc(ivh_beat_age_hist_preempted[bucket]);
+	else
+		this_cpu_inc(ivh_beat_age_hist_running[bucket]);
+
+	/* 2x2 agreement matrix against host ground truth. */
+	if (beat == kvm) {
+		if (kvm)
+			this_cpu_inc(ivh_beat_agree_true);
+		else
+			this_cpu_inc(ivh_beat_agree_false);
+	} else if (beat) {
+		this_cpu_inc(ivh_beat_false_pos);  /* TSC says preempted, host says no */
+	} else {
+		this_cpu_inc(ivh_beat_false_neg);  /* host says preempted, TSC missed it */
+	}
+
+	if (src == 2)
+		return beat;
+
+	return kvm;
+}
+
+/*
+ * Phase 2 publish: stamp our own heartbeat from inside the qspinlock spin
+ * loops, at microsecond-or-better cadence rather than the 1 ms tick cadence.
+ * This -- not Phase 1 -- is the actual proposal; see sec 2.2 of the build plan
+ * for the coverage argument (in short: while we spin on node->locked our MCS
+ * predecessor is itself still SPINNING, because the predecessor releases its
+ * successor at the moment it ACQUIRES the lock, not when it releases it, so
+ * the long critical section is being run by the lock owner, who is not prev).
+ *
+ * Gated twice over, and both gates matter:
+ *   - on ivh_pv_preempt_src != 0, because at src == 0 nobody reads the stamp
+ *     and this would be a pure dirtying store in the hottest spin loop in the
+ *     kernel;
+ *   - on (loop & ivh_pv_beat_publish_mask) == 0, because the cost side here
+ *     is real: every remote read of this line pulls it across the
+ *     interconnect.  At the default 0xfff that is one store per 4096
+ *     cpu_relax() iterations, ~90 us at this project's measured ~50 cycles
+ *     per PAUSE -- already ~16x finer than the 1 ms tick floor at 1/16th the
+ *     store rate of the 0xff read cadence.
+ *
+ * The src check is placed FIRST and reads a read-mostly global, so the
+ * default path is one predicted branch and no rdtsc.
+ */
+static __always_inline void ivh_beat_publish_in_spin(int loop)
+{
+	if (likely(!READ_ONCE(ivh_pv_preempt_src)))
+		return;
+	if (loop & (int)READ_ONCE(ivh_pv_beat_publish_mask))
+		return;
+
+	ivh_tsc_beat_publish();
+	this_cpu_inc(ivh_beat_publishes);
+}
+
+/*
+ * ivh_cs_head_check - the queue head asks whether the CURRENT LOCK HOLDER is
+ * in trouble, and (only at ivh_cs_preempt_src == 2) bails out of its spin if
+ * the answer is yes.  Build 1, build plan sec 3.4.
+ *
+ * WHY THE QUEUE HEAD AND NOT THE MCS NODES.  pv_wait_early() already has the
+ * right signal for its own question: for an MCS node, prev->cpu genuinely IS
+ * "the thing we are waiting on", so vcpu_is_preempted(prev->cpu) /
+ * is_wait_preempted(prev->cpu) is exactly on point there.  The queue head is
+ * different in kind -- it is spinning on the lock BYTE, waiting for an owner
+ * it has no name for.  That is the gap holder identity exists to close, and
+ * this is the only site that consumes it.
+ *
+ * Called at the (loop & PV_PREV_CHECK_MASK) == 0 cadence pv_wait_early()
+ * already uses, for the identical reason: the point of that mask is not to
+ * pound a remote cacheline, and a lookup that reads a remote holder slot and
+ * then a remote CS stamp is at least as expensive to do per-iteration as the
+ * check it is modelled on.
+ *
+ * THREE SHAPE DECISIONS, each mirroring existing in-tree reasoning:
+ *
+ *   - ivh_cs_age() is called ONCE, and both the verdict and the histogram
+ *     sample come from that single reading.  Calling is_cs_preempted()
+ *     separately would take a second, later rdtsc(), and the histogram would
+ *     then describe a different event from the one the verdict was taken on.
+ *     Same rule, same reason, as is_wait_preempted() above.
+ *   - `age >= 0` is the stamp == 0 sentinel guard.  A cleared stamp would
+ *     otherwise make rdtsc() - 0 an enormous positive that reads as
+ *     "preempted forever", silently and in the worst direction.
+ *   - src == 2 is the ONLY thing that changes the return value.  At src == 1
+ *     every counter and every histogram is fed under the real workload and
+ *     the function still returns false, so behaviour is bit-identical to
+ *     src == 0 while the data is collected.  Precisely the
+ *     is_wait_preempted() posture.
+ *
+ * THE SIDE EFFECT, WHICH MUST NOT BE ASSUMED HARMLESS.  Returning true makes
+ * the caller break out of its spin loop, which runs clear_pending(lock)
+ * EARLIER than it otherwise would.  The pending bit is the anti-lock-stealing
+ * flag -- pv_hybrid_queued_unfair_trylock() steals only when
+ * !(val & _Q_LOCKED_PENDING_MASK), and the whole starvation-freedom argument
+ * at the top of this file rests on the queue head holding that bit set while
+ * it spins.  Clearing it sooner reopens the stealing window and weakens that
+ * guarantee.  This is categorically unlike the MCS-node call site, where
+ * pv_wait_early() returning true only changes WHEN a waiter moves from hot
+ * spin to backoff and the caller's for(;;) re-checks node->locked regardless.
+ *
+ * Hence ivh_head_bail_early and ivh_head_bail_loop_hist[].  SPIN_THRESHOLD is
+ * 1 << 15 and the loop counts DOWN, so a bail at loop L means the pending bit
+ * is dropped L iterations early: a distribution concentrated near
+ * SPIN_THRESHOLD means the bit is being released almost immediately and the
+ * starvation guarantee is effectively gone, while a distribution near 0 means
+ * the bail happens just before the loop would have exhausted anyway and costs
+ * nothing.  Read that histogram together with ivh_lock_steals at src 1 vs 2
+ * before ever leaving src == 2 in place.
+ */
+static inline bool ivh_cs_head_check(struct qspinlock *lock, int loop)
+{
+	unsigned long src = READ_ONCE(ivh_cs_preempt_src);
+	int h1, h2, bucket;
+	bool verdict, kvm;
+	s64 age;
+
+	if (likely(!src))
+		return false;
+	if (loop & PV_PREV_CHECK_MASK)
+		return false;
+
+	this_cpu_inc(ivh_cs_checks);
+
+	h1 = ivh_lock_holder_cpu(lock);
+	if (h1 < 0)
+		return false;		/* counted inside the lookup */
+
+	if (h1 == raw_smp_processor_id()) {
+		/*
+		 * We are the queue head waiting for a lock we ourselves are
+		 * recorded as holding.  Must be ~0: a real count means either a
+		 * stale stamp left behind by a missed release site or a genuine
+		 * reentrancy bug, and either way the holder table is lying.
+		 *
+		 * Counted rather than pr_warn_once()'d, deliberately.  This
+		 * runs inside the qspinlock slowpath with the lock still
+		 * contended; printk() takes locks of its own and reaching it
+		 * from here is a recursion hazard that would turn a diagnostic
+		 * into a hang.  /proc/ivh_debug prints this counter beside
+		 * ivh_cs_checks, which is where it will actually be looked at.
+		 */
+		this_cpu_inc(ivh_holder_self);
+		return false;
+	}
+
+	age = ivh_cs_age(h1);
+	verdict = READ_ONCE(ivh_cs_predicate_form)
+			? (age >= 0 && ivh_beat_stale(h1))
+			: (age >= 0 && age > (s64)READ_ONCE(ivh_cs_beat_threshold));
+	kvm = vcpu_is_preempted(h1);
+
+	/*
+	 * Log2-bucketed CS-stamp age, split by the HOST's verdict at the same
+	 * instant, identical layout to ivh_beat_age_hist_*: bucket 0 absorbs
+	 * zero, negatives and the not-in-a-CS sentinel; the top bucket
+	 * saturates.  Both ends clamped explicitly rather than trusted --
+	 * ilog2(0) would index [-1].
+	 *
+	 * This pair is simultaneously the threshold-calibration method AND the
+	 * sign-convention check.  If _preempted does not sit above _running,
+	 * `age > threshold` is backwards, and these two lines say so directly
+	 * in one boot without a rebuild.
+	 */
+	bucket = (age > 0) ? ilog2((u64)age) : 0;
+	if (bucket >= IVH_CS_AGE_HIST_BUCKETS)
+		bucket = IVH_CS_AGE_HIST_BUCKETS - 1;
+	if (kvm)
+		this_cpu_inc(ivh_cs_age_hist_preempted[bucket]);
+	else
+		this_cpu_inc(ivh_cs_age_hist_running[bucket]);
+
+	/*
+	 * 2x2 agreement matrix against host ground truth.  This IS the
+	 * "does the TSC signal make the same decision as the real steal bit"
+	 * comparator for the CS predicate -- nothing further is needed and
+	 * nothing is deferred to a later build.
+	 */
+	if (verdict == kvm) {
+		if (kvm)
+			this_cpu_inc(ivh_cs_agree_true);
+		else
+			this_cpu_inc(ivh_cs_agree_false);
+	} else if (verdict) {
+		this_cpu_inc(ivh_cs_false_pos);	/* CS stamp says preempted, host says no */
+	} else {
+		this_cpu_inc(ivh_cs_false_neg);	/* host says preempted, CS stamp missed it */
+	}
+
+	/*
+	 * Read-verify-read.  holder_cpu and the CS stamp (or the liveness
+	 * heartbeat) are two independent loads and CAN skew -- no barrier fixes
+	 * that, because it is a timing problem and not a reordering problem.
+	 * Re-read the holder and act only if it is unchanged; a mismatch means
+	 * the lock changed hands underneath the verdict and the verdict
+	 * describes a CPU that is no longer relevant.
+	 */
+	h2 = ivh_lock_holder_cpu(lock);
+	if (h2 != h1) {
+		this_cpu_inc(ivh_holder_raced);
+		return false;
+	}
+
+	if (verdict) {
+		this_cpu_inc(ivh_head_bail_early);
+		bucket = ilog2((unsigned int)loop | 1U);
+		if (bucket >= IVH_CS_LOOP_HIST_BUCKETS)
+			bucket = IVH_CS_LOOP_HIST_BUCKETS - 1;
+		this_cpu_inc(ivh_head_bail_loop_hist[bucket]);
+	}
+
+	return (src == 2) && verdict;
+}
+
+/*
  * Return true if when it is time to check the previous node which is not
  * in a running state.
  */
 static inline bool
 pv_wait_early(struct pv_node *prev, int loop)
 {
+	unsigned long mech;
+
 	if ((loop & PV_PREV_CHECK_MASK) != 0)
 		return false;
 
@@ -297,11 +638,22 @@ pv_wait_early(struct pv_node *prev, int loop)
 	 * instead of falling through to an unconditional halt. Mechanisms 0
 	 * and 1 are unaffected: they still sleep on threshold exhaustion
 	 * regardless of this function's return value on that final check.
+	 *
+	 * Mechanism 3 ("no adaptive spinning", a live stand-in for `nopvspin`)
+	 * opts out alongside mechanism 0 and for the same reason: its whole
+	 * purpose is to add nothing to the stock check above. Letting the steal
+	 * bit bail it out early would not change *what* it does -- ivh_pv_wait()
+	 * only cpu_relax()-spins under mechanism 3 either way -- but it would
+	 * move the VCPU_HALTED store earlier, dragging more acquisitions through
+	 * pv_kick_node()'s cmpxchg, _Q_SLOW_VAL, pv_hash() and the unlock
+	 * slowpath, which is exactly the PV overhead this mechanism is meant to
+	 * minimize when used as a baseline. Mechanisms 1 and 2 are unaffected.
 	 */
-	if (!READ_ONCE(ivh_pv_wait_mechanism))
+	mech = READ_ONCE(ivh_pv_wait_mechanism);
+	if (!mech || mech == 3)
 		return false;
 
-	return vcpu_is_preempted(prev->cpu);
+	return is_wait_preempted(prev->cpu);
 }
 
 /*
@@ -315,6 +667,31 @@ static void pv_init_node(struct mcs_spinlock *node)
 
 	pn->cpu = smp_processor_id();
 	pn->state = VCPU_RUNNING;
+
+	/*
+	 * IVH heartbeat cold-start seed (build plan sec 2.2, "a second hole").
+	 * The first time PV_PREV_CHECK_MASK fires after `prev` enters the queue,
+	 * prev may not have published yet, so its slot still holds a value from
+	 * a previous and entirely unrelated spin -- an instant false positive,
+	 * and the worst kind, because it fires at queue-entry when the queue is
+	 * most likely to be short and the wait most likely to be brief.  Seeding
+	 * here fixes it for every node, since every node runs pv_init_node() on
+	 * queue entry.
+	 *
+	 * Gated on ivh_pv_preempt_src, which is a deliberate deviation from the
+	 * build plan's "unconditional seed publish": at src == 0 nothing reads
+	 * the stamp, so an unconditional seed would put an rdtsc plus a
+	 * remotely-read dirtying store on EVERY qspinlock slowpath entry to buy
+	 * nothing.  The cost of the gate is that flipping src from 0 to 1 live
+	 * leaves already-queued nodes unseeded for one spin; the tick publish is
+	 * unconditional, so those still carry a stamp at worst one tick old,
+	 * i.e. exactly Phase 1 freshness, and the shadow comparator counts the
+	 * resulting disagreements rather than acting on them.
+	 */
+	if (unlikely(READ_ONCE(ivh_pv_preempt_src))) {
+		ivh_tsc_beat_publish();
+		this_cpu_inc(ivh_beat_publishes);
+	}
 }
 
 /*
@@ -331,12 +708,23 @@ static void pv_wait_node(struct mcs_spinlock *node, struct mcs_spinlock *prev)
 
 	for (;;) {
 		for (wait_early = false, loop = SPIN_THRESHOLD; loop; loop--) {
+			/*
+			 * node->locked stays UNCONDITIONALLY FIRST. That is
+			 * also the mitigation for sec 2.2's "one real hole":
+			 * between prev acquiring the lock (it stops publishing)
+			 * and us observing node->locked == 1, prev's stamp
+			 * ages. This loop reads node->locked on EVERY
+			 * iteration while the heartbeat is consulted only every
+			 * 256th, so that window is a few hundred cycles against
+			 * a threshold in the millions. Do not reorder these.
+			 */
 			if (READ_ONCE(node->locked))
 				return;
 			if (pv_wait_early(pp, loop)) {
 				wait_early = true;
 				break;
 			}
+			ivh_beat_publish_in_spin(loop);
 			cpu_relax();
 		}
 
@@ -433,6 +821,7 @@ static void pv_wait_node(struct mcs_spinlock *node, struct mcs_spinlock *prev)
 static void pv_kick_node(struct qspinlock *lock, struct mcs_spinlock *node)
 {
 	struct pv_node *pn = (struct pv_node *)node;
+	unsigned long mech;
 	u8 old = VCPU_HALTED;
 	/*
 	 * If the vCPU is indeed halted, advance its state to match that of
@@ -497,8 +886,22 @@ static void pv_kick_node(struct qspinlock *lock, struct mcs_spinlock *node)
 	 * returns by IVH_PV_ADAPTIVE_TSC (~1 ms) even with zero IPIs; mechanism
 	 * 2's HLT un-halts on the next timer tick at the latest -- so either
 	 * mechanism makes forward progress with no IPI at all.
+	 *
+	 * Mechanism 3 is excluded: its successor is not halted or napping, it is
+	 * in ivh_pv_wait()'s plain cpu_relax() loop on pn->state, and the
+	 * try_cmpxchg_relaxed() above has already published VCPU_HASHED to it --
+	 * so the IPI has nothing left to do and would only add a vmexit per
+	 * hashed handoff to the one mechanism whose entire purpose is to add
+	 * nothing. This is the same "no kick at all" decision ivh_pv_kick() makes
+	 * for mechanism 3, applied at the second, independent kick site. It
+	 * cannot strand a straggler left over from a live toggle out of mechanism
+	 * 0 either: that waiter is in a bare halt() with RFLAGS.IF=0, which a
+	 * maskable RESCHEDULE_VECTOR IPI provably could never have woken anyway
+	 * (only ivh_pv_kick()'s KVM_HC_KICK_CPU hypercall can, and mechanism 3
+	 * deliberately keeps issuing that one).
 	 */
-	if (READ_ONCE(ivh_pv_wait_mechanism))
+	mech = READ_ONCE(ivh_pv_wait_mechanism);
+	if (mech && mech != 3)
 		smp_send_reschedule(pn->cpu);
 }
 
@@ -542,8 +945,42 @@ pv_wait_head_or_lock(struct qspinlock *lock, struct mcs_spinlock *node)
 		 */
 		set_pending(lock);
 		for (loop = SPIN_THRESHOLD; loop; loop--) {
-			if (trylock_clear_pending(lock))
+			if (trylock_clear_pending(lock)) {
+				/*
+				 * IVH ownership-transfer site A7 (build plan
+				 * sec 3.3.4): the queue head acquires straight
+				 * out of the spin.  trylock_clear_pending() is
+				 * a try_cmpxchg_acquire() on the
+				 * locked_pending halfword in the
+				 * _Q_PENDING_BITS == 8 variant that is live
+				 * here.
+				 */
+				ivh_lock_set_holder(lock);
 				goto gotlock;
+			}
+			/*
+			 * IVH CS predicate consult site (build plan sec 3.4).
+			 * At ivh_cs_preempt_src == 0 this is one READ_ONCE of a
+			 * read-mostly global and one predicted branch, taken
+			 * before anything else -- the same posture
+			 * ivh_beat_publish_in_spin() below already has.  At
+			 * src == 1 it measures and still returns false.  Only
+			 * at src == 2 can it break the loop, and breaking the
+			 * loop runs clear_pending() below EARLIER than it would
+			 * otherwise have run, which reopens the lock-stealing
+			 * window -- see the function's own comment, and read
+			 * ivh_head_bail_loop_hist[] before trusting src == 2.
+			 */
+			if (ivh_cs_head_check(lock, loop))
+				break;
+			/*
+			 * The queue head publishes too: sec 2.2's coverage
+			 * table needs "prev spinning in pv_wait_head_or_lock()"
+			 * to produce a fresh timestamp, otherwise the waiter
+			 * queued directly behind the head would read the head
+			 * as preempted for the whole time it holds that role.
+			 */
+			ivh_beat_publish_in_spin(loop);
 			cpu_relax();
 		}
 		clear_pending(lock);
@@ -571,6 +1008,15 @@ pv_wait_head_or_lock(struct qspinlock *lock, struct mcs_spinlock *node)
 				 */
 				WRITE_ONCE(lock->locked, _Q_LOCKED_VAL);
 				WRITE_ONCE(*lp, NULL);
+				/*
+				 * IVH ownership-transfer site A8 (build plan
+				 * sec 3.3.4): the queue head found the lock
+				 * free while hashing it, and now owns it.
+				 * Stamped after the lock byte is restored to
+				 * _Q_LOCKED_VAL so that the holder record and
+				 * the lock word become visible in that order.
+				 */
+				ivh_lock_set_holder(lock);
 				goto gotlock;
 			}
 		}
@@ -640,6 +1086,15 @@ __pv_queued_spin_unlock_slowpath(struct qspinlock *lock, u8 locked)
 	 * Now that we have a reference to the (likely) blocked pv_node,
 	 * release the lock.
 	 */
+	/*
+	 * IVH release site R4 (build plan sec 3.3.4).  Idempotent with respect
+	 * to R3 below, which has already cleared this slot on the way in: a
+	 * clear of an already-cleared slot fails the tag check and does
+	 * nothing.  That idempotence is deliberate -- see R3 for why clearing
+	 * unconditionally BEFORE the conditional release is correct and
+	 * clearing only on success would not be.
+	 */
+	ivh_lock_clear_holder(lock);
 	smp_store_release(&lock->locked, 0);
 
 	/*
@@ -663,6 +1118,18 @@ __visible __lockfunc void __pv_queued_spin_unlock(struct qspinlock *lock)
 	 * unhash. Otherwise it would be possible to have multiple @lock
 	 * entries, which would be BAD.
 	 */
+	/*
+	 * IVH release site R3 (build plan sec 3.3.4).  This is a CONDITIONAL
+	 * release: on failure it falls through to R4 in
+	 * __pv_queued_spin_unlock_slowpath().  Clear unconditionally here and
+	 * let R4's clear be a no-op, rather than trying to clear only when the
+	 * cmpxchg succeeds -- the latter would leave a window in which the lock
+	 * byte is already 0 and the holder is still published, i.e. a live
+	 * wrong answer handed to whichever queue head is spinning on this lock
+	 * at that instant.  A spurious early clear only ever produces
+	 * "unknown", which is the safe direction.
+	 */
+	ivh_lock_clear_holder(lock);
 	if (try_cmpxchg_release(&lock->locked, &locked, 0))
 		return;
 

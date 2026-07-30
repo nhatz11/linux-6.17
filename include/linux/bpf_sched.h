@@ -226,9 +226,30 @@ DECLARE_PER_CPU(u64, ivh_prelock_coldthread_skipped);
 DECLARE_PER_CPU(u64, ivh_prelock_hotthread_passed);
 
 /* Observe-only stats (ivh_observe / PR_SET_IVH_ELIGIBLE arg2==2), defined in
- * kernel/locking/spinlock.c, surfaced via /proc/ivh_debug (kernel/sched/fair.c). */
+ * kernel/locking/spinlock.c, surfaced via /proc/ivh_debug (kernel/sched/fair.c).
+ *
+ * cs_time_total_ns is fed from cs_exit() and pairs with total_holds as its
+ * denominator; wait_total_ns is fed from the qspinlock slowpath
+ * (kernel/locking/qspinlock.c) and pairs with wait_events, which counts only
+ * contended acquisitions -- the two averages have deliberately different
+ * denominators, see the comments at both feed sites. */
 DECLARE_PER_CPU(u64, ivh_obs_total_holds);
 DECLARE_PER_CPU(u64, ivh_obs_stolen_holds);
+DECLARE_PER_CPU(u64, ivh_obs_cs_time_total_ns);
+DECLARE_PER_CPU(u64, ivh_obs_wait_total_ns);
+DECLARE_PER_CPU(u64, ivh_obs_wait_events);
+
+/* Log2-bucketed CS-hold-time histogram, same gate and same feed site
+ * (cs_exit()) as cs_time_total_ns, giving the tail of the hold-duration
+ * distribution that a sum+count average structurally cannot -- see the long
+ * comment above the definition in kernel/locking/spinlock.c for the bucket
+ * layout and the clamping rules. Bucket i covers 2^i .. 2^(i+1)-1 ns, except
+ * i == 0 (0-1 ns, absorbs zero-length holds) and the top bucket (saturating,
+ * >= 2^31 ns). 32 buckets reaches multi-second holds, far past both the
+ * ~300ns common case and the 100us IVH_HOT_STEAL_FLOOR_NS. The bucket counts
+ * sum to ivh_obs_total_holds. */
+#define IVH_OBS_CS_HIST_BUCKETS 32
+DECLARE_PER_CPU(u64, ivh_obs_cs_hist[IVH_OBS_CS_HIST_BUCKETS]);
 
 /*
  * Mutex optimistic-spin observability counters, defined in
@@ -250,6 +271,60 @@ DECLARE_PER_CPU(u64, ivh_obs_stolen_holds);
  */
 DECLARE_PER_CPU(u64, ivh_mutex_spin_observed);
 DECLARE_PER_CPU(u64, ivh_mutex_spin_owner_preempted);
+
+/*
+ * ---------------------------------------------------------------------------
+ * IVH Part C source selection and the decision-agreement comparators.
+ * Build 1, tools/bpf/docs/ivh_tsc_full_redesign_build_plan_2026-07-29.md
+ * sec 3.6 / 3.8.  All defined in kernel/sched/bpf_sched.c; the source knobs
+ * are consumed in kernel/sched/fair.c's Gate 1+2, the parameters in
+ * kernel/sched/core.c's ivh_vact_tick().
+ * ---------------------------------------------------------------------------
+ *
+ *   ivh_cap_source            0 rq->cpu_capacity (vcap) | 1 shadow | 2 rq->ivh_vact_capacity
+ *   ivh_preempt_event_source  0 rq->last_preemption/last_active_time (real steal)
+ *                             | 1 shadow | 2 rq->ivh_vact_last_preempt_tsc/_last_active_c
+ *   ivh_vact_jump_threshold   tick-stamp staleness threshold, raw TSC cycles
+ *   ivh_vact_window_ns        tumbling window for the capacity ratio, ns
+ *   ivh_decision_shadow       run the dual migration-decision evaluation
+ */
+extern unsigned long ivh_cap_source;
+extern unsigned long ivh_preempt_event_source;
+extern unsigned long ivh_vact_jump_threshold;
+extern unsigned long ivh_vact_window_ns;
+extern unsigned long ivh_decision_shadow;
+
+/*
+ * Decision-agreement comparators (sec 3.8).  Defined in kernel/sched/fair.c
+ * beside the gates they instrument, summed into /proc/ivh_debug.  Fed only
+ * while ivh_decision_shadow != 0.
+ *
+ * (a) Gate 1+2 VERDICT agreement -- ivh_dec_*.  The gate is evaluated twice,
+ *     once from (rq->cpu_capacity, rq->last_preemption, rq->last_active_time)
+ *     and once from (rq->ivh_vact_capacity, ivh_vact_last_preempt_tsc,
+ *     ivh_vact_last_active_c), and the pair is binned into a 2x2.  The
+ *     existing ivh_steal_imminent_capacity_reject / _time_left_reject are
+ *     left strictly alone so that what they mean does not change -- the same
+ *     discipline the duplicated-gate comment in fair.c already enforces.
+ *
+ * (b) DESTINATION-SET agreement -- ivh_cap_pass_*.  The full BPF scan cannot
+ *     be run twice, but the thing the capacity number actually decides can
+ *     be: which CPUs pass GATE_CAPACITY_LOW and GATE_NOT_BETTER.  If
+ *     pass_tsc_only and pass_real_only are both small relative to pass_both,
+ *     the capacity replacement is behaviourally equivalent and
+ *     ivh_cap_source=2 is safe; if either is large it is not, and the
+ *     DIRECTION says which way the replacement is biased.  This is the
+ *     operational form of "would IVH have picked from the same candidate
+ *     set", which counters on the raw signals cannot answer.
+ */
+DECLARE_PER_CPU(u64, ivh_dec_agree_go);
+DECLARE_PER_CPU(u64, ivh_dec_agree_nogo);
+DECLARE_PER_CPU(u64, ivh_dec_tsc_only_go);
+DECLARE_PER_CPU(u64, ivh_dec_real_only_go);
+DECLARE_PER_CPU(u64, ivh_cap_pass_both);
+DECLARE_PER_CPU(u64, ivh_cap_pass_real_only);
+DECLARE_PER_CPU(u64, ivh_cap_pass_tsc_only);
+DECLARE_PER_CPU(u64, ivh_cap_pass_neither);
 
 DECLARE_STATIC_KEY_FALSE(bpf_sched_enabled_key);
 
