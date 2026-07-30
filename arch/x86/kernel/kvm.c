@@ -1803,10 +1803,11 @@ static int ivh_pv_proc_cs_preempt_src(const struct ctl_table *table, int write,
 }
 
 /*
- * ivh_cs_predicate_form: 0 or 1 only.  See the two-form table in
- * <asm/ivh_tsc_beat.h>.  A third value would silently select form 0 (the
- * expression is a plain truth test), so reject rather than let a typo change
- * which predicate a measurement window was actually running.
+ * ivh_cs_predicate_form: 0, 1 or 2 only.  See the form table in
+ * <asm/ivh_tsc_beat.h>.  A fourth value would silently select form 1 (both
+ * read sites test `form == 2` and then fall through to a plain truth test),
+ * so reject rather than let a typo change which predicate a measurement
+ * window was actually running.
  */
 static int ivh_pv_proc_cs_predicate_form(const struct ctl_table *table, int write,
 					 void *buffer, size_t *lenp, loff_t *ppos)
@@ -1820,8 +1821,8 @@ static int ivh_pv_proc_cs_predicate_form(const struct ctl_table *table, int writ
 	if (ret || !write)
 		return ret;
 
-	if (val > 1) {
-		pr_err("IVH: refusing ivh_cs_predicate_form=%lu: valid values are 0 (CS-stamp age > ivh_cs_beat_threshold) and 1 (in a CS AND liveness heartbeat stale)\n",
+	if (val > 2) {
+		pr_err("IVH: refusing ivh_cs_predicate_form=%lu: valid values are 0 (CS-stamp age > ivh_cs_beat_threshold), 1 (in a CS AND liveness heartbeat stale) and 2 (liveness heartbeat stale, no in-CS term)\n",
 		       val);
 		return -EINVAL;
 	}

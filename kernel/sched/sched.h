@@ -1539,6 +1539,16 @@ struct rq {
     u64                     ivh_vact_win_used_c;      /* window accumulator: executing */
     u64                     ivh_vact_win_stolen_c;    /* window accumulator: gone */
     /*
+     * Signed residual carried between ticks by the ivh_vact_residual split
+     * (ivh_vact_gap_split(), kernel/sched/core.c).  Always <= 0 and floored at
+     * one nominal tick: it holds the SHORTFALL of an inter-tick gap that came
+     * in early, so that the next gap's excess is offset by it instead of the
+     * short one being silently discarded -- the same anti-rectifier reasoning,
+     * and the same one-interval floor, as rq->ivh_ref_debt_c.  Untouched (and
+     * always 0) at the default ivh_vact_residual == 0.
+     */
+    s64                     ivh_vact_debt_c;
+    /*
      * THE OUTPUT, 0..1024, the rq->cpu_capacity replacement.  Initialised to
      * 1024 ("perfectly healthy") at rq init rather than 0, because IVH_CAP_FLOOR
      * is 850 and ivh_capacity_threshold is 1010 against a 1024 scale: a CPU

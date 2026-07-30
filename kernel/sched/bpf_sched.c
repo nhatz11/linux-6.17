@@ -320,6 +320,24 @@ unsigned long ivh_vact_jump_threshold = 3300000UL;
 unsigned long ivh_vact_window_ns = 100000000UL;
 
 /*
+ * Residual (sub-jump-threshold) steal accounting in ivh_vact_tick().
+ *
+ *   0 (default) = the arithmetic Build 1 shipped, byte for byte: a gap below
+ *       ivh_vact_jump_threshold is credited entirely to `used`.
+ *   1           = split every gap into one nominal tick of execution plus an
+ *       excess booked as steal, carrying the signed shortfall between ticks.
+ *
+ * The full root-cause writeup, including the 6.17.0-rseqport67 numbers that
+ * motivated it (Part C agreeing with only 40% of real steal's migrate
+ * verdicts and essentially never over-triggering), is at
+ * ivh_vact_gap_split() in kernel/sched/core.c.  Default off, and it must stay
+ * off until an A/B on /proc/ivh_debug's ivh_dec_* / ivh_cap_pass_* shows it
+ * moves Part C toward real steal WITHOUT crossing into over-triggering --
+ * exactly the discipline ivh_ref_carry is held to.
+ */
+unsigned long ivh_vact_residual = 0UL;
+
+/*
  * Run the dual migration-decision evaluation (sec 3.8).  Default off.
  *
  * This is the knob that discharges constraint #2 -- "any boot containing a
@@ -557,6 +575,13 @@ static const struct ctl_table ivh_sysctls[] = {
 	{
 		.procname	= "ivh_vact_window_ns",
 		.data		= &ivh_vact_window_ns,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_vact_residual",
+		.data		= &ivh_vact_residual,
 		.maxlen		= sizeof(unsigned long),
 		.mode		= 0644,
 		.proc_handler	= proc_doulongvec_minmax,

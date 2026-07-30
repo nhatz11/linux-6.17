@@ -258,6 +258,38 @@ static __always_inline u64 ivh_tsc_ns_to_cycles(u64 ns)
  * DISAGREEMENT RATE is itself a finding: a large "form 0 fires, form 1 does
  * not" population is a direct measurement of how much of the CS-duration tail
  * is long-but-healthy rather than preempted.
+ *
+ *   form 2 (added 2026-07-30, after the live 91% false-negative measurement):
+ *	holder identity AND the holder's liveness heartbeat is stale -- form 1
+ *	with the in-CS term DELETED.  The reason it is worth having is that
+ *	form 1's first term is very likely redundant AND coverage-limited at
+ *	the only call site there is:
+ *
+ *	  Redundant, because ivh_cs_head_check() only runs when we are the
+ *	  queue head spinning on a lock that IS held.  "Is the holder inside a
+ *	  critical section" is already known to be true from the fact that we
+ *	  are waiting on it; asking the CS stamp to confirm it adds no
+ *	  information.
+ *	  Coverage-limited, because the CS stamp and the holder-identity table
+ *	  instrument DIFFERENT POPULATIONS.  Identity is stamped at the
+ *	  qspinlock layer and therefore covers every acquisition in the kernel;
+ *	  the stamp is published from cs_enter() and therefore covers only
+ *	  outermost (lock_depth == 1), non-interrupt acquisitions taken through
+ *	  the kernel/locking/spinlock.c wrappers.  A holder that is in
+ *	  softirq/hardirq context, or holding an inner lock, is correctly
+ *	  IDENTIFIED and has no stamp at all -- so form 1 answers "not
+ *	  preempted" for it no matter what the host is doing.  That is a
+ *	  systematic FALSE NEGATIVE, and the measured 6.17.0-rseqport67
+ *	  sensitivity of 123/1423 = 8.6% is exactly the shape it would produce.
+ *
+ *	Form 2 costs nothing to carry and settles it with an echo instead of a
+ *	rebuild: run the same window at form 1 and at form 2 and compare
+ *	ivh_cs_sensitivity_pct.  It is NOT the default, because it makes the
+ *	predicate depend on holder identity alone and that composition has
+ *	never been measured; the discriminating measurement comes first.
+ *	Cross-check with the age histograms while doing it -- bucket 0 absorbs
+ *	the age < 0 sentinel, so hist_running[0] + hist_preempted[0] against
+ *	their totals IS the "holder had no CS stamp" rate.
  */
 struct ivh_cs_beat {
 	u64 stamp;		/* raw rdtsc() at cs_enter(); 0 == not in a CS */
@@ -272,7 +304,7 @@ DECLARE_PER_CPU_ALIGNED(struct ivh_cs_beat, ivh_cs_beat);
  *   really does bail out of its spin).  Same three-valued shape and the same
  *   meanings as ivh_pv_preempt_src above, on purpose: one established idiom
  *   for "flip a signal from measured to trusted", not four ad-hoc ones.
- * ivh_cs_predicate_form -- 0 or 1, per the table above.  Defaults to 1.
+ * ivh_cs_predicate_form -- 0, 1 or 2, per the table above.  Defaults to 1.
  * ivh_cs_beat_threshold -- form 0's threshold, in RAW TSC CYCLES, calibrated
  *   at late_initcall from tsc_khz and sysctl-writable so it can be swept live.
  *   The shipped value is a STARTING POINT FOR A SWEEP, not a committed value;
@@ -325,8 +357,11 @@ extern unsigned long ivh_cs_beat_threshold;
  *	separate because a lumped counter cannot answer "is the table big
  *	enough".
  *   ivh_holder_raced is the read-verify-read skew rate; ivh_holder_self
- *	should be ~0 and a real count means a stale stamp or a genuine
- *	reentrancy bug.
+ *	should be ~0 RELATIVE TO ivh_cs_checks and to
+ *	ivh_holder_unknown_collision -- not literally zero.  Its three causes
+ *	(missed release site, caller reentrancy, and the irreducible torn slot
+ *	that two interleaved stampers of colliding locks can compose) are
+ *	enumerated at the increment site in kernel/locking/qspinlock_paravirt.h.
  *   ivh_head_bail_early / _loop_hist[] / ivh_lock_steals quantify the SIDE
  *	EFFECT of the queue-head bail, which must not be assumed harmless --
  *	see ivh_cs_head_check() in kernel/locking/qspinlock_paravirt.h.
@@ -410,12 +445,23 @@ static __always_inline s64 ivh_cs_age(int cpu)
  */
 static __always_inline bool is_cs_preempted(int cpu)
 {
-	s64 age = ivh_cs_age(cpu);
+	unsigned long form = READ_ONCE(ivh_cs_predicate_form);
+	s64 age;
 
+	/*
+	 * Form 2 drops the in-CS term entirely -- see the form table above for
+	 * why that term is both redundant and coverage-limited at the one call
+	 * site this predicate has.  Tested first so that a CPU with no CS stamp
+	 * (the exact population form 1 cannot see) is still answered.
+	 */
+	if (form == 2)
+		return ivh_beat_stale(cpu);
+
+	age = ivh_cs_age(cpu);
 	if (age < 0)
 		return false;			/* not in a CS: never "preempted" */
 
-	if (READ_ONCE(ivh_cs_predicate_form))
+	if (form)
 		return ivh_beat_stale(cpu);
 
 	return age > (s64)READ_ONCE(ivh_cs_beat_threshold);

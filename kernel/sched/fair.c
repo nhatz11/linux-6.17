@@ -14072,7 +14072,7 @@ static int ivh_debug_show(struct seq_file *m, void *v)
 	 * nothing.  Read together with ivh_lock_steals at src 1 vs src 2.
 	 */
 	seq_printf(m, "ivh_cs_preempt_src:        %lu\n", READ_ONCE(ivh_cs_preempt_src));
-	seq_printf(m, "ivh_cs_predicate_form:     %lu  (0=CS-stamp age, 1=in-CS AND heartbeat stale)\n",
+	seq_printf(m, "ivh_cs_predicate_form:     %lu  (0=CS-stamp age, 1=in-CS AND heartbeat stale, 2=heartbeat stale only)\n",
 		   READ_ONCE(ivh_cs_predicate_form));
 	seq_printf(m, "ivh_cs_beat_threshold:     %lu (cycles)\n",
 		   READ_ONCE(ivh_cs_beat_threshold));
@@ -14090,19 +14090,36 @@ static int ivh_debug_show(struct seq_file *m, void *v)
 	{
 		u64 cs_verdicts = cs_agree_true + cs_agree_false +
 				  cs_false_pos + cs_false_neg;
+		u64 cs_real_pos = cs_agree_true + cs_false_neg;
 
 		if (cs_verdicts)
 			seq_printf(m, "ivh_cs_agree_pct:          %llu.%04llu%%\n",
 				   (cs_agree_true + cs_agree_false) * 100 / cs_verdicts,
 				   ((cs_agree_true + cs_agree_false) * 1000000 /
 				    cs_verdicts) % 10000);
+		/*
+		 * SENSITIVITY, and it is printed because the agreement percentage
+		 * above is actively misleading on its own.  Host preemption is a
+		 * ~0.1%-of-samples event, so agree_false (nothing preempted, both
+		 * signals say so) dominates the ratio and drags it to 99.8%
+		 * regardless of whether the predicate detects anything at all.
+		 * The number that matters is the fraction of REAL positives the
+		 * predicate caught, and on 6.17.0-rseqport67 that was 123/1423 =
+		 * 8.6% while agree_pct read 99.8%.  Do not quote agree_pct
+		 * without this line beside it.
+		 */
+		if (cs_real_pos)
+			seq_printf(m, "ivh_cs_sensitivity_pct:    %llu.%04llu%%  (agree_true / (agree_true + false_neg); THE number, not agree_pct)\n",
+				   cs_agree_true * 100 / cs_real_pos,
+				   (cs_agree_true * 1000000 / cs_real_pos) % 10000);
 	}
 	seq_printf(m, "ivh_holder_stamps:         %llu\n", hold_stamps);
 	seq_printf(m, "ivh_holder_clears:         %llu\n", hold_clears);
 	seq_printf(m, "ivh_holder_unknown_empty:  %llu\n", hold_unk_empty);
 	seq_printf(m, "ivh_holder_unknown_collision: %llu\n", hold_unk_collision);
 	seq_printf(m, "ivh_holder_raced:          %llu\n", hold_raced);
-	seq_printf(m, "ivh_holder_self:           %llu  (must be ~0)\n", hold_self);
+	seq_printf(m, "ivh_holder_self:           %llu  (~0 relative to checks AND to unknown_collision; 3 causes at the increment site)\n",
+		   hold_self);
 	seq_printf(m, "ivh_head_bail_early:       %llu\n", bail_early);
 	seq_printf(m, "ivh_lock_steals:           %llu  (unconditional; baseline at src=0)\n",
 		   lock_steals);
@@ -14188,6 +14205,8 @@ skip_cs_hists:
 	seq_printf(m, "ivh_vact_jump_threshold:   %lu (cycles)\n",
 		   READ_ONCE(ivh_vact_jump_threshold));
 	seq_printf(m, "ivh_vact_window_ns:        %lu\n", READ_ONCE(ivh_vact_window_ns));
+	seq_printf(m, "ivh_vact_residual:         %lu  (0=sub-threshold gap counts wholly as executing, 1=split at one tick + carry)\n",
+		   READ_ONCE(ivh_vact_residual));
 	seq_printf(m, "ivh_decision_shadow:       %lu\n", READ_ONCE(ivh_decision_shadow));
 	seq_printf(m, "# cpu real_last_preempt_ns vact_last_preempt_ns real_last_active_ns "
 		      "vact_last_active_ns real_preemptions vact_preemptions "

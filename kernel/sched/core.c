@@ -1065,6 +1065,93 @@ void ivh_ref_accumulate(void) { }
  */
 
 /*
+ * ivh_vact_gap_split - how much of ONE inter-tick gap was stolen, under
+ * ivh_vact_residual == 1.  Returns cycles; the caller books the remainder as
+ * executing, so used + stolen == age exactly and the tumbling window's
+ * denominator stays equal to real elapsed time.
+ *
+ * -------------------------------------------------------------------------
+ * WHY THIS EXISTS (root cause, 2026-07-30).  Measured on 6.17.0-rseqport67
+ * under real host contention, with ivh_decision_shadow=1:
+ *
+ *	ivh_dec_agree_go 15854   ivh_dec_real_only_go 23295
+ *	ivh_dec_tsc_only_go 28   ivh_cap_pass_real_only 182720
+ *	                         ivh_cap_pass_tsc_only    67167
+ *
+ * Real-steal Gate 1+2 said "migrate" 39149 times and Part C agreed 15854
+ * times -- a 60% miss -- while almost never firing when real did not.  A
+ * signal that only ever under-triggers is a BIASED ESTIMATOR, not a noisy
+ * one, and the bias is in ivh_vact_tick()'s original arithmetic:
+ *
+ *	if (age <= jump_threshold) { used = age; }	 <-- stolen += 0
+ *
+ * Every gap below ivh_vact_jump_threshold (1.5 ms) was credited ENTIRELY to
+ * `used`.  A vCPU descheduled for 300 us three times inside one 1 ms tick
+ * period produces age = 1.9 ms > threshold only sometimes, and whenever it
+ * lands under the threshold that steal is not merely uncounted -- it is
+ * counted as EXECUTION, which moves the ratio the wrong way twice.  The
+ * result is ivh_vact_capacity pinned at or near 1024 on every CPU, which
+ * fails Gate 1 (capacity > ivh_capacity_threshold rejects) and fails the
+ * destination gate (drq->cap > src_cap is false when every CPU reads 1024).
+ * That is exactly the observed shape, including why pass_tsc_only is small.
+ *
+ * This is the same FAMILY of defect as the one ivh_ref_carry fixes, but not
+ * the same mechanism, and the difference matters when reading the two: in
+ * ivh_ref_accumulate() a pair of non-negative clamps discards one tail of a
+ * symmetric jitter distribution; here a THRESHOLD discards an entire
+ * sub-threshold population and misfiles it on the other side of the ratio.
+ *
+ * THE CORRECTION.  The guest tick is programmed at an absolute deadline, so
+ * on a vCPU that is executing, consecutive account_process_tick() calls are
+ * one TICK_NSEC apart; anything beyond that is time the vCPU did not get.
+ * So: nominal execution per gap is one tick period, the excess is steal, and
+ * that reads sub-threshold preemption at ~100 us resolution instead of
+ * 1.5 ms.
+ *
+ * THE CARRY, and why the naive form would be a rectifier in the OTHER
+ * direction.  Tick delivery jitters both ways -- a gap that comes in SHORT
+ * (irq coalescing, an early hrtimer) would contribute nothing under a plain
+ * max(0, age - tick_c), while every long gap contributes its full excess.
+ * Keeping one tail and discarding the other is precisely the failure
+ * ivh_ref_carry's comment dissects, so the shortfall is carried as a signed
+ * debt against the next interval's excess instead of being dropped, which
+ * makes the estimator unbiased over any window longer than the jitter.
+ *
+ * The debt is FLOORED at one nominal tick for the same reason ivh_ref_debt_c
+ * is floored at one interval: bounded debt absorbs sampling jitter, which is
+ * what it is for, and cannot absorb a sustained rate error (a tsc_khz that
+ * does not match the real tick period, say) and thereby hide a calibration
+ * bug behind a reservoir that swallows real steal for minutes.
+ *
+ * DEFAULT OFF.  At ivh_vact_residual == 0 this function is not called and
+ * every line below is the pre-2026-07-30 arithmetic, byte for byte, so the
+ * validated baseline is untouched and the two forms can be A/B'd against
+ * /proc/ivh_debug's ivh_cap_pass_* and ivh_dec_* inside one boot -- which is
+ * the only way to find out whether the correction over-shoots into
+ * over-triggering, the failure this build must not ship blind.
+ */
+static u64 ivh_vact_gap_split(struct rq *rq, u64 age, u64 tick_c)
+{
+	s64 ex;
+	u64 stolen;
+
+	if (unlikely(!tick_c)) {		/* tsc_khz not established yet */
+		rq->ivh_vact_debt_c = 0;
+		return 0;
+	}
+
+	ex = (s64)age - (s64)tick_c + rq->ivh_vact_debt_c;
+	if (ex <= 0) {
+		rq->ivh_vact_debt_c = (ex < -(s64)tick_c) ? -(s64)tick_c : ex;
+		return 0;
+	}
+
+	rq->ivh_vact_debt_c = 0;
+	stolen = (u64)ex;
+	return min(stolen, age);
+}
+
+/*
  * ivh_vact_tick - one tick's worth of Part C.
  *
  * Called from account_process_tick() (kernel/sched/cputime.c) on the owning
@@ -1086,12 +1173,23 @@ void ivh_ref_accumulate(void) { }
 void ivh_vact_tick(void)
 {
 	struct rq *rq = this_rq();
+	unsigned long residual = READ_ONCE(ivh_vact_residual);
 	u64 now = ivh_raw_tsc();
 	u64 old = rq->ivh_vact_stamp;
-	u64 used = 0, window_c;
+	u64 used = 0, stolen = 0, window_c, tick_c = 0;
 	s64 age;
 
 	rq->ivh_vact_stamp = now;		/* the publish, always */
+
+	/*
+	 * One nominal tick period in cycles, computed only when the residual
+	 * split is armed so the default path keeps its "one rdtsc and a handful
+	 * of arithmetic" cost.  TICK_NSEC rather than a measured cadence: the
+	 * whole point is to compare the OBSERVED gap against what the gap would
+	 * have been on a vCPU that never lost the CPU, and that is a constant.
+	 */
+	if (unlikely(residual))
+		tick_c = ivh_tsc_ns_to_cycles(TICK_NSEC);
 
 	if (unlikely(!old)) {
 		/* First tick on this CPU: nothing to measure across yet. */
@@ -1102,8 +1200,25 @@ void ivh_vact_tick(void)
 
 	age = (s64)(now - old);
 	if (likely(age <= (s64)READ_ONCE(ivh_vact_jump_threshold))) {
-		/* Normal ticking: the whole interval was executing. */
-		used = (u64)age;
+		/*
+		 * Normal ticking.  At ivh_vact_residual == 0 the whole interval
+		 * is credited as executing, exactly as before; at 1 the part of
+		 * it that exceeds one nominal tick is credited as stolen
+		 * instead -- see ivh_vact_gap_split() for why the original
+		 * unconditional `used = age` is a systematic under-trigger and
+		 * not merely a coarse one.
+		 *
+		 * NOTE this does NOT count a preemption EVENT and does not
+		 * touch the burst: sub-threshold steal is real capacity loss
+		 * but it is not a "the vCPU was taken away" event, and
+		 * ivh_vact_preemptions must keep meaning the same thing as
+		 * rq->preemptions for the Gate 2 comparison to stay controlled.
+		 */
+		if (unlikely(residual)) {
+			stolen = ivh_vact_gap_split(rq, (u64)age, tick_c);
+			rq->ivh_vact_win_stolen_c += stolen;
+		}
+		used = (u64)age - stolen;
 		goto window;
 	}
 
@@ -1137,6 +1252,13 @@ void ivh_vact_tick(void)
 		rq->ivh_vact_burst_start_tsc = rq->ivh_vact_idle_exit_tsc;
 		rq->ivh_vact_idle_explained++;
 		/*
+		 * An idle gap breaks the "consecutive ticks are one TICK_NSEC
+		 * apart" premise the residual split rests on, so any debt
+		 * accumulated before it is meaningless afterwards.  Dropping it
+		 * here is the one place discarding a residual is correct.
+		 */
+		rq->ivh_vact_debt_c = 0;
+		/*
 		 * The part of the gap after the idle exit was real execution.
 		 * Idle itself is neither used nor stolen: it must not inflate
 		 * the denominator, or a mostly-idle vCPU would read as heavily
@@ -1155,8 +1277,20 @@ void ivh_vact_tick(void)
 		rq->ivh_vact_last_preempt_tsc = now;
 		rq->ivh_vact_burst_start_tsc  = now;
 		rq->ivh_vact_preemptions++;
-		rq->ivh_vact_win_stolen_c    += (u64)age;
 		rq->ivh_vact_jumps++;
+		/*
+		 * The gap of a DETECTED preemption is not all steal either: the
+		 * tick would have fired one TICK_NSEC in whether or not the
+		 * vCPU was later descheduled, so the first nominal tick of it
+		 * was execution.  At residual == 0 the original `stolen = age`
+		 * stands unchanged; at 1 the same split as the sub-threshold
+		 * path applies, which matters because a 1.6 ms gap booked
+		 * whole is a 2.7x over-count of a 0.6 ms preemption.
+		 */
+		stolen = unlikely(residual) ?
+			 ivh_vact_gap_split(rq, (u64)age, tick_c) : (u64)age;
+		rq->ivh_vact_win_stolen_c += stolen;
+		used = (u64)age - stolen;
 	}
 
 window:

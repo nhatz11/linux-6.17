@@ -56,11 +56,24 @@ static inline void native_queued_spin_unlock(struct qspinlock *lock)
 	 * same reason as R1 in <asm-generic/qspinlock.h>: strictly before the
 	 * release, because after it the lock may already belong to someone else.
 	 *
-	 * This is the live release path on a `nopvspin` boot, and it is also
-	 * where pv_queued_spin_unlock() lands when PV spinlocks are compiled in
-	 * but not selected.  Missing it would show up as ivh_holder_clears
-	 * trailing ivh_holder_stamps without bound, which is exactly the
-	 * imbalance those two counters exist to catch.
+	 * DEAD ON x86-64, AND THE ORIGINAL COMMENT HERE WAS WRONG ABOUT WHY IT
+	 * WAS NOT (fixed 2026-07-30 after the 680000:1 stamps/clears imbalance
+	 * measured on 6.17.0-rseqport67).  It claimed this was "the live release
+	 * path on a nopvspin boot".  It is not: pv_queued_spin_unlock() below is
+	 * PVOP_ALT_VCALLEE1 with ALT_NOT(X86_FEATURE_PVUNLOCK), so when the PV
+	 * unlock is NOT selected the call site is ALTERNATIVE-PATCHED to an
+	 * inline "movb $0, (%rdi)" and pv_ops.lock.queued_spin_unlock -- i.e.
+	 * this function -- is never reached at all.  And when the PV unlock IS
+	 * selected, paravirt_set_cap() sets X86_FEATURE_PVUNLOCK precisely
+	 * because the op is not native, so it is not reached then either.
+	 *
+	 * Kept rather than deleted because it costs nothing (this body is not
+	 * emitted on any live path) and because a future direct caller of
+	 * native_queued_spin_unlock() would otherwise silently lose its clear.
+	 * It cannot double-count against the R2b clear in queued_spin_unlock()
+	 * below: the two are mutually exclusive by the alternative above, and
+	 * even if they were not, a clear of an already-cleared slot fails the
+	 * tag check and increments nothing.
 	 */
 	ivh_lock_clear_holder(lock);
 	smp_store_release(&lock->locked, 0);
@@ -74,6 +87,45 @@ static inline void queued_spin_lock_slowpath(struct qspinlock *lock, u32 val)
 static inline void queued_spin_unlock(struct qspinlock *lock)
 {
 	kcsan_release();
+	/*
+	 * IVH release site R2b, and THE release site on this kernel.  Added
+	 * 2026-07-30; this is the fix for the measured
+	 * ivh_holder_stamps:ivh_holder_clears ratio of ~680000:1
+	 * (72M stamps against 87 clears over a live hackbench session on
+	 * 6.17.0-rseqport67), which was NOT a bug in the table, in the clear
+	 * function or in any guard -- every release-side clear placed by
+	 * Build 1 sat on code that this configuration does not execute:
+	 *
+	 *   R1 (<asm-generic/qspinlock.h>) -- #ifndef'd out, because this file
+	 *      defines queued_spin_unlock.
+	 *   R2 (native_queued_spin_unlock() above) -- unreachable, see the
+	 *      writeup there.
+	 *   R3 (__pv_queued_spin_unlock(), kernel/locking/qspinlock_paravirt.h)
+	 *      -- NOT COMPILED on x86-64.  <asm/qspinlock_paravirt.h> does
+	 *      "#define __pv_queued_spin_unlock __pv_queued_spin_unlock" under
+	 *      CONFIG_64BIT, so that C body's #ifndef excludes it, and the real
+	 *      unlock is the hand-written PV_UNLOCK_ASM thunk: a bare
+	 *      "LOCK cmpxchg %dl,(%rdi); jne .slowpath; ret" that calls no C at
+	 *      all on the fast path.
+	 *   R4 (__pv_queued_spin_unlock_slowpath()) -- live, but reached ONLY
+	 *      when the lock byte holds _Q_SLOW_VAL, i.e. only when a queue
+	 *      head has actually parked in pv_wait().  That rare path is the
+	 *      entirety of the 87 clears that were observed.
+	 *
+	 * Clearing HERE covers every one of those cases with one site, because
+	 * every qspinlock release in the kernel funnels through this function
+	 * before any of the alternatives above are selected.  Same placement
+	 * rule as R1/R2 -- strictly before the release, never after -- because
+	 * the instant the lock byte clears another CPU may already own the lock
+	 * and a clear placed after would wipe ITS stamp.  R4 still runs its own
+	 * clear behind us and is idempotent: the slot no longer carries this
+	 * lock's tag, so it fails the tag check and increments nothing.
+	 *
+	 * Cost at the default ivh_lock_holder_enabled == 0 is one READ_ONCE of
+	 * a read-mostly global and one perfectly-predicted branch, which is the
+	 * same posture as the matching stamp on the acquire side.
+	 */
+	ivh_lock_clear_holder(lock);
 	pv_queued_spin_unlock(lock);
 }
 

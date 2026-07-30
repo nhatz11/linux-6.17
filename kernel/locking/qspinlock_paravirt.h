@@ -494,6 +494,7 @@ static __always_inline void ivh_beat_publish_in_spin(int loop)
 static inline bool ivh_cs_head_check(struct qspinlock *lock, int loop)
 {
 	unsigned long src = READ_ONCE(ivh_cs_preempt_src);
+	unsigned long form;
 	int h1, h2, bucket;
 	bool verdict, kvm;
 	s64 age;
@@ -512,9 +513,37 @@ static inline bool ivh_cs_head_check(struct qspinlock *lock, int loop)
 	if (h1 == raw_smp_processor_id()) {
 		/*
 		 * We are the queue head waiting for a lock we ourselves are
-		 * recorded as holding.  Must be ~0: a real count means either a
-		 * stale stamp left behind by a missed release site or a genuine
-		 * reentrancy bug, and either way the holder table is lying.
+		 * recorded as holding.  The holder table is lying when this
+		 * fires; the question is only which of THREE causes did it.
+		 *
+		 *  1. A MISSED RELEASE SITE.  This was the live cause on
+		 *     6.17.0-rseqport67, which measured 239 of these: with the
+		 *     release-side clear sitting on dead code (see the R2b
+		 *     writeup in <asm/qspinlock.h>) a CPU that had previously
+		 *     held this lock left its own stamp behind forever, so when
+		 *     it re-contended on the same lock and read the slot during
+		 *     the winner's acquire->stamp window it found ITSELF.  With
+		 *     R2b in place that window answers "unknown" instead, so
+		 *     this counter should now collapse toward zero -- and if it
+		 *     does not, cause 1 is still present somewhere and this
+		 *     counter is the thing that says so.
+		 *  2. A GENUINE REENTRANCY BUG in the caller, which is what the
+		 *     counter was originally written for.
+		 *  3. A TORN SLOT, which is irreducible and is NOT a bug.
+		 *     __ivh_lock_set_holder() writes holder_cpu then tag as two
+		 *     separate stores, so two CPUs stamping two DIFFERENT locks
+		 *     that hash to one slot can interleave into a slot reading
+		 *     (this lock, this CPU) that no single stamper ever wrote.
+		 *     The rate is bounded by the collision rate, so read this
+		 *     counter against ivh_holder_unknown_collision: a residue
+		 *     that scales with collisions and vanishes when
+		 *     ivh_holder_bits is raised is cause 3 and can be ignored.
+		 *
+		 * "Must be ~0" therefore means ~0 RELATIVE TO ivh_cs_checks and
+		 * to ivh_holder_unknown_collision, not literally zero.
+		 *
+		 * Either way the answer returned here is "do not act", so no
+		 * cause of this can produce a wrong verdict -- only a lost one.
 		 *
 		 * Counted rather than pr_warn_once()'d, deliberately.  This
 		 * runs inside the qspinlock slowpath with the lock still
@@ -527,10 +556,23 @@ static inline bool ivh_cs_head_check(struct qspinlock *lock, int loop)
 		return false;
 	}
 
+	/*
+	 * Kept in sync BY HAND with is_cs_preempted() (<asm/ivh_tsc_beat.h>),
+	 * which that function's own comment records as deliberate: this site
+	 * needs the age AND the verdict to come from ONE ivh_cs_age() reading,
+	 * so it open-codes the same three expressions.  Form 2 ignores the age
+	 * entirely; the age is still sampled because the histograms below want
+	 * it regardless of which form is selected.
+	 */
+	form = READ_ONCE(ivh_cs_predicate_form);
 	age = ivh_cs_age(h1);
-	verdict = READ_ONCE(ivh_cs_predicate_form)
-			? (age >= 0 && ivh_beat_stale(h1))
-			: (age >= 0 && age > (s64)READ_ONCE(ivh_cs_beat_threshold));
+	if (form == 2)
+		verdict = ivh_beat_stale(h1);
+	else if (form)
+		verdict = (age >= 0 && ivh_beat_stale(h1));
+	else
+		verdict = (age >= 0 &&
+			   age > (s64)READ_ONCE(ivh_cs_beat_threshold));
 	kvm = vcpu_is_preempted(h1);
 
 	/*
@@ -1119,7 +1161,18 @@ __visible __lockfunc void __pv_queued_spin_unlock(struct qspinlock *lock)
 	 * entries, which would be BAD.
 	 */
 	/*
-	 * IVH release site R3 (build plan sec 3.3.4).  This is a CONDITIONAL
+	 * IVH release site R3 (build plan sec 3.3.4).
+	 *
+	 * NOT COMPILED ON x86-64, which is the single largest contributor to
+	 * the stamps/clears imbalance measured on 6.17.0-rseqport67 (see the
+	 * R2b writeup in <asm/qspinlock.h>): <asm/qspinlock_paravirt.h> defines
+	 * __pv_queued_spin_unlock to itself under CONFIG_64BIT, so the #ifndef
+	 * above excludes this whole function and the live unlock is that
+	 * header's hand-written PV_UNLOCK_ASM, which touches no C on its fast
+	 * path.  This body is still the live one on x86-32 and on any other
+	 * architecture that does not hand-code the thunk, so the clear stays.
+	 *
+	 * This is a CONDITIONAL
 	 * release: on failure it falls through to R4 in
 	 * __pv_queued_spin_unlock_slowpath().  Clear unconditionally here and
 	 * let R4's clear be a no-op, rather than trying to clear only when the
