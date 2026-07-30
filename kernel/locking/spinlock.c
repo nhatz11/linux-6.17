@@ -454,6 +454,22 @@ static __always_inline void cs_exit(raw_spinlock_t *lock)
 			 * been measured in this tree; if it turns out to be
 			 * common, that is a Build 2 finding about where the
 			 * stamp belongs, not a Build 1 failure.
+			 *
+			 * LIVE-FLIP CORNER, stated so it is not rediscovered as
+			 * a bug: writing ivh_cs_preempt_src 1 -> 0 while a hold
+			 * is in flight skips this clear, leaving one stale
+			 * non-zero stamp behind on that CPU.  Nothing reads it
+			 * at src == 0, and the next outermost acquire on that
+			 * CPU republishes it, so it can only survive on a CPU
+			 * that then takes no locks at all.  Predicate form 1 is
+			 * immune regardless (it also requires the liveness
+			 * heartbeat to be stale, and the tick keeps that
+			 * fresh); form 0 could read one such CPU as preempted
+			 * until its next acquire.  If a sweep ever needs to be
+			 * airtight about this, flip src to 0, wait a tick, and
+			 * only then read -- do not add a clear here, which
+			 * would cost a branch on every release forever to fix a
+			 * transient that only exists across a sysctl write.
 			 */
 			if (current->cs_beat_lock == (void *)lock) {
 				ivh_cs_beat_clear();
