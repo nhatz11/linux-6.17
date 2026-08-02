@@ -287,11 +287,13 @@ DECLARE_PER_CPU(u64, ivh_mutex_spin_owner_preempted);
  *   ivh_vact_jump_threshold   tick-stamp staleness threshold, raw TSC cycles
  *   ivh_vact_window_ns        tumbling window for the capacity ratio, ns
  *   ivh_vact_residual         0 sub-threshold gaps count wholly as executing
- *                             | 1 split each gap into one nominal tick of
- *                               execution plus a stolen excess, with a carried
- *                               signed shortfall (ivh_vact_gap_split(),
- *                               kernel/sched/core.c -- the fix for Part C's
- *                               measured 60% under-trigger against real steal)
+ *                             | 1 remove this tick's idle, then split what is
+ *                               left into one nominal tick of execution plus a
+ *                               stolen excess, with a carried signed shortfall
+ *                               (ivh_vact_gap_split(), kernel/sched/core.c --
+ *                               the fix for Part C's measured under-trigger,
+ *                               and the idle term is in turn the fix for that
+ *                               fix's measured 4x over-trigger)
  *   ivh_decision_shadow       run the dual migration-decision evaluation
  */
 extern unsigned long ivh_cap_source;

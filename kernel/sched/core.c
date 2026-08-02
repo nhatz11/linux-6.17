@@ -1129,8 +1129,100 @@ void ivh_ref_accumulate(void) { }
  * /proc/ivh_debug's ivh_cap_pass_* and ivh_dec_* inside one boot -- which is
  * the only way to find out whether the correction over-shoots into
  * over-triggering, the failure this build must not ship blind.
+ *
+ * -------------------------------------------------------------------------
+ * IT DID OVER-SHOOT, AND THE CAUSE WAS IDLE, NOT JITTER (measured
+ * 2026-07-30 on 6.17.0-rseqport67, hackbench -T -g 1 -f 8 -l 400000 under
+ * real host contention, /proc/ivh_debug sampled at 10 Hz for the whole run):
+ *
+ *	                       ivh_vact_residual=0   ivh_vact_residual=1
+ *	median ivh_vact_capacity      1024                   220
+ *	 (per-CPU, cpu8-15)           1024                96-178
+ *	median vcap cpu_capacity       578                   472
+ *	Gate 1 "go" rate, TSC          5.2%                 92.2%
+ *	Gate 1 "go" rate, real        12.2%                 12.7%
+ *
+ * cpu8-15 carried 0.2% real steal (/proc/stat) and 37-47% idle, and Part C
+ * called them 83-91% STOLEN.  The correlation is not weak, it is INVERTED:
+ * the eight vCPUs with no host contention at all read as the most stolen,
+ * because what they actually had was idle.
+ *
+ * WHY.  The premise above -- "consecutive account_process_tick() calls are
+ * one TICK_NSEC apart on a vCPU that is executing" -- is false on a vCPU
+ * that goes NOHZ IDLE, because the tick is STOPPED while it idles.  The gap
+ * branch below already knows this and tests rq->ivh_vact_idle_exit_tsc for
+ * exactly it.  The sub-threshold branch does NOT, and it does not because at
+ * ivh_vact_residual == 0 it had nothing to get wrong: it booked the whole
+ * gap as `used` either way.  Arm the split and every idle episode SHORTER
+ * than ivh_vact_jump_threshold (1.5 ms) -- which for hackbench, whose entire
+ * structure is tiny pipe round trips, is nearly all of them -- becomes
+ * (gap - one tick) of phantom steal.
+ *
+ * The jump-threshold sweep isolates it beyond argument, same workload, same
+ * boot, ivh_vact_residual=1 throughout.  Widening the band that has no idle
+ * test makes it monotonically worse:
+ *
+ *	ivh_vact_jump_threshold   median ivh_vact_capacity
+ *	 2300000 (1.05 ms)                318
+ *	 3300000 (1.50 ms)                328
+ *	11000000 (5.00 ms)                 72
+ *
+ * THE CORRECTION.  Take idle out of the gap FIRST, then split what is left.
+ * A gap decomposes as age = idle + executed + stolen, so the quantity the
+ * one-nominal-tick premise applies to is `avail` (= age - idle), never age.
+ * Idle is then neither used nor stolen -- it leaves the ratio entirely,
+ * which is the identical treatment the idle branch below already gives it
+ * and for the identical reason stated there: a mostly-idle vCPU must not
+ * read as heavily stolen.
+ *
+ * The debt still exists and is still what makes this an unbiased estimator
+ * of tick jitter rather than a rectifier -- but note that with idle removed
+ * the debt no longer accumulates against idle episodes, which is precisely
+ * the bug: at avail < tick_c the shortfall is now genuine early-tick jitter
+ * and nothing else.  It stays floored at one nominal tick, so an idle-heavy
+ * vCPU parks the debt at -tick_c and under-reports the NEXT real preemption
+ * by at most one tick period.  Bounded, in the safe direction, and the same
+ * trade ivh_ref_debt_c's floor already makes.
+ *
+ * -------------------------------------------------------------------------
+ * READ THIS BEFORE TRUSTING ANY NUMBER IN THE TWO SECTIONS ABOVE (2026-08-01).
+ *
+ * `tick_c` was ONE CYCLE in the shipped 6.17.0-rseqport68 binary.  Not one
+ * tick, one cycle.  <asm/div64.h>'s mulq/divq asm let GCC satisfy the
+ * TICK_NSEC dividend and the USEC_PER_SEC divisor of
+ * ivh_tsc_ns_to_cycles(TICK_NSEC) from the same register -- they are the same
+ * number at CONFIG_HZ=1000 -- and `mulq` clobbers it before `divq` reads it.
+ * The full diagnosis, the disassembly and the repair are in
+ * <asm/ivh_tsc_beat.h> above ivh_tsc_ns_to_cycles(); ivh_vact_tick() now also
+ * refuses to arm the split if tick_c comes back implausibly small.
+ *
+ * What that means for everything written above:
+ *
+ *  - `ex = avail - tick_c` degenerated to `avail - 1`, so EVERY armed tick
+ *    booked (avail - 1) cycles stolen and exactly 1 cycle used, on every CPU,
+ *    idle or not, stolen or not.  Live confirmation on the affected boot:
+ *    rq->ivh_vact_win_used_c advanced by exactly 1 per tick, and
+ *    ivh_vact_capacity read 0 on all 16 vCPUs including the eight with
+ *    literally zero steal in /proc/stat.  That -- not idle -- is what
+ *    produced the 4x Gate 1 over-trigger this round was sent to explain.
+ *
+ *  - The idle correction described above is CORRECT and was verified working
+ *    on that same boot (per-tick idle deltas read back from
+ *    rq->ivh_vact_prev_idle_ns match the tickless gap lengths to the
+ *    microsecond, and the sub-threshold branch does subtract them).  It was
+ *    simply invisible underneath a scale error of six orders of magnitude.
+ *
+ *  - The ivh_vact_residual=1 capacity figures and the jump-threshold sweep in
+ *    the section above were measured on builds that may or may not have had
+ *    the same miscompile -- codegen depended on surrounding code, and the
+ *    pre-fix boot reported 96-178 where the post-fix boot reported 0, which
+ *    is the signature of the miscompile APPEARING between them.  Treat those
+ *    tables as unvalidated until re-measured on a build carrying the
+ *    OPTIMIZER_HIDE_VAR() repair.  The residual=0 baseline is unaffected:
+ *    this function is not called at all there.
+ * -------------------------------------------------------------------------
  */
-static u64 ivh_vact_gap_split(struct rq *rq, u64 age, u64 tick_c)
+static u64 ivh_vact_gap_split(struct rq *rq, u64 avail, u64 tick_c)
 {
 	s64 ex;
 	u64 stolen;
@@ -1140,7 +1232,7 @@ static u64 ivh_vact_gap_split(struct rq *rq, u64 age, u64 tick_c)
 		return 0;
 	}
 
-	ex = (s64)age - (s64)tick_c + rq->ivh_vact_debt_c;
+	ex = (s64)avail - (s64)tick_c + rq->ivh_vact_debt_c;
 	if (ex <= 0) {
 		rq->ivh_vact_debt_c = (ex < -(s64)tick_c) ? -(s64)tick_c : ex;
 		return 0;
@@ -1148,7 +1240,64 @@ static u64 ivh_vact_gap_split(struct rq *rq, u64 age, u64 tick_c)
 
 	rq->ivh_vact_debt_c = 0;
 	stolen = (u64)ex;
-	return min(stolen, age);
+	return min(stolen, avail);
+}
+
+/*
+ * ivh_vact_idle_delta_c - cycles this CPU spent halted in the IDLE LOOP since
+ * the previous armed tick.  Returns U64_MAX when idle time is not obtainable,
+ * which the caller treats as "do not run the split at all".
+ *
+ * Same two source accessors, and the same two traps, that ivh_ref_accumulate()
+ * documents at length one screen up -- read that comment rather than
+ * duplicating it here.  In one line each: BOTH idle_sleeptime and
+ * iowait_sleeptime are needed because tick_nohz_stop_idle() puts each episode
+ * in exactly one of them; and NOT kcpustat's CPUTIME_IDLE, which is
+ * tick-quantised to +/-1 ms per episode and would land that quantisation
+ * straight in the capacity ratio.
+ *
+ * NOT read from rq->ivh_ref_* even though ivh_ref_accumulate() computes the
+ * identical delta one call earlier on this very tick.  Doing so would make
+ * Part C -- whose entire premise is independence from the REF_TSC PMU path --
+ * silently produce a different capacity number depending on
+ * kernel.ivh_ref_steal_enabled, and would inherit that path's four early
+ * returns as invisible holes in this one.  Two accessor calls per tick, only
+ * while the split is armed, is the correct price for keeping the two signals
+ * separable.
+ *
+ * NOTHING IS SUBTRACTED FOR LOCK-PATH HALTS, and that is not an omission: a
+ * lock-path safe_halt() runs with IF=1, so the LAPIC timer fires through it
+ * and account_process_tick() republishes rq->ivh_vact_stamp -- there is no
+ * gap for it to have created.  That is the same claim struct rq's Part C
+ * comment makes under "WHY NO HALT CORRECTION IS NEEDED", and it is why this
+ * function needs no counterpart to ivh_ref_halt_correct.
+ */
+static u64 ivh_vact_idle_delta_c(struct rq *rq)
+{
+	int cpu = cpu_of(rq);
+	u64 idle_us, iowait_us, idle_ns, prev;
+
+	idle_us   = get_cpu_idle_time_us(cpu, NULL);
+	iowait_us = get_cpu_iowait_time_us(cpu, NULL);
+	if (unlikely(idle_us == (u64)-1 || iowait_us == (u64)-1))
+		return U64_MAX;			/* !tick_nohz_active: unusable */
+
+	idle_ns = (idle_us + iowait_us) * NSEC_PER_USEC;
+	prev = rq->ivh_vact_prev_idle_ns;
+	rq->ivh_vact_prev_idle_ns = idle_ns;
+
+	/*
+	 * First armed tick on this CPU (including the first tick after a live
+	 * 0 -> 1 write of ivh_vact_residual): 0 rather than the cumulative
+	 * since-boot value.  Reporting no idle for one tick can over-report
+	 * steal by at most one gap, once; reporting hours of it would zero the
+	 * split and plant a debt at the floor instead.  The smaller error, and
+	 * it self-corrects on the very next tick.
+	 */
+	if (unlikely(!prev))
+		return 0;
+
+	return ivh_tsc_ns_to_cycles(idle_ns > prev ? idle_ns - prev : 0);
 }
 
 /*
@@ -1176,20 +1325,62 @@ void ivh_vact_tick(void)
 	unsigned long residual = READ_ONCE(ivh_vact_residual);
 	u64 now = ivh_raw_tsc();
 	u64 old = rq->ivh_vact_stamp;
-	u64 used = 0, stolen = 0, window_c, tick_c = 0;
+	u64 used = 0, stolen = 0, window_c, tick_c = 0, idle_c = 0, avail;
 	s64 age;
 
 	rq->ivh_vact_stamp = now;		/* the publish, always */
 
 	/*
-	 * One nominal tick period in cycles, computed only when the residual
-	 * split is armed so the default path keeps its "one rdtsc and a handful
-	 * of arithmetic" cost.  TICK_NSEC rather than a measured cadence: the
-	 * whole point is to compare the OBSERVED gap against what the gap would
-	 * have been on a vCPU that never lost the CPU, and that is a constant.
+	 * One nominal tick period in cycles, and this tick's idle, both computed
+	 * only when the residual split is armed so the default path keeps its
+	 * "one rdtsc and a handful of arithmetic" cost.  TICK_NSEC rather than a
+	 * measured cadence: the whole point is to compare the OBSERVED gap
+	 * against what the gap would have been on a vCPU that never lost the
+	 * CPU, and that is a constant.
+	 *
+	 * An unusable idle series DISARMS the split for this tick rather than
+	 * being treated as zero idle.  Zero idle is exactly the assumption that
+	 * produced the measured 4x over-trigger (see ivh_vact_gap_split()), so
+	 * falling back to the validated ivh_vact_residual == 0 arithmetic is the
+	 * only safe direction; silently assuming it would reintroduce the bug on
+	 * whatever configuration hits it.
 	 */
-	if (unlikely(residual))
-		tick_c = ivh_tsc_ns_to_cycles(TICK_NSEC);
+	if (unlikely(residual)) {
+		idle_c = ivh_vact_idle_delta_c(rq);
+		if (unlikely(idle_c == U64_MAX)) {
+			residual = 0;
+			idle_c = 0;
+		} else {
+			tick_c = ivh_tsc_ns_to_cycles(TICK_NSEC);
+			/*
+			 * SANITY FLOOR, and it is not paranoia: this exact
+			 * conversion returned 1 in the shipped
+			 * 6.17.0-rseqport68 binary, because <asm/div64.h>'s
+			 * mulq/divq asm let GCC put the TICK_NSEC dividend and
+			 * the USEC_PER_SEC divisor -- numerically equal at
+			 * CONFIG_HZ=1000 -- in the same register.  The whole
+			 * story is in <asm/ivh_tsc_beat.h> above
+			 * ivh_tsc_ns_to_cycles(), and the OPTIMIZER_HIDE_VAR()
+			 * there is the actual repair.
+			 *
+			 * This is the belt to that fix's braces, and it costs
+			 * one compare on an already-unlikely path.  A nominal
+			 * tick below 1000 cycles would mean a sub-1 MHz TSC,
+			 * which does not exist; any such value is a broken
+			 * conversion, and the only safe response is the one
+			 * the unusable-idle case above already takes -- fall
+			 * back to the validated ivh_vact_residual == 0
+			 * arithmetic rather than run a split whose scale is
+			 * wrong, because a wrong scale here does not add noise,
+			 * it inverts the signal (capacity 0 everywhere).
+			 */
+			if (unlikely(tick_c < 1000)) {
+				residual = 0;
+				tick_c = 0;
+				idle_c = 0;
+			}
+		}
+	}
 
 	if (unlikely(!old)) {
 		/* First tick on this CPU: nothing to measure across yet. */
@@ -1213,12 +1404,24 @@ void ivh_vact_tick(void)
 		 * but it is not a "the vCPU was taken away" event, and
 		 * ivh_vact_preemptions must keep meaning the same thing as
 		 * rq->preemptions for the Gate 2 comparison to stay controlled.
+		 *
+		 * A sub-threshold gap can be mostly or entirely NOHZ IDLE -- at
+		 * HZ=1000 every idle episode shorter than ivh_vact_jump_threshold
+		 * lands here and not in the gap branch below, so this is where
+		 * hackbench's pipe round trips arrive.  `avail` is the gap with
+		 * idle removed; both accumulators are fed from it so that idle
+		 * leaves the ratio entirely instead of being booked as steal
+		 * (which it was) or as execution (which would dilute the signal
+		 * on exactly the vCPUs the gate has to judge).
 		 */
 		if (unlikely(residual)) {
-			stolen = ivh_vact_gap_split(rq, (u64)age, tick_c);
+			avail = ((u64)age > idle_c) ? (u64)age - idle_c : 0;
+			stolen = ivh_vact_gap_split(rq, avail, tick_c);
 			rq->ivh_vact_win_stolen_c += stolen;
+			used = avail - stolen;
+		} else {
+			used = (u64)age;
 		}
-		used = (u64)age - stolen;
 		goto window;
 	}
 
@@ -1286,11 +1489,31 @@ void ivh_vact_tick(void)
 		 * stands unchanged; at 1 the same split as the sub-threshold
 		 * path applies, which matters because a 1.6 ms gap booked
 		 * whole is a 2.7x over-count of a 0.6 ms preemption.
+		 *
+		 * Idle is removed here too, and that is NOT dead code merely
+		 * because the branch above already handled "the gap was idle":
+		 * rq->ivh_vact_idle_exit_tsc is written only from
+		 * account_idle_time(), which the NOHZ catch-up path reaches via
+		 * account_idle_ticks() -- and that is called only once a WHOLE
+		 * jiffy of idle has elapsed.  A sub-jiffy idle followed by a
+		 * slow tick restart therefore produces a gap that lands HERE,
+		 * with idle_exit_tsc still pointing before `old`, and booking it
+		 * whole is the same phantom steal, just rarer.  It also counts a
+		 * preemption EVENT that did not happen, which this correction
+		 * deliberately does not touch: ivh_vact_preemptions has to keep
+		 * meaning the same thing as rq->preemptions for the Gate 2
+		 * comparison to stay controlled, so that stays a Build 2
+		 * question and only the capacity ratio is repaired here.
 		 */
-		stolen = unlikely(residual) ?
-			 ivh_vact_gap_split(rq, (u64)age, tick_c) : (u64)age;
+		if (unlikely(residual)) {
+			avail = ((u64)age > idle_c) ? (u64)age - idle_c : 0;
+			stolen = ivh_vact_gap_split(rq, avail, tick_c);
+			used = avail - stolen;
+		} else {
+			stolen = (u64)age;
+			used = 0;
+		}
 		rq->ivh_vact_win_stolen_c += stolen;
-		used = (u64)age - stolen;
 	}
 
 window:

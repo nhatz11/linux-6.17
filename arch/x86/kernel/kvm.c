@@ -1246,6 +1246,43 @@ unsigned long ivh_pv_preempt_src = 0UL;		/* 0 = KVM bit (default) */
  * host; the literal below is only the pre-calibration fallback.  For Phase 2,
  * do NOT pick a number up front -- read it off the separation point of the
  * two ivh_beat_age_hist_* distributions.
+ *
+ * THAT SEPARATION POINT HAS NOW BEEN READ (2026-07-30), and it says this
+ * value is far too high for the WAIT predicate.  Left unchanged anyway, and
+ * both halves of that need saying.
+ *
+ * From ivh_beat_age_hist_* over a hackbench run under real host contention
+ * (647,858 running / 1,128 preempted samples at the is_wait_preempted() call
+ * site, i.e. the MCS-predecessor population):
+ *
+ *	threshold          sens%    FPR%    prec%
+ *	  16384 (  7 us)   96.01   1.299   11.40
+ *	  65536 ( 30 us)   48.05   0.397   17.42
+ *	 131072 ( 60 us)   45.48   0.036   68.86   <-- the separation point
+ *	 262144 (119 us)   41.76   0.030   70.93
+ *	1048576 (477 us)   29.88   0.013   80.62
+ *	3300000 (1.5 ms)   ~0      ~0      n/a     <-- shipped
+ *
+ * FPR falls 11x between 65536 and 131072 while sensitivity barely moves --
+ * that is the knee, and it sits at ~60 us because the predecessor is SPINNING
+ * and republishing at ivh_beat_publish_in_spin()'s ~90 us cadence.  The
+ * shipped 1.5 ms is nine doublings past it, out in the tail of the preempted
+ * distribution, and the live counters agree: ivh_beat_agree_true came in at
+ * 0-2 against 1,128-2,028 false negatives, i.e. the heartbeat currently never
+ * fires on this path at all.
+ *
+ * NOT CHANGED HERE, deliberately.  ivh_pv_preempt_src defaults to 0 but is
+ * running at 2 (authoritative) on this project's test setup, so this value
+ * really does steer pv_wait_early(); moving it changes when waiters stop
+ * spinning and start halting, which is a throughput question that has to be
+ * benchmarked, not a comparator question that can be settled from a
+ * confusion matrix.  Sweep it live with ivh_pv_preempt_src=1 first (the
+ * numbers above were taken that way), then benchmark 131072 against 3300000
+ * at src=2 before committing.  Note also that this same knob feeds
+ * ivh_cs_predicate_form 1 and 2, where lowering it does NOT help -- see the
+ * form table in <asm/ivh_tsc_beat.h> for why the two populations need
+ * different numbers and why that is an argument against forms 1 and 2 rather
+ * than an argument for a second threshold.
  */
 unsigned long ivh_pv_beat_threshold = 3300000UL;
 #define IVH_BEAT_THRESHOLD_US	1500ULL
@@ -1274,14 +1311,37 @@ EXPORT_PER_CPU_SYMBOL_GPL(ivh_cs_beat);
 unsigned long ivh_cs_preempt_src = 0UL;		/* 0 = off (default) */
 EXPORT_SYMBOL_GPL(ivh_cs_preempt_src);
 /*
- * Form 1 by default -- "in a CS AND the liveness heartbeat is stale" rather
- * than "in a CS for a long time".  See the two-form table in
- * <asm/ivh_tsc_beat.h>: form 1 is strictly better founded, and defaulting to
- * it means that if nobody ever gets round to running the form-0-vs-form-1 A/B
- * the shipped behaviour is still the defensible one.  Form 0 remains
- * reachable by sysctl precisely so that A/B costs an echo rather than a boot.
+ * FORM 0 by default as of 2026-07-30, changed from form 1 BY THE A/B THAT
+ * THIS KNOB EXISTS TO MAKE CHEAP.  Form 1 was defaulted on the a-priori
+ * argument that it composes the new piece (holder identity) with a proven one
+ * (heartbeat staleness); the argument was reasonable and the measurement
+ * disagrees with it.
+ *
+ * Aggregated over 3 x hackbench -T -g 1 -f 8 -l 400000 per form on
+ * 6.17.0-rseqport67 under real host contention, ~27M ivh_cs_head_check()
+ * samples each, ivh_cs_preempt_src=1 so no behaviour differed between arms:
+ *
+ *	form   sensitivity   FPR      precision
+ *	  0        34.15%    0.203%     18.36%
+ *	  1        10.22%    0.166%      7.68%
+ *	  2         6.89%    0.183%      3.34%
+ *
+ * Form 0 is 3.3x form 1's sensitivity AND 2.4x its precision at
+ * indistinguishable FPR -- it dominates, so there is no operating point at
+ * which form 1 is the better choice.  The full explanation is in the form
+ * table in <asm/ivh_tsc_beat.h>; the one-line version is that forms 1 and 2
+ * ask the LIVENESS HEARTBEAT about a LOCK HOLDER, and a lock holder is by
+ * definition not spinning, so its heartbeat is refreshed only by the 1 kHz
+ * tick.  A signal republished at 1 kHz cannot resolve an event that must be
+ * caught inside a hold, whatever threshold is chosen -- and the sweep in that
+ * table shows exactly that: sensitivity is fully tunable from 10% to 97% via
+ * ivh_pv_beat_threshold, but every point on that curve is worse than form 0
+ * at the same sensitivity.
+ *
+ * Forms 1 and 2 remain reachable by sysctl, and should be, because the number
+ * above is one workload's.  Rerun the A/B before trusting it on another.
  */
-unsigned long ivh_cs_predicate_form = 1UL;
+unsigned long ivh_cs_predicate_form = 0UL;
 EXPORT_SYMBOL_GPL(ivh_cs_predicate_form);
 
 /*
@@ -1307,6 +1367,42 @@ EXPORT_SYMBOL_GPL(ivh_cs_predicate_form);
  * is the separation point of ivh_cs_age_hist_running[] against
  * ivh_cs_age_hist_preempted[], cross-checked against ivh_cs_hold_hist[]'s
  * p99.9 -- which is why all three histograms ship in this same build.
+ *
+ * THAT CALIBRATION HAS NOW BEEN DONE (2026-07-30, same aggregated run as the
+ * form A/B above: 20.3M running / 27.2k preempted age samples) and the seed
+ * survives it, which is worth recording so the next person does not redo it:
+ *
+ *	threshold        sens%   FPR%    prec%    F1
+ *	   4096 (1.9us)  75.90   0.883   10.33   0.182
+ *	   8192 (3.7us)  75.62   0.642   13.63   0.231
+ *	  16384 (7.4us)  71.78   0.511   15.84   0.260
+ *	  65536 ( 30us)  39.90   0.416   11.40   0.177
+ *	 220000 (100us)  34.15   0.203   18.36   ~0.22   <-- shipped, MEASURED
+ *	 524288 (238us)  30.85   0.123   25.08   0.277
+ *	2097152 (953us)  25.72   0.111   23.75   0.247
+ *
+ * The curve is flat between 100 us and 240 us, so the shipped value is inside
+ * the optimum and moving it would be fitting noise.  Two things about it are
+ * NOT noise and should be read before anyone retunes:
+ *
+ *   THE SENSITIVITY CEILING IS 75.9%, not 100%, and no threshold reaches past
+ *   it.  ivh_cs_age_hist_preempted[0] is 24.1% of all preempted samples --
+ *   holders the host says are preempted that have NO CS STAMP AT ALL, because
+ *   cs_enter() only stamps outermost non-interrupt acquires taken through
+ *   kernel/locking/spinlock.c while the holder-identity table covers every
+ *   acquisition in the kernel.  That gap is a coverage question for the STAMP
+ *   SITE, not a threshold question, and it is the only remaining lever on
+ *   sensitivity for this predicate.
+ *
+ *   PRECISION IS CAPPED BY PREVALENCE, not by the predicate.  Only 0.134% of
+ *   queue-head checks are against a genuinely preempted holder on this
+ *   workload, so an FPR of 0.2% already means false positives outnumber true
+ *   ones ~4:1 no matter how good the discriminator is.  Pushing precision up
+ *   means finding a workload that actually produces lock-holder preemption --
+ *   see the workload note in the form table in <asm/ivh_tsc_beat.h>.  A lower
+ *   threshold buys sensitivity at strictly worse precision, so pick the end
+ *   of this curve by what a false bail COSTS (the pending bit drops early --
+ *   read ivh_head_bail_loop_hist[] and ivh_lock_steals), not by sensitivity.
  */
 unsigned long ivh_cs_beat_threshold = 220000UL;
 #define IVH_CS_BEAT_THRESHOLD_US	100ULL

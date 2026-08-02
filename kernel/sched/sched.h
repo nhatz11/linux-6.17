@@ -1549,6 +1549,21 @@ struct rq {
      */
     s64                     ivh_vact_debt_c;
     /*
+     * Cumulative idle+iowait for this CPU in NANOSECONDS as of the last armed
+     * tick -- the prev_* snapshot for ivh_vact_idle_delta_c()
+     * (kernel/sched/core.c).  Nanoseconds, not cycles, and that is the one
+     * exception to this block's "everything is raw TSC cycles" rule: the
+     * source (get_cpu_idle_time_us) is a microsecond counter with no TSC
+     * relationship, so the DELTA is what gets converted, once, at the point
+     * of use.  Converting the cumulative value instead would put a tsc_khz
+     * multiply on a since-boot quantity and hand the split a rounding error
+     * that grows with uptime.
+     *
+     * Untouched (and always 0) at the default ivh_vact_residual == 0, exactly
+     * like ivh_vact_debt_c beside it.
+     */
+    u64                     ivh_vact_prev_idle_ns;
+    /*
      * THE OUTPUT, 0..1024, the rq->cpu_capacity replacement.  Initialised to
      * 1024 ("perfectly healthy") at rq init rather than 0, because IVH_CAP_FLOOR
      * is 850 and ivh_capacity_threshold is 1010 against a 1024 scale: a CPU

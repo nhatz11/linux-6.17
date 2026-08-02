@@ -14205,7 +14205,7 @@ skip_cs_hists:
 	seq_printf(m, "ivh_vact_jump_threshold:   %lu (cycles)\n",
 		   READ_ONCE(ivh_vact_jump_threshold));
 	seq_printf(m, "ivh_vact_window_ns:        %lu\n", READ_ONCE(ivh_vact_window_ns));
-	seq_printf(m, "ivh_vact_residual:         %lu  (0=sub-threshold gap counts wholly as executing, 1=split at one tick + carry)\n",
+	seq_printf(m, "ivh_vact_residual:         %lu  (0=sub-threshold gap counts wholly as executing, 1=remove idle then split at one tick + carry)\n",
 		   READ_ONCE(ivh_vact_residual));
 	seq_printf(m, "ivh_decision_shadow:       %lu\n", READ_ONCE(ivh_decision_shadow));
 	seq_printf(m, "# cpu real_last_preempt_ns vact_last_preempt_ns real_last_active_ns "

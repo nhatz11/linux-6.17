@@ -3,6 +3,7 @@
 #define _ASM_X86_IVH_TSC_BEAT_H
 
 #include <linux/cache.h>
+#include <linux/compiler.h>	/* OPTIMIZER_HIDE_VAR(), see the conversions below */
 #include <linux/ivh_lock_holder.h>
 #include <linux/log2.h>
 #include <linux/math64.h>
@@ -177,6 +178,45 @@ static __always_inline bool ivh_beat_stale(int cpu)
  * mul_u64_u32_div() rather than a plain multiply-then-divide for the reason
  * ivh_ref_accumulate() already documents: the naive form overflows u64 for
  * cumulative cycle counts and truncates silently when it does.
+ *
+ * ---------------------------------------------------------------------------
+ * THE OPTIMIZER_HIDE_VAR() CALLS ARE LOAD-BEARING.  DO NOT DELETE THEM.
+ * (root cause of Bug 4, found 2026-08-01 by disassembling the booted vmlinux)
+ * ---------------------------------------------------------------------------
+ *
+ * On x86-64 mul_u64_u32_div() resolves to <asm/div64.h>'s
+ *
+ *	asm ("mulq %2; divq %3" : "=a" (q)
+ *	                        : "a" (a), "rm" (mul), "rm" (div) : "rdx");
+ *
+ * `a` is TIED to %rax and `mulq` DESTROYS %rax before `divq` reads %3.  The
+ * asm does not (and cannot, in GCC's constraint language) say so.  So if the
+ * compiler can PROVE that the `mul` or the `div` operand holds the same value
+ * as `a`, it is free to satisfy both with the one register -- %rax -- and it
+ * emits `divq %rax`, which divides the product by itself.  The quotient is
+ * then 1, silently, with no warning anywhere.
+ *
+ * That is not hypothetical.  ivh_vact_tick() computes
+ * ivh_tsc_ns_to_cycles(TICK_NSEC), and at CONFIG_HZ=1000 TICK_NSEC is
+ * 1000000 -- numerically identical to the USEC_PER_SEC divisor one line
+ * below.  GCC coalesced them and 6.17.0-rseqport68 shipped with a nominal
+ * tick period of ONE CYCLE, so ivh_vact_gap_split() booked (avail - 1) cycles
+ * of every single tick as STOLEN and exactly 1 cycle as EXECUTING, pinning
+ * rq->ivh_vact_capacity at 0 on all 16 vCPUs regardless of real steal.  A
+ * disassembly sweep of the whole vmlinux found exactly one victim of the
+ * pattern, this one, precisely because equal-valued operands are rare.
+ *
+ * Hiding the DIVIDEND is sufficient and is the cheapest place to cut: `mul`
+ * and `div` are the two operands that can alias %rax, and both can only be
+ * proven equal to something the compiler can still see.  Once `a` is opaque
+ * no such proof exists, for either operand, in either direction, for any
+ * present or future caller.  Cost is at most one register move on a path that
+ * already issues a 64-bit divide.
+ *
+ * Fixing <asm/div64.h> itself would be the upstream-correct repair and would
+ * cover the whole tree; it is deliberately NOT done here because that header
+ * feeds sched_clock(), timekeeping and cpufreq, and the audit above says IVH
+ * is the only caller currently miscompiled.  Revisit if that stops being true.
  */
 static __always_inline u64 ivh_raw_tsc(void)
 {
@@ -191,6 +231,7 @@ static __always_inline u64 ivh_tsc_cycles_to_ns(u64 cycles)
 	if (unlikely(!khz))
 		return 0;
 
+	OPTIMIZER_HIDE_VAR(cycles);	/* see the comment above -- required */
 	return mul_u64_u32_div(cycles, USEC_PER_SEC, khz);
 }
 #define ivh_tsc_cycles_to_ns ivh_tsc_cycles_to_ns
@@ -202,6 +243,7 @@ static __always_inline u64 ivh_tsc_ns_to_cycles(u64 ns)
 	if (unlikely(!khz))
 		return 0;
 
+	OPTIMIZER_HIDE_VAR(ns);		/* see the comment above -- required */
 	return mul_u64_u32_div(ns, khz, USEC_PER_SEC);
 }
 #define ivh_tsc_ns_to_cycles ivh_tsc_ns_to_cycles
@@ -290,6 +332,90 @@ static __always_inline u64 ivh_tsc_ns_to_cycles(u64 ns)
  *	Cross-check with the age histograms while doing it -- bucket 0 absorbs
  *	the age < 0 sentinel, so hist_running[0] + hist_preempted[0] against
  *	their totals IS the "holder had no CS stamp" rate.
+ *
+ * ===========================================================================
+ * THE MEASUREMENT WAS RUN (2026-07-30).  FORM 0 WINS AND IS NOW THE DEFAULT.
+ * ===========================================================================
+ *
+ * 6.17.0-rseqport67, hackbench -T -g 1 -f 8 -l 400000 x3 per arm under real
+ * host contention, ~27M ivh_cs_head_check() samples per arm,
+ * ivh_cs_preempt_src=1 so the arms differed in nothing but which counter was
+ * incremented:
+ *
+ *	form   sensitivity   FPR      precision
+ *	  0        34.15%    0.203%     18.36%
+ *	  1        10.22%    0.166%      7.68%
+ *	  2         6.89%    0.183%      3.34%
+ *
+ * Form 0 dominates: more than 3x the sensitivity of form 1 AND more than 2x
+ * its precision, at an FPR the two share. So the argument above -- that form
+ * 1 composes the unproven piece with a proven one and is therefore the safer
+ * default -- was wrong, and it was wrong for a reason worth stating plainly,
+ * because it invalidates forms 1 and 2 STRUCTURALLY and not just on this
+ * workload:
+ *
+ *   THE HEARTBEAT IS THE WRONG INSTRUMENT FOR A LOCK HOLDER.  is_wait_-
+ *   preempted() asks about prev->cpu, an MCS predecessor, which is SPINNING
+ *   and therefore republishing at ivh_beat_publish_in_spin()'s ~90 us
+ *   cadence.  Forms 1 and 2 ask about the LOCK HOLDER, which by definition is
+ *   not spinning -- it is executing inside the critical section -- so the only
+ *   thing refreshing its stamp is the 1 kHz tick in account_process_tick().
+ *   Same field, same predicate, two populations whose republish rates differ
+ *   by more than an order of magnitude.  Everything else follows from that.
+ *
+ * It is a THRESHOLD problem in the sense that ivh_pv_beat_threshold really
+ * does control the sensitivity, over an enormous range -- and it is NOT a
+ * threshold problem in the sense that no setting of it is any good.  Sweeping
+ * it live against form 2, same workload, same boot:
+ *
+ *	ivh_pv_beat_threshold   sens%    FPR%    prec%
+ *	  3300000 (1500 us)     10.53    0.177    5.90   <-- shipped
+ *	  1100000 ( 500 us)     30.75    0.427   11.20
+ *	   131072 (  60 us)     36.45    1.304    2.96
+ *	    16384 (   7 us)     97.21   12.241    0.99
+ *
+ * Compare each row against form 0 at MATCHED SENSITIVITY and form 0 wins
+ * every time: at ~31% sensitivity form 0 costs 0.12% FPR against form 2's
+ * 0.43%, and at ~76% sensitivity form 0 costs 0.64% against form 2's 12.2%.
+ * A 1 kHz-refreshed stamp simply cannot be read at microsecond resolution;
+ * pushing the threshold down converts running holders into false positives
+ * roughly as fast as it converts preempted ones into true ones.  1500 us was
+ * never a calibration -- it is is_cpu_preempted()'s number, chosen so Phase 1
+ * would be a controlled comparison -- and the honest reading of the sweep is
+ * that the constraint it accidentally satisfies (stay above one tick period)
+ * is a real one for this population.
+ *
+ * TWO THINGS THIS DOES *NOT* SHOW, both of which were plausible going in:
+ *
+ *   NOT "the CS is too short to catch".  hackbench's holds are 100-300 ns
+ *   (ivh_obs_cs_hist p50 = 128 ns, mean 175 ns), and the tempting inference
+ *   is that a host preemption cannot be observed inside a window that short.
+ *   The data says otherwise: ivh_cs_age_hist_preempted[] puts the observed
+ *   age of a preempted holder's CS at 3.7 us to 4 ms -- the preemption
+ *   STRETCHES the hold by three to four orders of magnitude, and 75.9% of
+ *   preempted samples land in a measurable, live-stamped bucket.  The CS
+ *   being short is what makes form 0 WORK: a healthy hold almost never
+ *   crosses even 1 us, so the separation is enormous.
+ *
+ *   NOT a holder-identity failure.  ivh_holder_self reads 0 and
+ *   unknown_empty/unknown_collision/raced are all populated and plausible,
+ *   so the table is doing its job in all three arms.
+ *
+ * THE ONE THING THAT IS A WORKLOAD ARTEFACT, stated so it is not mistaken for
+ * a property of the signal: PREVALENCE.  Only 0.134% of queue-head checks on
+ * hackbench are against a holder the host has actually preempted, and
+ * ivh_obs_stolen_pct is 0.0005% -- roughly 1 critical section in 200,000.
+ * At that prevalence an FPR of 0.2% already means false positives outnumber
+ * true ones ~4:1, so 18% precision is close to the arithmetic ceiling for
+ * ANY predicate here, and no amount of tuning moves it.  hackbench is a fine
+ * workload for measuring the FPR and the running-age distribution, both of
+ * which are stable to ~1% run to run.  It is a poor one for measuring
+ * sensitivity: the preempted population arrives in bursts, so 3-second runs
+ * put sensitivity anywhere from 0% to 55% for a FIXED configuration (this is
+ * why the numbers above are aggregated over 3 x 12 s and why the earlier
+ * single-run figures in this project's notes disagree with each other and
+ * with these).  Validating this signal on its merits needs a workload that
+ * actually produces sustained lock-holder preemption.
  */
 struct ivh_cs_beat {
 	u64 stamp;		/* raw rdtsc() at cs_enter(); 0 == not in a CS */
@@ -304,7 +430,8 @@ DECLARE_PER_CPU_ALIGNED(struct ivh_cs_beat, ivh_cs_beat);
  *   really does bail out of its spin).  Same three-valued shape and the same
  *   meanings as ivh_pv_preempt_src above, on purpose: one established idiom
  *   for "flip a signal from measured to trusted", not four ad-hoc ones.
- * ivh_cs_predicate_form -- 0, 1 or 2, per the table above.  Defaults to 1.
+ * ivh_cs_predicate_form -- 0, 1 or 2, per the table above.  Defaults to 0 as
+ *   of 2026-07-30 (was 1); the measurement that changed it is in that table.
  * ivh_cs_beat_threshold -- form 0's threshold, in RAW TSC CYCLES, calibrated
  *   at late_initcall from tsc_khz and sysctl-writable so it can be swept live.
  *   The shipped value is a STARTING POINT FOR A SWEEP, not a committed value;

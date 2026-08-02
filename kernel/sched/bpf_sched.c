@@ -324,16 +324,34 @@ unsigned long ivh_vact_window_ns = 100000000UL;
  *
  *   0 (default) = the arithmetic Build 1 shipped, byte for byte: a gap below
  *       ivh_vact_jump_threshold is credited entirely to `used`.
- *   1           = split every gap into one nominal tick of execution plus an
- *       excess booked as steal, carrying the signed shortfall between ticks.
+ *   1           = take this tick's IDLE out of the gap, then split what is
+ *       left into one nominal tick of execution plus an excess booked as
+ *       steal, carrying the signed shortfall between ticks.
  *
- * The full root-cause writeup, including the 6.17.0-rseqport67 numbers that
- * motivated it (Part C agreeing with only 40% of real steal's migrate
- * verdicts and essentially never over-triggering), is at
- * ivh_vact_gap_split() in kernel/sched/core.c.  Default off, and it must stay
- * off until an A/B on /proc/ivh_debug's ivh_dec_* / ivh_cap_pass_* shows it
- * moves Part C toward real steal WITHOUT crossing into over-triggering --
- * exactly the discipline ivh_ref_carry is held to.
+ * The full root-cause writeup is at ivh_vact_gap_split() in
+ * kernel/sched/core.c.  Read it before touching this: the knob has been
+ * measured TWICE and has a different failure mode on each side.
+ *
+ *   At 0 it UNDER-triggers -- median ivh_vact_capacity 1024, Gate 1 saying
+ *   "go" 5.2% of the time against real steal's 12.2%.  That is what motivated
+ *   the split.
+ *
+ *   At 1, in its FIRST form (no idle term), it OVER-triggered by 4x -- Gate 1
+ *   "go" 92.2% against real steal's 12.7%, because every NOHZ idle episode
+ *   shorter than ivh_vact_jump_threshold was booked as steal.  Exactly the
+ *   over-shoot this comment previously warned might happen, and the reason it
+ *   shipped default-off.
+ *
+ * The idle term added 2026-07-30 is the repair for that second failure and it
+ * has NOT yet been measured, because it needs a rebuild and a boot.  So this
+ * stays default OFF and the acceptance test is unchanged: A/B
+ * /proc/ivh_debug's ivh_dec_* / ivh_cap_pass_* in one boot and require that
+ * it moves Part C toward real steal without crossing into over-triggering --
+ * the same discipline ivh_ref_carry is held to.  The specific thing to look
+ * at first is the per-CPU ivh_vact_cpu lines: the previous form inverted the
+ * correlation outright, calling the eight vCPUs with 0.2% real steal the most
+ * stolen in the system, so "does vact_capacity now rank the CPUs the same way
+ * vcap_capacity does" is a sharper acceptance test than any aggregate.
  */
 unsigned long ivh_vact_residual = 0UL;
 
