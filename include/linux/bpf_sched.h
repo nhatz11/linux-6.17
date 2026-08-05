@@ -335,6 +335,92 @@ DECLARE_PER_CPU(u64, ivh_cap_pass_real_only);
 DECLARE_PER_CPU(u64, ivh_cap_pass_tsc_only);
 DECLARE_PER_CPU(u64, ivh_cap_pass_neither);
 
+/*
+ * ---------------------------------------------------------------------------
+ * IVH "uc" (used-capacity): in-kernel replica of vcap's used/(used+stolen)
+ * EMA, the vcap-retirement signal.
+ * tools/bpf/docs/ivh_vcap_retirement_build_plan_2026-08-03.md.
+ * Sysctls defined in kernel/sched/bpf_sched.c; the tick producer is
+ * ivh_uc_tick() in kernel/sched/core.c; the gate-level and destination-set
+ * comparators below are defined in kernel/sched/fair.c beside the Part C
+ * ones they parallel (sec 5.4); the window-close histogram/threshold
+ * counters are defined in kernel/sched/core.c beside ivh_uc_close() (sec
+ * 5.2/5.3), since window close -- unlike a gate evaluation -- happens on the
+ * tick path, not the lock path.
+ *
+ *   ivh_uc_enabled          produce the signal (default ON, ungated)
+ *   ivh_uc_window_ns        measurement window, ns (matches vcap's -p 200)
+ *   ivh_uc_duty_ns          0 continuous | vcap's -s 5000 duty cycle for
+ *                           shadow-comparison sample-count isolation only
+ *   ivh_uc_ema_alpha_q16    Q16 EMA coefficient (868 = 10.4s half-life)
+ *   ivh_uc_used_source      0 WALL (production, idle-excluded, spinner-
+ *                           invariant) | 1 ACCT (vcap-formula replica,
+ *                           validation only -- see plan sec 1.3/G3)
+ *   ivh_uc_min_steal_ns     vcap's <10us-stolen -> 1.0 guard, reproduced
+ *   ivh_uc_min_avail_pct    minimum non-idle % of a window before it may
+ *                           close; below this the window extends instead
+ *   ivh_uc_shadow           feed the window-close comparison counters
+ *   ivh_uc_avgcap_enabled   run the 1Hz average_capacity_all worker (sec 6.3)
+ *   ivh_cap_source           (existing, extended) 0 vcap | 1 shadow |
+ *                           2 rq->ivh_vact_capacity | 3 rq->ivh_uc_capacity
+ */
+extern unsigned long ivh_uc_enabled;
+extern unsigned long ivh_uc_window_ns;
+extern unsigned long ivh_uc_duty_ns;
+extern unsigned long ivh_uc_ema_alpha_q16;
+extern unsigned long ivh_uc_used_source;
+extern unsigned long ivh_uc_min_steal_ns;
+extern unsigned long ivh_uc_min_avail_pct;
+extern unsigned long ivh_uc_shadow;
+extern unsigned long ivh_uc_avgcap_enabled;
+
+/*
+ * Gate-level agreement (real vs uc), parallel to ivh_dec_* above but scoped
+ * to the capacity term only -- uc does not touch Gate 2, so both arms of
+ * this comparison use the real (non-TSC) time-left verdict, isolating
+ * exactly the difference the retirement plan needs measured (sec 5.4).
+ */
+DECLARE_PER_CPU(u64, ivh_dec_uc_agree_go);
+DECLARE_PER_CPU(u64, ivh_dec_uc_agree_nogo);
+DECLARE_PER_CPU(u64, ivh_dec_uc_only_go);
+DECLARE_PER_CPU(u64, ivh_dec_uc_real_only_go);
+
+/* Destination-set agreement (vcap vs uc), parallel to ivh_cap_pass_* above. */
+DECLARE_PER_CPU(u64, ivh_uc_pass_both);
+DECLARE_PER_CPU(u64, ivh_uc_pass_vcap_only);
+DECLARE_PER_CPU(u64, ivh_uc_pass_uc_only);
+DECLARE_PER_CPU(u64, ivh_uc_pass_neither);
+
+/*
+ * Destination-set EMPTY rate, one bool per shadow evaluation per source --
+ * the counter the pre-existing comparator above does not have.  Directly
+ * predicts "IVH stops migrating at all", which retirement plan sec 1.4
+ * shows rq->ivh_vact_capacity would already do today if it were live.
+ */
+DECLARE_PER_CPU(u64, ivh_destset_empty_vcap);
+DECLARE_PER_CPU(u64, ivh_destset_empty_uc);
+DECLARE_PER_CPU(u64, ivh_destset_empty_tsc);
+
+/*
+ * Window-close-level validation (sec 5.2/5.3), fed only while ivh_uc_shadow
+ * is on.  Signed-divergence histogram of (uc_capacity - vcap_capacity),
+ * 16 buckets spanning +-1024, the direct analogue of ivh_cs_age_hist_*.
+ * Threshold-crossing 2x2s at both consumer thresholds: agreement in the
+ * middle of the range is worth nothing if the two disagree AT the
+ * thresholds that actually gate a decision (IVH_BPF_CAP_FLOOR = 850,
+ * ivh_capacity_threshold = 1010).
+ */
+#define IVH_UC_DIV_HIST_BUCKETS	16
+DECLARE_PER_CPU(u64, ivh_uc_div_hist[IVH_UC_DIV_HIST_BUCKETS]);
+DECLARE_PER_CPU(u64, ivh_uc_thr850_both);
+DECLARE_PER_CPU(u64, ivh_uc_thr850_vcap_only);
+DECLARE_PER_CPU(u64, ivh_uc_thr850_uc_only);
+DECLARE_PER_CPU(u64, ivh_uc_thr850_neither);
+DECLARE_PER_CPU(u64, ivh_uc_thr1010_both);
+DECLARE_PER_CPU(u64, ivh_uc_thr1010_vcap_only);
+DECLARE_PER_CPU(u64, ivh_uc_thr1010_uc_only);
+DECLARE_PER_CPU(u64, ivh_uc_thr1010_neither);
+
 DECLARE_STATIC_KEY_FALSE(bpf_sched_enabled_key);
 
 static inline bool bpf_sched_enabled(void)

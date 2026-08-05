@@ -372,6 +372,71 @@ unsigned long ivh_vact_residual = 0UL;
  */
 unsigned long ivh_decision_shadow = 0UL;
 
+/*
+ * ---------------------------------------------------------------------------
+ * IVH "uc" (used-capacity): in-kernel replica of vcap's used/(used+stolen)
+ * EMA, replacing the vcap userspace daemon.
+ * tools/bpf/docs/ivh_vcap_retirement_build_plan_2026-08-03.md sec 4.
+ * ---------------------------------------------------------------------------
+ *
+ * ivh_uc_enabled default ON and ungated by any consumer (matches
+ * ivh_vact_tick()'s discipline): the signal is produced from the first boot
+ * so it can be validated for a full session before anything reads it.
+ * ivh_cap_source (existing knob, extended below) is what actually gates
+ * consumption; producing the signal and trusting it remain two decisions.
+ */
+unsigned long ivh_uc_enabled = 1UL;
+
+/* Measurement window, ns.  200 ms matches vcap's `-p 200`.  Clamped to
+ * [10 ms, 60 s] in the validating handler below -- the overflow bound in the
+ * retirement plan sec 3.7 point 5 depends on the 60 s ceiling holding. */
+unsigned long ivh_uc_window_ns = 200000000UL;
+
+/* 0 (default) = windows tile back-to-back, continuous accumulation.
+ * Non-zero = skip this many ns of accumulation after each window closes;
+ * 5000000000 reproduces vcap's `-s 5000` duty cycle exactly, for isolating
+ * "different estimator" from "different sample count" in shadow comparison
+ * (retirement plan sec 1.1/3.4). Not a production knob. */
+unsigned long ivh_uc_duty_ns = 0UL;
+
+/* Q16 fixed-point EMA coefficient, direct (not half-life-derived, so no
+ * pow() ever has to live in the kernel).  868 = 10.4s half-life at the
+ * default 200ms window, matching vcap's own bias-corrected EWMA time
+ * constant (retirement plan sec 3.3 table). */
+unsigned long ivh_uc_ema_alpha_q16 = 868UL;
+
+/* 0 (default) = WALL variant: (elapsed-idle-stolen)/(elapsed-idle), the
+ *   production formula, idle-excluded and therefore invariant to whether
+ *   vcap's SCHED_IDLE spinners are running (retirement plan sec 1.3/3.2).
+ * 1 = ACCT variant: literal kcpustat replica of vcap's used/(used+stolen)
+ *   formula. Validation only -- see the retirement plan's G3 gate for why
+ *   this variant is expected to diverge from WALL once vcap's spinners stop
+ *   running, and why that divergence is confirmation, not a bug. */
+unsigned long ivh_uc_used_source = 0UL;
+
+/* vcap's `if (stolen_pass < 10000) capacity_perc = 1.0` guard (main.cpp:371),
+ * reproduced here so a window with negligible steal doesn't publish a noisy
+ * near-1.0 ratio from a tiny denominator. */
+unsigned long ivh_uc_min_steal_ns = 10000UL;
+
+/* Minimum non-idle percentage of a window before it may close and publish;
+ * below this the window is extended (ivh_uc_extended++) rather than
+ * publishing a ratio derived from a near-empty sample. */
+unsigned long ivh_uc_min_avail_pct = 10UL;
+
+/* Feed the per-window comparison counters/histograms against vcap
+ * (retirement plan sec 5). Default off: the comparison is O(1) per window
+ * close but the counters are only meaningful once vcap is confirmed running
+ * with ivh_steal_source=1, same posture as ivh_decision_shadow. */
+unsigned long ivh_uc_shadow = 0UL;
+
+/* Run the 1Hz worker that republishes average_capacity_all from
+ * ivh_uc_capacity, the vcap-free replacement for vcap's own
+ * set_average_capacity_all() call (retirement plan sec 6.3). Default off
+ * until stage G6 -- vcap is still the authoritative writer of that value
+ * until then. */
+unsigned long ivh_uc_avgcap_enabled = 0UL;
+
 #ifdef CONFIG_SYSCTL
 /*
  * Both source selectors share one validating handler shape, and it is the
@@ -392,7 +457,8 @@ unsigned long ivh_decision_shadow = 0UL;
  */
 static int ivh_proc_source_common(const struct ctl_table *table, int write,
 				  void *buffer, size_t *lenp, loff_t *ppos,
-				  unsigned long *target, const char *name)
+				  unsigned long *target, const char *name,
+				  unsigned long max)
 {
 	unsigned long val = READ_ONCE(*target);
 	struct ctl_table tmp = *table;
@@ -403,9 +469,9 @@ static int ivh_proc_source_common(const struct ctl_table *table, int write,
 	if (ret || !write)
 		return ret;
 
-	if (val > 2) {
-		pr_err("IVH: refusing %s=%lu: valid values are 0 (real steal-derived value, default), 1 (shadow compare) and 2 (Part C authoritative)\n",
-		       name, val);
+	if (val > max) {
+		pr_err("IVH: refusing %s=%lu: valid values are 0..%lu\n",
+		       name, val, max);
 		return -EINVAL;
 	}
 
@@ -416,8 +482,13 @@ static int ivh_proc_source_common(const struct ctl_table *table, int write,
 static int ivh_proc_cap_source(const struct ctl_table *table, int write,
 			       void *buffer, size_t *lenp, loff_t *ppos)
 {
+	/* 0 vcap rq->cpu_capacity | 1 shadow | 2 rq->ivh_vact_capacity (Part C)
+	 * | 3 rq->ivh_uc_capacity (vcap retirement replica) -- see the
+	 * retirement plan sec 4 for why this max is 3 and
+	 * ivh_preempt_event_source's stays 2: there is no Part-C-plus-one
+	 * preemption-event series. */
 	return ivh_proc_source_common(table, write, buffer, lenp, ppos,
-				      &ivh_cap_source, "ivh_cap_source");
+				      &ivh_cap_source, "ivh_cap_source", 3);
 }
 
 static int ivh_proc_preempt_event_source(const struct ctl_table *table, int write,
@@ -425,7 +496,39 @@ static int ivh_proc_preempt_event_source(const struct ctl_table *table, int writ
 {
 	return ivh_proc_source_common(table, write, buffer, lenp, ppos,
 				      &ivh_preempt_event_source,
-				      "ivh_preempt_event_source");
+				      "ivh_preempt_event_source", 2);
+}
+
+/*
+ * ivh_uc_window_ns needs a real clamp, not just a validated set: the
+ * retirement plan's overflow argument (sec 3.7 point 5,
+ * win_used_c * SCHED_CAPACITY_SCALE staying 5 orders below u64 max) depends
+ * on the window never exceeding 60s, and ivh_uc_maybe_close_window()'s
+ * "win_c < 1000 cycles" sanity floor (sec 3.7 point 4) depends on it never
+ * being pushed to 0. Bounded here rather than via extra1/extra2 so the
+ * rejected value is never silently clamped -- same "reject, don't clamp"
+ * posture ivh_proc_source_common() takes above.
+ */
+static int ivh_proc_uc_window_ns(const struct ctl_table *table, int write,
+				 void *buffer, size_t *lenp, loff_t *ppos)
+{
+	unsigned long val = READ_ONCE(ivh_uc_window_ns);
+	struct ctl_table tmp = *table;
+	int ret;
+
+	tmp.data = &val;
+	ret = proc_doulongvec_minmax(&tmp, write, buffer, lenp, ppos);
+	if (ret || !write)
+		return ret;
+
+	if (val < 10000000UL || val > 60000000000UL) {
+		pr_err("IVH: refusing ivh_uc_window_ns=%lu: valid range is 10ms..60s (10000000..60000000000)\n",
+		       val);
+		return -EINVAL;
+	}
+
+	WRITE_ONCE(ivh_uc_window_ns, val);
+	return 0;
 }
 
 static const struct ctl_table ivh_sysctls[] = {
@@ -607,6 +710,75 @@ static const struct ctl_table ivh_sysctls[] = {
 	{
 		.procname	= "ivh_decision_shadow",
 		.data		= &ivh_decision_shadow,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	/*
+	 * vcap retirement (ivh_vcap_retirement_build_plan_2026-08-03.md sec 4).
+	 * ivh_uc_enabled default ON so the signal is produced and validatable
+	 * from the first boot; ivh_cap_source (above) is the actual consumer
+	 * gate and stays default 0 (vcap) until the plan's stage gates pass.
+	 */
+	{
+		.procname	= "ivh_uc_enabled",
+		.data		= &ivh_uc_enabled,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_uc_window_ns",
+		.data		= &ivh_uc_window_ns,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= ivh_proc_uc_window_ns,
+	},
+	{
+		.procname	= "ivh_uc_duty_ns",
+		.data		= &ivh_uc_duty_ns,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_uc_ema_alpha_q16",
+		.data		= &ivh_uc_ema_alpha_q16,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_uc_used_source",
+		.data		= &ivh_uc_used_source,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_uc_min_steal_ns",
+		.data		= &ivh_uc_min_steal_ns,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_uc_min_avail_pct",
+		.data		= &ivh_uc_min_avail_pct,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_uc_shadow",
+		.data		= &ivh_uc_shadow,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_uc_avgcap_enabled",
+		.data		= &ivh_uc_avgcap_enabled,
 		.maxlen		= sizeof(unsigned long),
 		.mode		= 0644,
 		.proc_handler	= proc_doulongvec_minmax,

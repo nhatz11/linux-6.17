@@ -134,6 +134,18 @@ extern void ivh_vact_tick(void);
 extern void get_vact_compare(int cpunum, u64 *last_preempt_ns, u64 *last_active_ns,
 			     u64 *preemptions, unsigned long *capacity,
 			     u64 *jumps, u64 *idle_explained);
+/*
+ * IVH "uc": in-kernel replica of vcap's used/(used+stolen) EMA, the vcap
+ * retirement signal.  tools/bpf/docs/ivh_vcap_retirement_build_plan_2026-08-03.md.
+ * Called from account_process_tick() immediately after ivh_vact_tick(), same
+ * placement reasoning as that call.  Implemented in kernel/sched/core.c.
+ */
+extern void ivh_uc_tick(void);
+/* Side-by-side comparator feed, shipped with no in-tree caller for the same
+ * reason get_vact_compare() is: adding an accessor later costs a rebuild. */
+extern void get_uc_compare(int cpunum, unsigned long *capacity,
+			   unsigned long *capacity_wall, unsigned long *capacity_acct,
+			   u64 *windows, u64 *skipped, u64 *extended);
 extern void set_avg_latency(int cpunum, u64 avg_latency);
 extern void set_ewma_act_ns(int cpu, u64 ewma_act_ns);
 extern int  get_average_capacity_all(void);
@@ -1584,6 +1596,53 @@ struct rq {
     unsigned long           ivh_vact_capacity;
     u64                     ivh_vact_jumps;           /* diagnostics: gaps attributed to real preemption */
     u64                     ivh_vact_idle_explained;  /* diagnostics: gaps explained by idle */
+
+    /*
+     * ---------------------------------------------------------------------
+     * IVH "uc" (used-capacity): in-kernel replica of vcap's
+     * used/(used+stolen) EMA, replacing the vcap userspace daemon as the
+     * capacity input to Gate 1 and the BPF destination scan.  See
+     * tools/bpf/docs/ivh_vcap_retirement_build_plan_2026-08-03.md.
+     *
+     * Deliberately NOT a merge into the ivh_vact_* block above: Part C's
+     * ivh_vact_capacity is a different estimator (tick-gated,
+     * thresholded-excess) that a prior live experiment showed compresses
+     * badly under this workload and must be left untouched as an
+     * independent comparator.  This block reproduces vcap's own formula
+     * instead -- continuous accumulation, no threshold on any term -- and
+     * lands on vcap's 1024 scale so IVH_CAP_FLOOR / ivh_capacity_threshold
+     * transfer unchanged.
+     *
+     * A struct rq field, not a per-CPU variable, because the BPF program
+     * reaches this only via bpf_per_cpu_ptr(&runqueues, cpu)->cpu_capacity
+     * -style CO-RE access -- see the retirement plan sec 3.1.  Not routed
+     * through rq->cpu_capacity_custom for the same load-balance-cadence
+     * reason rq->ivh_vact_capacity above is not.
+     */
+    u64                     ivh_uc_prev_tsc;      /* rdtsc() at last tick; 0 == unseeded */
+    u64                     ivh_uc_prev_steal_ns; /* cumulative steal at last tick */
+    u64                     ivh_uc_prev_idle_ns;  /* idle+iowait ns at last tick */
+    u64                     ivh_uc_prev_used_ns;  /* kcpustat user+nice+system at last tick */
+
+    u64                     ivh_uc_win_start_tsc;
+    u64                     ivh_uc_win_avail_c;    /* elapsed - idle */
+    u64                     ivh_uc_win_stolen_c;   /* steal within avail */
+    u64                     ivh_uc_win_used_c;     /* avail - stolen   (WALL numerator) */
+    u64                     ivh_uc_win_acct_c;     /* kcpustat used    (ACCT numerator) */
+
+    u64                     ivh_uc_ema_wall_q;     /* Q16 fixed point, 1024 scale */
+    u64                     ivh_uc_ema_acct_q;
+
+    unsigned long           ivh_uc_capacity;       /* THE OUTPUT: published, == selected variant */
+    unsigned long           ivh_uc_capacity_wall;  /* always computed: production candidate */
+    unsigned long           ivh_uc_capacity_acct;  /* always computed: vcap-formula replica, validation only */
+
+    u64                     ivh_uc_windows;        /* windows closed */
+    u64                     ivh_uc_skipped;        /* ticks bailed (unusable idle sample / no tsc_khz) */
+    u64                     ivh_uc_extended;       /* windows held open by the min-avail guard */
+    u64                     ivh_uc_raw_wall;       /* last pre-EMA sample, wall (1..1024) */
+    u64                     ivh_uc_raw_acct;       /* last pre-EMA sample, acct (1..1024) */
+    u64                     ivh_uc_vcap_at_close;  /* rq->cpu_capacity_custom snapshotted at window close */
 
     struct __call_single_data preempt_migrate;
     u64                       wakeup_stamp;

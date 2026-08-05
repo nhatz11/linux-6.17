@@ -110,6 +110,33 @@ DEFINE_PER_CPU(u64, ivh_cap_pass_tsc_only);
 DEFINE_PER_CPU(u64, ivh_cap_pass_neither);
 
 /*
+ * vcap-retirement comparators, tools/bpf/docs/
+ * ivh_vcap_retirement_build_plan_2026-08-03.md sec 5.4.  Same posture as the
+ * pair above: fed only while ivh_decision_shadow != 0, read only by
+ * /proc/ivh_debug, never consulted by any decision.
+ */
+DEFINE_PER_CPU(u64, ivh_dec_uc_agree_go);
+DEFINE_PER_CPU(u64, ivh_dec_uc_agree_nogo);
+DEFINE_PER_CPU(u64, ivh_dec_uc_only_go);
+DEFINE_PER_CPU(u64, ivh_dec_uc_real_only_go);
+DEFINE_PER_CPU(u64, ivh_uc_pass_both);
+DEFINE_PER_CPU(u64, ivh_uc_pass_vcap_only);
+DEFINE_PER_CPU(u64, ivh_uc_pass_uc_only);
+DEFINE_PER_CPU(u64, ivh_uc_pass_neither);
+/*
+ * Destination-set EMPTY rate, one bool per shadow evaluation per source.
+ * The counter the pair above does not have: pass_{both,real_only,...} can
+ * all be small while EVERY candidate still fails, and that is a materially
+ * different failure ("IVH stops migrating at all") from a biased-but-
+ * nonempty destination set.  Directly predicted by retirement plan sec 1.4:
+ * rq->ivh_vact_capacity reads below 850 on all 16 CPUs on this host today,
+ * which would make ivh_destset_empty_tsc read 100% if it were live.
+ */
+DEFINE_PER_CPU(u64, ivh_destset_empty_vcap);
+DEFINE_PER_CPU(u64, ivh_destset_empty_uc);
+DEFINE_PER_CPU(u64, ivh_destset_empty_tsc);
+
+/*
  * Mirror of IVH_CAP_FLOOR in tools/bpf/MY_ivh_atc.bpf.c.  The BPF program is
  * a separate compilation unit with no shared header, so this constant is
  * duplicated rather than included.  It exists ONLY for the destination-set
@@ -13257,9 +13284,21 @@ EXPORT_SYMBOL_GPL(ivh_eval_cooldown_ok);
  * pass.  A dedicated field also leaves the vcap path completely untouched,
  * which is what keeps vcap usable as the comparator baseline.
  */
-static __always_inline unsigned long ivh_gate_capacity(struct rq *rq, bool tsc_cap)
+/*
+ * @cap_src is the raw ivh_cap_source value (0/1/2/3), not a bool, since
+ * vcap retirement (tools/bpf/docs/ivh_vcap_retirement_build_plan_2026-08-03.md)
+ * added a third real source alongside Part C's rq->ivh_vact_capacity: 3
+ * selects rq->ivh_uc_capacity.  1 (shadow) is never passed here -- the
+ * shadow evaluation below calls this with explicit 0/2/3, never with the
+ * live sysctl value, so this function does not need to special-case it.
+ */
+static __always_inline unsigned long ivh_gate_capacity(struct rq *rq, unsigned long cap_src)
 {
-	return tsc_cap ? rq->ivh_vact_capacity : rq->cpu_capacity;
+	switch (cap_src) {
+	case 2:  return rq->ivh_vact_capacity;
+	case 3:  return rq->ivh_uc_capacity;
+	default: return rq->cpu_capacity;
+	}
 }
 
 /*
@@ -13347,6 +13386,29 @@ static __always_inline void ivh_dec_shadow_bin(bool real_go, bool tsc_go)
 }
 
 /*
+ * Gate-level agreement (real vs uc), parallel to ivh_dec_shadow_bin() above
+ * but scoped to the capacity term only -- vcap retirement does not touch
+ * Gate 2, so both arms this is fed from use the SAME time-left verdict,
+ * isolating exactly the difference the retirement plan sec 5.4 needs
+ * measured.  A separate function rather than a third arm of
+ * ivh_dec_shadow_bin() so the existing real-vs-tsc counters stay
+ * byte-for-byte what they have always meant.
+ */
+static __always_inline void ivh_dec_uc_shadow_bin(bool real_go, bool uc_go)
+{
+	if (real_go == uc_go) {
+		if (real_go)
+			this_cpu_inc(ivh_dec_uc_agree_go);
+		else
+			this_cpu_inc(ivh_dec_uc_agree_nogo);
+	} else if (uc_go) {
+		this_cpu_inc(ivh_dec_uc_only_go);
+	} else {
+		this_cpu_inc(ivh_dec_uc_real_only_go);
+	}
+}
+
+/*
  * ivh_steal_imminent - Gate 1+2, "is this vCPU in the IVH danger zone".
  *
  * Runtime-switchable between two "time left" formulas via
@@ -13364,25 +13426,35 @@ static __always_inline void ivh_dec_shadow_bin(bool real_go, bool tsc_go)
  */
 static __always_inline bool ivh_steal_imminent(struct rq *rq)
 {
-	bool tsc_cap = READ_ONCE(ivh_cap_source) == 2;
+	unsigned long cap_src = READ_ONCE(ivh_cap_source);
 	bool tsc_pe  = READ_ONCE(ivh_preempt_event_source) == 2;
 
 	/*
 	 * Shadow evaluation FIRST, so that whichever way the selected path
 	 * returns below, both verdicts have already been recorded for this
-	 * evaluation.  Costs two extra gate evaluations and is default-off.
+	 * evaluation.  Costs extra gate evaluations and is default-off.
+	 *
+	 * uc_go isolates the capacity term only (retirement plan sec 5.4):
+	 * vcap retirement does not touch Gate 2, so both real_go and uc_go
+	 * use the SAME (real, non-TSC) time-left verdict -- comparing them
+	 * against real_go answers "would swapping ONLY the capacity input to
+	 * uc change today's decision", without also mixing in whatever Gate 2
+	 * source happens to be live.
 	 */
 	if (unlikely(READ_ONCE(ivh_decision_shadow))) {
 		u64 cs_ns = current->last_cs_ns;
-		bool real_go = !(ivh_gate_capacity(rq, false) > ivh_capacity_threshold) &&
+		bool real_go = !(ivh_gate_capacity(rq, 0) > ivh_capacity_threshold) &&
 			       !ivh_gate_time_left_reject(rq, cs_ns, false);
-		bool tsc_go  = !(ivh_gate_capacity(rq, true) > ivh_capacity_threshold) &&
+		bool tsc_go  = !(ivh_gate_capacity(rq, 2) > ivh_capacity_threshold) &&
 			       !ivh_gate_time_left_reject(rq, cs_ns, true);
+		bool uc_go   = !(ivh_gate_capacity(rq, 3) > ivh_capacity_threshold) &&
+			       !ivh_gate_time_left_reject(rq, cs_ns, false);
 
 		ivh_dec_shadow_bin(real_go, tsc_go);
+		ivh_dec_uc_shadow_bin(real_go, uc_go);
 	}
 
-	if (ivh_gate_capacity(rq, tsc_cap) > ivh_capacity_threshold) {
+	if (ivh_gate_capacity(rq, cap_src) > ivh_capacity_threshold) {
 		this_cpu_inc(ivh_steal_imminent_capacity_reject);
 		return false;
 	}
@@ -13413,7 +13485,7 @@ static __always_inline bool ivh_steal_imminent(struct rq *rq)
 static __always_inline bool ivh_rq_capacity_and_timeleft_ok(struct rq *rq,
 							     struct task_struct *t)
 {
-	bool tsc_cap = READ_ONCE(ivh_cap_source) == 2;
+	unsigned long cap_src = READ_ONCE(ivh_cap_source);
 	bool tsc_pe  = READ_ONCE(ivh_preempt_event_source) == 2;
 
 	/*
@@ -13430,7 +13502,7 @@ static __always_inline bool ivh_rq_capacity_and_timeleft_ok(struct rq *rq,
 	 * with advisory evaluations that never correspond to a migration
 	 * decision -- corrupting exactly the statistic sec 3.8 needs.
 	 */
-	if (ivh_gate_capacity(rq, tsc_cap) > ivh_capacity_threshold)
+	if (ivh_gate_capacity(rq, cap_src) > ivh_capacity_threshold)
 		return false;
 
 	return !ivh_gate_time_left_reject(rq, t->last_cs_ns, tsc_pe);
@@ -13541,11 +13613,13 @@ void bpf_sched_pre_lock_migrate(void)
 	if (unlikely(READ_ONCE(ivh_decision_shadow))) {
 		unsigned long src_real = rq->cpu_capacity;
 		unsigned long src_tsc  = rq->ivh_vact_capacity;
+		unsigned long src_uc   = rq->ivh_uc_capacity;
+		bool any_real = false, any_uc = false, any_tsc = false;
 		int cpu;
 
 		for_each_online_cpu(cpu) {
 			struct rq *drq = cpu_rq(cpu);
-			bool pass_real, pass_tsc;
+			bool pass_real, pass_tsc, pass_uc;
 
 			if (cpu == src_cpu)
 				continue;
@@ -13554,6 +13628,8 @@ void bpf_sched_pre_lock_migrate(void)
 				    drq->cpu_capacity > src_real;
 			pass_tsc  = drq->ivh_vact_capacity > IVH_BPF_CAP_FLOOR &&
 				    drq->ivh_vact_capacity > src_tsc;
+			pass_uc   = drq->ivh_uc_capacity > IVH_BPF_CAP_FLOOR &&
+				    drq->ivh_uc_capacity > src_uc;
 
 			if (pass_real && pass_tsc)
 				this_cpu_inc(ivh_cap_pass_both);
@@ -13563,7 +13639,40 @@ void bpf_sched_pre_lock_migrate(void)
 				this_cpu_inc(ivh_cap_pass_tsc_only);
 			else
 				this_cpu_inc(ivh_cap_pass_neither);
+
+			/*
+			 * vcap-retirement destination-set comparator
+			 * (retirement plan sec 5.4), parallel to the {real,tsc}
+			 * pair above but modelling {vcap,uc}.
+			 */
+			if (pass_real && pass_uc)
+				this_cpu_inc(ivh_uc_pass_both);
+			else if (pass_real)
+				this_cpu_inc(ivh_uc_pass_vcap_only);
+			else if (pass_uc)
+				this_cpu_inc(ivh_uc_pass_uc_only);
+			else
+				this_cpu_inc(ivh_uc_pass_neither);
+
+			any_real |= pass_real;
+			any_uc   |= pass_uc;
+			any_tsc  |= pass_tsc;
 		}
+
+		/*
+		 * Destination-set EMPTY rate (retirement plan sec 1.4/5.4):
+		 * a bool per source per evaluation, not per candidate CPU, so
+		 * its denominator is evaluations, not (evaluations x online
+		 * CPUs) like the pass_* counters above -- compare each
+		 * against ITSELF, same discipline the existing comment on
+		 * ivh_dec_* vs ivh_cap_pass_* already states.
+		 */
+		if (!any_real)
+			this_cpu_inc(ivh_destset_empty_vcap);
+		if (!any_uc)
+			this_cpu_inc(ivh_destset_empty_uc);
+		if (!any_tsc)
+			this_cpu_inc(ivh_destset_empty_tsc);
 	}
 
 	/*
@@ -13817,6 +13926,17 @@ static int ivh_debug_show(struct seq_file *m, void *v)
 	u64 dec_tsc_only = 0, dec_real_only = 0;
 	u64 cap_pass_both = 0, cap_pass_real = 0;
 	u64 cap_pass_tsc = 0, cap_pass_neither = 0;
+	/* vcap retirement (ivh_vcap_retirement_build_plan_2026-08-03.md sec 5). */
+	u64 dec_uc_agree_go = 0, dec_uc_agree_nogo = 0;
+	u64 dec_uc_only = 0, dec_uc_real_only = 0;
+	u64 uc_pass_both = 0, uc_pass_vcap_only = 0;
+	u64 uc_pass_uc_only = 0, uc_pass_neither = 0;
+	u64 destset_empty_vcap = 0, destset_empty_uc = 0, destset_empty_tsc = 0;
+	u64 uc_div_hist[IVH_UC_DIV_HIST_BUCKETS] = { 0 };
+	u64 uc_thr850_both = 0, uc_thr850_vcap_only = 0;
+	u64 uc_thr850_uc_only = 0, uc_thr850_neither = 0;
+	u64 uc_thr1010_both = 0, uc_thr1010_vcap_only = 0;
+	u64 uc_thr1010_uc_only = 0, uc_thr1010_neither = 0;
 
 	for_each_possible_cpu(cpu) {
 #if defined(CONFIG_KVM_GUEST) && defined(CONFIG_PARAVIRT_SPINLOCKS)
@@ -13883,6 +14003,27 @@ static int ivh_debug_show(struct seq_file *m, void *v)
 		cap_pass_real += per_cpu(ivh_cap_pass_real_only, cpu);
 		cap_pass_tsc += per_cpu(ivh_cap_pass_tsc_only, cpu);
 		cap_pass_neither += per_cpu(ivh_cap_pass_neither, cpu);
+		dec_uc_agree_go += per_cpu(ivh_dec_uc_agree_go, cpu);
+		dec_uc_agree_nogo += per_cpu(ivh_dec_uc_agree_nogo, cpu);
+		dec_uc_only += per_cpu(ivh_dec_uc_only_go, cpu);
+		dec_uc_real_only += per_cpu(ivh_dec_uc_real_only_go, cpu);
+		uc_pass_both += per_cpu(ivh_uc_pass_both, cpu);
+		uc_pass_vcap_only += per_cpu(ivh_uc_pass_vcap_only, cpu);
+		uc_pass_uc_only += per_cpu(ivh_uc_pass_uc_only, cpu);
+		uc_pass_neither += per_cpu(ivh_uc_pass_neither, cpu);
+		destset_empty_vcap += per_cpu(ivh_destset_empty_vcap, cpu);
+		destset_empty_uc += per_cpu(ivh_destset_empty_uc, cpu);
+		destset_empty_tsc += per_cpu(ivh_destset_empty_tsc, cpu);
+		for (b = 0; b < IVH_UC_DIV_HIST_BUCKETS; b++)
+			uc_div_hist[b] += per_cpu(ivh_uc_div_hist[b], cpu);
+		uc_thr850_both += per_cpu(ivh_uc_thr850_both, cpu);
+		uc_thr850_vcap_only += per_cpu(ivh_uc_thr850_vcap_only, cpu);
+		uc_thr850_uc_only += per_cpu(ivh_uc_thr850_uc_only, cpu);
+		uc_thr850_neither += per_cpu(ivh_uc_thr850_neither, cpu);
+		uc_thr1010_both += per_cpu(ivh_uc_thr1010_both, cpu);
+		uc_thr1010_vcap_only += per_cpu(ivh_uc_thr1010_vcap_only, cpu);
+		uc_thr1010_uc_only += per_cpu(ivh_uc_thr1010_uc_only, cpu);
+		uc_thr1010_neither += per_cpu(ivh_uc_thr1010_neither, cpu);
 	}
 
 	seq_printf(m, "ivh_in_schedule:    %d\n", atomic_read(&ivh_in_schedule));
@@ -14198,7 +14339,7 @@ skip_cs_hists:
 	 * (ivh_capacity_threshold), because agreement in the middle of the range
 	 * is worth nothing if the two disagree at the thresholds.
 	 */
-	seq_printf(m, "ivh_cap_source:            %lu  (0=vcap rq->cpu_capacity, 1=shadow, 2=rq->ivh_vact_capacity)\n",
+	seq_printf(m, "ivh_cap_source:            %lu  (0=vcap rq->cpu_capacity, 1=shadow, 2=rq->ivh_vact_capacity, 3=rq->ivh_uc_capacity)\n",
 		   READ_ONCE(ivh_cap_source));
 	seq_printf(m, "ivh_preempt_event_source:  %lu  (0=real steal last_preemption/last_active_time, 1=shadow, 2=Part C)\n",
 		   READ_ONCE(ivh_preempt_event_source));
@@ -14235,6 +14376,42 @@ skip_cs_hists:
 		}
 	}
 	/*
+	 * vcap retirement (ivh_vcap_retirement_build_plan_2026-08-03.md sec
+	 * 5.1): a NEW line, not an extension of ivh_vact_cpu: above, because
+	 * that format is consumed by existing scripts.  vcap_custom is
+	 * rq->cpu_capacity_custom (what vcap writes) sampled at THIS uc
+	 * window's close, separately from vcap_cpu_capacity
+	 * (rq->cpu_capacity, what Gate 1 actually reads); the two differ
+	 * because cpu_capacity only refreshes from cpu_capacity_custom at
+	 * load-balance cadence (update_cpu_capacity()), while ivh_uc_capacity
+	 * is fresh at window cadence -- a genuine behaviour difference that
+	 * must be attributable in the data rather than mistaken for
+	 * estimator divergence.
+	 */
+	seq_printf(m, "ivh_uc_enabled:            %lu\n", READ_ONCE(ivh_uc_enabled));
+	seq_printf(m, "ivh_uc_window_ns:          %lu\n", READ_ONCE(ivh_uc_window_ns));
+	seq_printf(m, "ivh_uc_duty_ns:            %lu\n", READ_ONCE(ivh_uc_duty_ns));
+	seq_printf(m, "ivh_uc_ema_alpha_q16:      %lu\n", READ_ONCE(ivh_uc_ema_alpha_q16));
+	seq_printf(m, "ivh_uc_used_source:        %lu  (0=WALL production, 1=ACCT validation-only)\n",
+		   READ_ONCE(ivh_uc_used_source));
+	seq_printf(m, "ivh_uc_shadow:             %lu\n", READ_ONCE(ivh_uc_shadow));
+	seq_printf(m, "ivh_uc_avgcap_enabled:     %lu\n", READ_ONCE(ivh_uc_avgcap_enabled));
+	seq_printf(m, "# cpu vcap_custom vcap_cpu_capacity uc_capacity uc_wall uc_acct raw_wall raw_acct "
+		      "win_avail_c win_stolen_c windows extended skipped vact_capacity\n");
+	for_each_possible_cpu(cpu) {
+		struct rq *rq = cpu_rq(cpu);
+
+		seq_printf(m, "ivh_uc_cpu: %d %lu %lu %lu %lu %lu %llu %llu %llu %llu %llu %llu %llu %lu\n",
+			   cpu, READ_ONCE(rq->cpu_capacity_custom), rq->cpu_capacity,
+			   READ_ONCE(rq->ivh_uc_capacity),
+			   READ_ONCE(rq->ivh_uc_capacity_wall),
+			   READ_ONCE(rq->ivh_uc_capacity_acct),
+			   READ_ONCE(rq->ivh_uc_raw_wall), READ_ONCE(rq->ivh_uc_raw_acct),
+			   READ_ONCE(rq->ivh_uc_win_avail_c), READ_ONCE(rq->ivh_uc_win_stolen_c),
+			   READ_ONCE(rq->ivh_uc_windows), READ_ONCE(rq->ivh_uc_extended),
+			   READ_ONCE(rq->ivh_uc_skipped), READ_ONCE(rq->ivh_vact_capacity));
+	}
+	/*
 	 * The two decision-agreement 2x2s (sec 3.8), fed only while
 	 * ivh_decision_shadow is on.  These are the ONLY lines here that answer
 	 * "does IVH make the same MIGRATION DECISIONS with the TSC signal as
@@ -14256,6 +14433,38 @@ skip_cs_hists:
 	seq_printf(m, "ivh_cap_pass_real_only:    %llu\n", cap_pass_real);
 	seq_printf(m, "ivh_cap_pass_tsc_only:     %llu\n", cap_pass_tsc);
 	seq_printf(m, "ivh_cap_pass_neither:      %llu\n", cap_pass_neither);
+	seq_printf(m, "\n");
+	/*
+	 * vcap retirement (ivh_vcap_retirement_build_plan_2026-08-03.md sec
+	 * 5.4): same {agree,pass,destset_empty} shape as the real-vs-tsc set
+	 * above, modelling {real,uc} instead.  Compare each set against
+	 * ITSELF, same discipline as the comment on ivh_dec_* above.
+	 */
+	seq_printf(m, "ivh_dec_uc_agree_go:       %llu\n", dec_uc_agree_go);
+	seq_printf(m, "ivh_dec_uc_agree_nogo:     %llu\n", dec_uc_agree_nogo);
+	seq_printf(m, "ivh_dec_uc_only_go:        %llu\n", dec_uc_only);
+	seq_printf(m, "ivh_dec_uc_real_only_go:   %llu\n", dec_uc_real_only);
+	seq_printf(m, "ivh_uc_pass_both:          %llu\n", uc_pass_both);
+	seq_printf(m, "ivh_uc_pass_vcap_only:     %llu\n", uc_pass_vcap_only);
+	seq_printf(m, "ivh_uc_pass_uc_only:       %llu\n", uc_pass_uc_only);
+	seq_printf(m, "ivh_uc_pass_neither:       %llu\n", uc_pass_neither);
+	seq_printf(m, "ivh_destset_empty_vcap:    %llu\n", destset_empty_vcap);
+	seq_printf(m, "ivh_destset_empty_uc:      %llu\n", destset_empty_uc);
+	seq_printf(m, "ivh_destset_empty_tsc:     %llu\n", destset_empty_tsc);
+	seq_printf(m, "ivh_uc_thr850_both:        %llu\n", uc_thr850_both);
+	seq_printf(m, "ivh_uc_thr850_vcap_only:   %llu\n", uc_thr850_vcap_only);
+	seq_printf(m, "ivh_uc_thr850_uc_only:     %llu\n", uc_thr850_uc_only);
+	seq_printf(m, "ivh_uc_thr850_neither:     %llu\n", uc_thr850_neither);
+	seq_printf(m, "ivh_uc_thr1010_both:       %llu\n", uc_thr1010_both);
+	seq_printf(m, "ivh_uc_thr1010_vcap_only:  %llu\n", uc_thr1010_vcap_only);
+	seq_printf(m, "ivh_uc_thr1010_uc_only:    %llu\n", uc_thr1010_uc_only);
+	seq_printf(m, "ivh_uc_thr1010_neither:    %llu\n", uc_thr1010_neither);
+	seq_printf(m, "# ivh_uc_div_hist: signed (uc_capacity - vcap_capacity), 16 buckets, "
+		      "b0 <=-512 .. b7 -8..0 | b8 0..8 .. b15 >=+512\n");
+	seq_printf(m, "ivh_uc_div_hist:");
+	for (b = 0; b < IVH_UC_DIV_HIST_BUCKETS; b++)
+		seq_printf(m, " %llu", uc_div_hist[b]);
+	seq_printf(m, "\n");
 	seq_printf(m, "\n");
 /* CONFIG_PERF_EVENTS as well as CONFIG_X86: ivh_ref_steal_enabled and the
  * whole inference live inside that same #if in kernel/sched/core.c. */

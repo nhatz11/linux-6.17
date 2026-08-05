@@ -19,7 +19,22 @@
 #include <fcntl.h>
 #include <time.h>
 #include "MY_ivh_atc.skel.h"
-#define LOG_BUF_SIZE (1024 * 1024)
+/*
+ * Verifier log buffer.  log_level is 2 (see bpf_program__set_log_level below),
+ * which emits a per-instruction trace, so this buffer scales with PROGRAM SIZE
+ * and not with anything the verifier objects to.
+ *
+ * Raised 1 MiB -> 8 MiB on 2026-08-03: adding the scan_max_cpu() sub-program
+ * (gate reshape, recalibration doc sec 5.1) pushed test3's trace past 1 MiB and
+ * bpf_prog_load() returned **-ENOSPC**.  That is the log buffer overflowing,
+ * NOT a verifier rejection -- the program itself verifies fine (3.5K insns
+ * against a 1M limit).  The failure mode is badly misleading: the daemon exits
+ * with "Failed to load and verify BPF skeleton" and the log tail looks like a
+ * clean, successful verification, because the successful part is all that fit.
+ * If this recurs after a future edit, raise the buffer before suspecting the
+ * program.
+ */
+#define LOG_BUF_SIZE (8 * 1024 * 1024)
 static char verifier_log[LOG_BUF_SIZE];
 
 /* Must match struct ivh_migration_event in MY_ivh_atc.bpf.c */

@@ -44,6 +44,11 @@
 #include <linux/cpuhotplug.h>
 #include <linux/math64.h>
 #include <linux/perf_event.h>
+/* IVH "uc" (vcap retirement, tools/bpf/docs/
+ * ivh_vcap_retirement_build_plan_2026-08-03.md): kcpustat_this_cpu for the
+ * ACCT-variant numerator, ilog2 for the shadow-comparison histogram. */
+#include <linux/kernel_stat.h>
+#include <linux/log2.h>
 #ifdef CONFIG_X86
 #include <asm/tsc.h>		/* rdtsc(), tsc_khz */
 #endif
@@ -1581,6 +1586,421 @@ void get_vact_compare(int cpunum, u64 *last_preempt_ns, u64 *last_active_ns,
 	*idle_explained  = READ_ONCE(rq->ivh_vact_idle_explained);
 }
 EXPORT_SYMBOL_GPL(get_vact_compare);
+
+/*
+ * ---------------------------------------------------------------------------
+ * IVH "uc" (used-capacity): in-kernel replica of vcap's used/(used+stolen)
+ * EMA -- the vcap-retirement signal.
+ * tools/bpf/docs/ivh_vcap_retirement_build_plan_2026-08-03.md.
+ *
+ * Called from account_process_tick() (kernel/sched/cputime.c) immediately
+ * after ivh_vact_tick(), same placement and same reason: every tick, on
+ * every CPU, before the vtime_accounting_enabled_this_cpu() early return, so
+ * a future config change cannot silently punch a hole in the series (sec
+ * 2.1).
+ *
+ * Deliberately NOT rq->ivh_vact_capacity or ivh_vact_tick()'s machinery:
+ * Part C is a different, already-shipped estimator (tick-gated,
+ * thresholded-excess) that a live experiment showed compresses badly under
+ * this workload (retirement plan sec 3.5) and stays untouched as an
+ * independent comparator at ivh_cap_source=2.  This block is a from-scratch
+ * replica of vcap's OWN formula instead: continuous accumulation, no
+ * threshold on any term, landing on vcap's 1024 scale so IVH_CAP_FLOOR and
+ * ivh_capacity_threshold transfer unchanged.
+ */
+
+/*
+ * ivh_uc_steal_ns - the same steal number vcap itself consumes.
+ *
+ * Deliberately honours the existing global ivh_steal_source rather than a
+ * knob of its own: vcap and ivh_uc_capacity must always be fed the SAME
+ * steal series, or the shadow comparison (sec 5) would be confounded by two
+ * different steal sources instead of isolating the transformation
+ * difference sec 3.6 is actually testing.
+ *
+ * Not get_steal_and_preemptions() directly: that function also writes
+ * *preempt and takes a cpunum that is always this_cpu here, and its wire
+ * format is frozen (see the comment on get_inferred_steal() in sched.h).
+ * The two bodies must be kept behaviourally identical by hand.
+ */
+static __always_inline u64 ivh_uc_steal_ns(int cpu)
+{
+	if (READ_ONCE(ivh_steal_source))
+		return READ_ONCE(cpu_rq(cpu)->ivh_ref_steal_ns);
+#ifdef CONFIG_PARAVIRT
+	return paravirt_steal_clock(cpu);
+#else
+	return 0;
+#endif
+}
+
+/*
+ * Q16 fixed-point EMA update on the 1024 scale.  No division, no floating
+ * point, no pow(): alpha is a directly-set Q16 sysctl rather than a
+ * half-life the kernel would have to convert, so no approximation of
+ * 0.5^(window/half_life) has to live here (retirement plan sec 3.3).
+ * |cur| <= 1024<<16 = 2^26, |diff| <= 2^26, |diff * alpha_q16| <= 2^42:
+ * safe in s64 with margin to spare.
+ */
+static __always_inline void ivh_uc_ema(u64 *ema_q, u64 x, u32 alpha_q16)
+{
+	s64 cur  = (s64)*ema_q;
+	s64 diff = ((s64)x << 16) - cur;
+
+	*ema_q = (u64)(cur + ((diff * (s64)alpha_q16) >> 16));
+}
+
+/*
+ * IVH_UC_BPF_CAP_FLOOR must track IVH_BPF_CAP_FLOOR in kernel/sched/fair.c
+ * (which in turn must track the BPF program's own IVH_CAP_FLOOR literal --
+ * see that comment).  Duplicated rather than shared because this is a
+ * diagnostic mirror, not a gate: retune the real floor and this one in the
+ * same commit or this file's 850-threshold counters quietly start
+ * describing a boundary that no longer gates anything.
+ */
+#define IVH_UC_BPF_CAP_FLOOR	850UL
+
+DEFINE_PER_CPU(u64, ivh_uc_div_hist[IVH_UC_DIV_HIST_BUCKETS]);
+DEFINE_PER_CPU(u64, ivh_uc_thr850_both);
+DEFINE_PER_CPU(u64, ivh_uc_thr850_vcap_only);
+DEFINE_PER_CPU(u64, ivh_uc_thr850_uc_only);
+DEFINE_PER_CPU(u64, ivh_uc_thr850_neither);
+DEFINE_PER_CPU(u64, ivh_uc_thr1010_both);
+DEFINE_PER_CPU(u64, ivh_uc_thr1010_vcap_only);
+DEFINE_PER_CPU(u64, ivh_uc_thr1010_uc_only);
+DEFINE_PER_CPU(u64, ivh_uc_thr1010_neither);
+
+/*
+ * Per-window validation counters (sec 5.2/5.3): signed-divergence histogram
+ * and threshold-crossing 2x2s of ivh_uc_capacity against vcap's live
+ * rq->cpu_capacity_custom.  Fed only while ivh_uc_shadow is on.  Window-close
+ * cadence (a few Hz per CPU at the default window), not gate-evaluation
+ * cadence -- the gate-level agreement counters this parallels
+ * (ivh_dec_uc_*, ivh_uc_pass_*, ivh_destset_empty_*) live in
+ * kernel/sched/fair.c beside the Part C ones they mirror, because THAT
+ * comparison has to happen on the lock path where the gate is actually
+ * evaluated.
+ */
+static void ivh_uc_shadow_bin(struct rq *rq)
+{
+	unsigned long vcap = READ_ONCE(rq->cpu_capacity_custom);
+	unsigned long uc   = rq->ivh_uc_capacity;
+	s64 diff;
+	u64 mag;
+	unsigned int step, bucket;
+	bool uc850, vcap850, uc1010, vcap1010;
+
+	if (!READ_ONCE(ivh_uc_shadow))
+		return;
+
+	/*
+	 * 16 signed buckets spanning +-1024, doubling away from zero:
+	 * b0 <=-512 .. b7 -8..0 | b8 0..8 .. b15 >=+512.  ilog2(mag/8) gives
+	 * the doubling step for mag >= 8; mag < 8 collapses to step 0 on
+	 * both sides, matching the b7/b8 pair at the origin.
+	 */
+	diff = (s64)uc - (s64)vcap;
+	mag = (u64)(diff >= 0 ? diff : -diff);
+	if (mag < 8) {
+		step = 0;
+	} else {
+		step = ilog2(mag / 8) + 1;
+		if (step > 7)
+			step = 7;
+	}
+	bucket = diff >= 0 ? 8 + step : 7 - step;
+	this_cpu_inc(ivh_uc_div_hist[bucket]);
+
+	vcap850  = vcap > IVH_UC_BPF_CAP_FLOOR;
+	uc850    = uc   > IVH_UC_BPF_CAP_FLOOR;
+	if (vcap850 && uc850)
+		this_cpu_inc(ivh_uc_thr850_both);
+	else if (vcap850)
+		this_cpu_inc(ivh_uc_thr850_vcap_only);
+	else if (uc850)
+		this_cpu_inc(ivh_uc_thr850_uc_only);
+	else
+		this_cpu_inc(ivh_uc_thr850_neither);
+
+	vcap1010 = vcap > READ_ONCE(ivh_capacity_threshold);
+	uc1010   = uc   > READ_ONCE(ivh_capacity_threshold);
+	if (vcap1010 && uc1010)
+		this_cpu_inc(ivh_uc_thr1010_both);
+	else if (vcap1010)
+		this_cpu_inc(ivh_uc_thr1010_vcap_only);
+	else if (uc1010)
+		this_cpu_inc(ivh_uc_thr1010_uc_only);
+	else
+		this_cpu_inc(ivh_uc_thr1010_neither);
+}
+
+/*
+ * ivh_uc_close - window close: ratio, EMA, publish.
+ *
+ * vcap's own guard, reproduced verbatim (main.cpp:371): a window with
+ * negligible steal publishes a perfect 1.0 rather than a ratio computed from
+ * a near-zero denominator's noise.
+ */
+static void ivh_uc_close(struct rq *rq, u64 now)
+{
+	u64 avail = rq->ivh_uc_win_avail_c;
+	u64 min_steal_c = ivh_tsc_ns_to_cycles(READ_ONCE(ivh_uc_min_steal_ns));
+	u32 alpha = (u32)READ_ONCE(ivh_uc_ema_alpha_q16);
+	u64 x_wall, x_acct;
+
+	if (!avail || rq->ivh_uc_win_stolen_c < min_steal_c) {
+		x_wall = SCHED_CAPACITY_SCALE;
+		x_acct = SCHED_CAPACITY_SCALE;
+	} else {
+		x_wall = div64_u64(rq->ivh_uc_win_used_c * SCHED_CAPACITY_SCALE, avail);
+		/* ACCT variant reproduces vcap's literal formula: used/(used+stolen). */
+		{
+			u64 den = rq->ivh_uc_win_acct_c + rq->ivh_uc_win_stolen_c;
+
+			x_acct = den ? div64_u64(rq->ivh_uc_win_acct_c *
+						 SCHED_CAPACITY_SCALE, den)
+				     : SCHED_CAPACITY_SCALE;
+		}
+	}
+	/* vcap floors at 0.001 (main.cpp:381); 0 is reserved as "not yet
+	 * measured" is not a concern here since rq init already seeds a
+	 * nonzero EMA, but the clamp is cheap insurance regardless. */
+	x_wall = clamp_val(x_wall, 1ULL, (u64)SCHED_CAPACITY_SCALE);
+	x_acct = clamp_val(x_acct, 1ULL, (u64)SCHED_CAPACITY_SCALE);
+
+	if (unlikely(!rq->ivh_uc_windows)) {
+		/* First window: ASSIGN rather than blend, reproducing
+		 * calculate_ema()'s bias-corrected first-sample behaviour and
+		 * removing the multi-half-life cold-start transient a
+		 * zero-seeded blend would otherwise cost (sec 3.3). */
+		rq->ivh_uc_ema_wall_q = x_wall << 16;
+		rq->ivh_uc_ema_acct_q = x_acct << 16;
+	} else {
+		ivh_uc_ema(&rq->ivh_uc_ema_wall_q, x_wall, alpha);
+		ivh_uc_ema(&rq->ivh_uc_ema_acct_q, x_acct, alpha);
+	}
+
+	rq->ivh_uc_capacity_wall = (unsigned long)(rq->ivh_uc_ema_wall_q >> 16);
+	rq->ivh_uc_capacity_acct = (unsigned long)(rq->ivh_uc_ema_acct_q >> 16);
+	WRITE_ONCE(rq->ivh_uc_capacity,
+		   READ_ONCE(ivh_uc_used_source) ? rq->ivh_uc_capacity_acct
+						  : rq->ivh_uc_capacity_wall);
+
+	/* Validation taps, sec 5: both pre-EMA raw samples and vcap's own
+	 * value at this exact instant, so a shadow-mode divergence can be
+	 * attributed to the ratio, the EMA, or genuine estimator disagreement. */
+	rq->ivh_uc_raw_wall = x_wall;
+	rq->ivh_uc_raw_acct = x_acct;
+	rq->ivh_uc_vcap_at_close = READ_ONCE(rq->cpu_capacity_custom);
+	ivh_uc_shadow_bin(rq);
+	rq->ivh_uc_windows++;
+
+	rq->ivh_uc_win_start_tsc = now;
+	rq->ivh_uc_win_avail_c = rq->ivh_uc_win_stolen_c = 0;
+	rq->ivh_uc_win_used_c  = rq->ivh_uc_win_acct_c   = 0;
+}
+
+/*
+ * ivh_uc_maybe_close_window - window cadence, the min-avail guard, and the
+ * duty-cycle knob (sec 3.4).
+ *
+ * The min-avail guard extends rather than closes a window that was almost
+ * entirely idle: such a window carries a near-zero denominator and would
+ * publish a ratio derived from a millisecond of data, which is noise, not
+ * signal.  ivh_uc_duty_ns is NOT a production knob -- it exists only to
+ * reproduce vcap's exact -s 5000 duty cycle for the shadow comparison
+ * (sec 1.1), isolating "different estimator" from "different sample count".
+ */
+static void ivh_uc_maybe_close_window(struct rq *rq, u64 now)
+{
+	u64 win_c  = ivh_tsc_ns_to_cycles(READ_ONCE(ivh_uc_window_ns));
+	u64 duty_c = ivh_tsc_ns_to_cycles(READ_ONCE(ivh_uc_duty_ns));
+
+	/*
+	 * SANITY FLOOR, same reasoning as ivh_vact_tick()'s tick_c < 1000
+	 * check right above: a nominal window under 1000 cycles implies a
+	 * sub-1 MHz TSC, which does not exist, and is the signature of the
+	 * mul_u64_u64_div_u64() miscompile class (sec 3.7).  A miscompiled
+	 * conversion here would not add noise, it would invert the signal.
+	 */
+	if (unlikely(win_c < 1000))
+		return;
+	if ((s64)(now - rq->ivh_uc_win_start_tsc) < (s64)win_c)
+		return;
+	if (rq->ivh_uc_win_avail_c <
+	    div64_u64(win_c * READ_ONCE(ivh_uc_min_avail_pct), 100)) {
+		rq->ivh_uc_extended++;
+		return;
+	}
+	ivh_uc_close(rq, now);
+	if (duty_c)			/* 0 (default) = continuous, no skip */
+		rq->ivh_uc_win_start_tsc = now + duty_c;
+}
+
+/*
+ * ivh_uc_tick - one tick's worth of the vcap-retirement signal.
+ *
+ * One-tick lag, stated so it is not rediscovered as a bug: this runs before
+ * steal_account_process_time() and before account_user_time()/
+ * account_system_time() in account_process_tick() (kernel/sched/cputime.c),
+ * so on any given tick both the steal delta and the kcpustat delta it reads
+ * are one tick stale.  Over a 200-tick window this is a 0.5% phase error
+ * that cancels across window boundaries because every window uses the same
+ * prev_*-delta discipline.  Do not "fix" it by moving the call later -- that
+ * would put it after the vtime_accounting_enabled_this_cpu() early return
+ * and reintroduce the NOHZ hole this placement exists to avoid.
+ *
+ * Every delta below is clamped non-negative, but unlike ivh_ref_accumulate()
+ * this is NOT a rectifier: nothing here is a difference of two
+ * independently-jittering series that could legitimately go negative.
+ * steal_ns is monotonic by construction (ivh_ref_accumulate() above);
+ * used_ns is a monotonic kcpustat accumulator; idle_ns is the one series
+ * documented as occasionally non-monotonic, and that is the only clamp that
+ * ever fires.  There is therefore no residual to carry and no
+ * ivh_ref_carry-style analogue needed here.
+ */
+void ivh_uc_tick(void)
+{
+	struct rq *rq = this_rq();
+	int cpu = smp_processor_id();
+	u64 now, idle_us, iowait_us, idle_ns, steal_ns, used_ns;
+	u64 d_elapsed_c, d_idle_c, d_steal_c, d_used_c, avail_c, used_c;
+
+	if (unlikely(!READ_ONCE(ivh_uc_enabled)))
+		return;
+	if (unlikely(!tsc_khz)) {
+		rq->ivh_uc_skipped++;
+		return;
+	}
+
+	now = ivh_raw_tsc();
+
+	idle_us   = get_cpu_idle_time_us(cpu, NULL);
+	iowait_us = get_cpu_iowait_time_us(cpu, NULL);
+	if (unlikely(idle_us == (u64)-1 || iowait_us == (u64)-1)) {
+		rq->ivh_uc_skipped++;		/* !tick_nohz_active: idle unobtainable */
+		return;				/* do NOT touch prev_*: next sample spans the gap */
+	}
+	idle_ns  = (idle_us + iowait_us) * NSEC_PER_USEC;
+	steal_ns = ivh_uc_steal_ns(cpu);
+	used_ns  = kcpustat_this_cpu->cpustat[CPUTIME_USER]
+		 + kcpustat_this_cpu->cpustat[CPUTIME_NICE]
+		 + kcpustat_this_cpu->cpustat[CPUTIME_SYSTEM];
+
+	if (unlikely(!rq->ivh_uc_prev_tsc)) {
+		rq->ivh_uc_skipped++;
+		rq->ivh_uc_win_start_tsc = now;
+		goto seed;			/* first tick: no delta yet */
+	}
+
+	d_elapsed_c = now - rq->ivh_uc_prev_tsc;
+
+	d_idle_c  = ivh_tsc_ns_to_cycles(idle_ns  > rq->ivh_uc_prev_idle_ns
+					 ? idle_ns  - rq->ivh_uc_prev_idle_ns : 0);
+	d_steal_c = ivh_tsc_ns_to_cycles(steal_ns > rq->ivh_uc_prev_steal_ns
+					 ? steal_ns - rq->ivh_uc_prev_steal_ns : 0);
+	d_used_c  = ivh_tsc_ns_to_cycles(used_ns  > rq->ivh_uc_prev_used_ns
+					 ? used_ns  - rq->ivh_uc_prev_used_ns : 0);
+
+	/*
+	 * avail = wall time this vCPU WANTED the CPU.  Idle leaves the ratio
+	 * entirely -- neither used nor stolen.  This is the analytic
+	 * equivalent of vcap's SCHED_IDLE spinner (sec 1.3): forcing
+	 * measured idle to zero and computing the ratio directly from
+	 * already-known idle time produce the same number, without any
+	 * thread ever running, and this formula is what makes the signal
+	 * invariant to whether vcap's spinners are actually present.
+	 */
+	avail_c = (d_elapsed_c > d_idle_c) ? d_elapsed_c - d_idle_c : 0;
+	d_steal_c = min(d_steal_c, avail_c);
+	used_c  = avail_c - d_steal_c;
+
+	/* Suppressed during a duty-cycle skip (sec 3.4): win_start_tsc was
+	 * pushed into the future by ivh_uc_maybe_close_window(), and this
+	 * single comparison is what keeps that skip from needing its own
+	 * state variable. */
+	if ((s64)(now - rq->ivh_uc_win_start_tsc) >= 0) {
+		rq->ivh_uc_win_avail_c  += avail_c;
+		rq->ivh_uc_win_stolen_c += d_steal_c;
+		rq->ivh_uc_win_used_c   += used_c;
+		rq->ivh_uc_win_acct_c   += min(d_used_c, avail_c);
+	}
+
+	ivh_uc_maybe_close_window(rq, now);
+seed:
+	rq->ivh_uc_prev_tsc      = now;
+	rq->ivh_uc_prev_idle_ns  = idle_ns;
+	rq->ivh_uc_prev_steal_ns = steal_ns;
+	rq->ivh_uc_prev_used_ns  = used_ns;
+}
+
+/*
+ * Side-by-side comparator feed, shipped with no in-tree caller for the same
+ * reason get_vact_compare() above is: adding an accessor later costs a
+ * kernel build and a reboot, while reformatting in the module costs an
+ * rmmod/insmod.
+ */
+void get_uc_compare(int cpunum, unsigned long *capacity,
+		    unsigned long *capacity_wall, unsigned long *capacity_acct,
+		    u64 *windows, u64 *skipped, u64 *extended)
+{
+	struct rq *rq = cpu_rq(cpunum);
+
+	*capacity      = READ_ONCE(rq->ivh_uc_capacity);
+	*capacity_wall = READ_ONCE(rq->ivh_uc_capacity_wall);
+	*capacity_acct = READ_ONCE(rq->ivh_uc_capacity_acct);
+	*windows       = READ_ONCE(rq->ivh_uc_windows);
+	*skipped       = READ_ONCE(rq->ivh_uc_skipped);
+	*extended      = READ_ONCE(rq->ivh_uc_extended);
+}
+EXPORT_SYMBOL_GPL(get_uc_compare);
+
+/*
+ * 1Hz average_capacity_all republisher, the vcap-free replacement for
+ * vcap's own set_average_capacity_all() call (retirement plan sec 6.3).
+ * Ships in Build A so stage G6 (retiring vcap) costs no further rebuild, but
+ * is inert -- schedules itself and returns without touching
+ * average_capacity_all -- until ivh_uc_avgcap_enabled is set, since vcap
+ * remains the authoritative writer of that value until then.
+ *
+ * Averages over online CPUs above vcap's own straggler_cutoff (main.cpp:57,
+ * 0.20 -> 205 on the 1024 scale), the same cutoff vcap's total_capacity/
+ * total_countable average uses (main.cpp:390-393), so a CPU vcap would have
+ * excluded from its average does not skew this one either.  Simplified from
+ * vcap's version by not reproducing its variance>0.1 gate (main.cpp:449),
+ * which zeroes the average when the fleet is uniformly healthy -- a
+ * cosmetic difference for a value nothing currently reads except through
+ * this same knob's own gate.
+ */
+static struct delayed_work ivh_uc_avgcap_work;
+
+static void ivh_uc_avgcap_fn(struct work_struct *work)
+{
+	if (READ_ONCE(ivh_uc_avgcap_enabled)) {
+		u64 total = 0;
+		int cpu, count = 0;
+
+		for_each_online_cpu(cpu) {
+			unsigned long cap = READ_ONCE(cpu_rq(cpu)->ivh_uc_capacity);
+
+			if (cap > 205) {
+				total += cap;
+				count++;
+			}
+		}
+		set_average_capacity_all(count ? (int)div64_u64(total, count) : 0);
+	}
+
+	schedule_delayed_work(&ivh_uc_avgcap_work, HZ);
+}
+
+static int __init ivh_uc_avgcap_init(void)
+{
+	INIT_DELAYED_WORK(&ivh_uc_avgcap_work, ivh_uc_avgcap_fn);
+	schedule_delayed_work(&ivh_uc_avgcap_work, HZ);
+	return 0;
+}
+late_initcall(ivh_uc_avgcap_init);
 
 /* lhp tick-time lockholder classification — per-CPU snapshot */
 DEFINE_PER_CPU(struct lhp_classify_snapshot, lhp_last_class);
@@ -10354,6 +10774,19 @@ void __init sched_init(void)
 		 * thresholds silently change meaning.
 		 */
 		rq->ivh_vact_capacity = SCHED_CAPACITY_SCALE;
+		/*
+		 * Same reasoning as rq->ivh_vact_capacity immediately above,
+		 * for the vcap-retirement replica (retirement plan sec 3.1):
+		 * an unseeded CPU must not read as fully stolen on either the
+		 * published output or the EMA state it will first blend
+		 * against -- though in practice ivh_uc_close()'s first-window
+		 * assign path (sec 3.3) overwrites the EMA seed on the very
+		 * first window close regardless.
+		 */
+		rq->ivh_uc_capacity = rq->ivh_uc_capacity_wall =
+			rq->ivh_uc_capacity_acct = SCHED_CAPACITY_SCALE;
+		rq->ivh_uc_ema_wall_q = rq->ivh_uc_ema_acct_q =
+			(u64)SCHED_CAPACITY_SCALE << 16;
 		rq->balance_callback = &balance_push_callback;
 		rq->active_balance = 0;
 		rq->next_balance = jiffies;

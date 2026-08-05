@@ -585,6 +585,23 @@ void account_process_tick(struct task_struct *p, int user_tick)
 	 */
 	ivh_vact_tick();
 
+	/*
+	 * IVH "uc" (vcap retirement) tick, tools/bpf/docs/
+	 * ivh_vcap_retirement_build_plan_2026-08-03.md sec 2.2/3.2.
+	 *
+	 * Same placement, same reason, as ivh_vact_tick() immediately above:
+	 * before the vtime_accounting_enabled_this_cpu() early return, so the
+	 * signal is produced on every tick on every CPU regardless of
+	 * accounting flavour.  This ALSO means it runs before
+	 * account_user_time()/account_system_time() below (and before
+	 * steal_account_process_time()), so the kcpustat and steal deltas it
+	 * reads are one tick stale -- a documented, self-cancelling 0.5%
+	 * phase error at the default 200-tick window, not a bug.  Moving this
+	 * call later would remove the lag but reintroduce the NOHZ hole this
+	 * placement exists to avoid; do not do that.
+	 */
+	ivh_uc_tick();
+
 	if (vtime_accounting_enabled_this_cpu())
 		return;
 

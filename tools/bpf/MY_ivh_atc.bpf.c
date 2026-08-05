@@ -265,6 +265,62 @@ static __always_inline void bump_reason(u32 reason)
 }
 
 /*
+ * BUILD B (vcap retirement plan 2026-08-03, sec 6.2): runtime capacity-source
+ * kill switch.
+ *
+ * Every capacity read in this program used to be an unconditional
+ * select_rq->cpu_capacity, i.e. vcap's number, decided at compile time.  That
+ * made the riskiest flip in the system a source edit + recompile + reload, and
+ * the 2026-08-02 report sec 6.4 records an hour lost to a "revert" that did not
+ * revert because the kernel sysctl was reverted while the BPF side was not.
+ *
+ * ivh_cfg[0] is the capacity source, using the SAME numbering as the kernel's
+ * /proc/sys/kernel/ivh_cap_source:
+ *     0 = vcap             -> rq->cpu_capacity        (default, today's behaviour)
+ *     3 = ivh_uc_capacity  -> rq->ivh_uc_capacity     (the new in-kernel signal)
+ * Values 1 and 2 are kernel-side-only concepts (shadow / Part C) and map to
+ * vcap here, deliberately: this program has no Part C consumer.
+ *
+ * Keys 1-3 are reserved (max_entries 4) so a later knob costs a map update and
+ * not a reload.
+ *
+ * Flip:     bpftool map update name ivh_cfg key 0 0 0 0 value 3 0 0 0
+ * Rollback: bpftool map update name ivh_cfg key 0 0 0 0 value 0 0 0 0
+ */
+#define IVH_CFG_CAP_SOURCE   0
+#define IVH_CAP_SRC_VCAP     0
+#define IVH_CAP_SRC_UC       3
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 4);          /* key 0 = cap_source, 1-3 reserved */
+    __type(key, u32);
+    __type(value, u32);
+} ivh_cfg SEC(".maps");
+
+/*
+ * The ONLY way this program is allowed to read a CPU's capacity.
+ *
+ * `src` must be resolved ONCE per scan and stashed in the per-scan context --
+ * never re-read per candidate.  A mid-scan map write would otherwise produce a
+ * half-vcap, half-uc candidate set, i.e. an unreproducible decision.  See
+ * task_ctx.cap_source and its initialiser in test3().
+ */
+static __always_inline unsigned long ivh_cap_of(struct rq *rq, u32 src)
+{
+    return src == IVH_CAP_SRC_UC ? rq->ivh_uc_capacity : rq->cpu_capacity;
+}
+
+/* Read ivh_cfg[0] once, at the top of a scan. */
+static __always_inline u32 ivh_cap_source_now(void)
+{
+    u32 key = IVH_CFG_CAP_SOURCE;
+    u32 *v = bpf_map_lookup_elem(&ivh_cfg, &key);
+
+    return v ? *v : IVH_CAP_SRC_VCAP;
+}
+
+/*
  * Compile-time gate toggles for process_cpu(), EXPERIMENT: hackbench
  * leave-one-out gate sweep, 2026-07-01.  Set to 0 to disable a gate.
  * (CPUMASK and CLAIMED are not toggleable: CPUMASK is a hard correctness
@@ -280,13 +336,61 @@ static __always_inline void bump_reason(u32 reason)
 #define GATE_BURST_BUDGET    0
 
 /*
- * Destination capacity floor, 2026-07-02 gate-combo experiment: require
- * a migration target to be well above ivh_capacity_threshold (currently
- * tuned to 512 as the *source* trigger ceiling), not just "average or
- * >500". With a strict floor here, dest > 850 > source (<=512) always
- * holds, so GATE_NOT_BETTER is provably redundant and left off.
+ * RETIRED 2026-08-03: destination capacity floor, 2026-07-02 gate-combo
+ * experiment.  Kept defined for reference only -- NOTHING READS IT.
+ *
+ * It required a migration target to be well above ivh_capacity_threshold (the
+ * *source* trigger ceiling), on the theory that a single absolute constant on
+ * the capacity scale is meaningful.  That is true of vcap's number and false
+ * of rq->ivh_uc_capacity: ivh_uc_gate_recalibration_2026-08-03.md sec 2.4
+ * measured the SAME eight host-contended vCPUs, under an UNCHANGED host
+ * corunner, reading 506-520 (guest saturated), 742-823 (guest idle) and
+ * 890-936 (sustained hackbench).  850 is on the correct side of the population
+ * in two of those regimes and on the wrong side in the third -- and the third
+ * is the regime IVH actually operates in.  See sec 4: "IVH_CAP_FLOOR as a
+ * concept -- a fixed constant on the capacity scale -- is a vcap-shaped
+ * artefact and does not survive vcap's retirement."
  */
-#define IVH_CAP_FLOOR    850
+#define IVH_CAP_FLOOR    850   /* RETIRED -- unused, see above */
+
+/*
+ * Gate reshape, ivh_uc_gate_recalibration_2026-08-03.md sec 5.1 / 5.2.
+ *
+ * The signal carries perfectly reliable ORDINAL information (100.00% correct
+ * group ordering over 3,217 samples, worst-case inter-group gap 77) but has no
+ * stable scale ORIGIN.  So both capacity gates are reshaped to read the
+ * ordering rather than the absolute value:
+ *
+ *   GATE_CAPACITY_LOW  -> population-normalised top-band test against scan_max
+ *   GATE_NOT_BETTER    -> relative test with a fixed absolute margin
+ *
+ * Values re-derived offline (V2) from this boot's own capture: a genuine
+ * 0-lateral / 0-empty-destination-set plateau exists across
+ * D in {0,25,50,75} x K in {25,50,75}, with (50,50) inside it and all four
+ * orthogonal neighbours also clean -- 70,784 useful accepts, 0 lateral, 0 empty
+ * over 8,848 source-samples.  (50,50) is therefore the centre of a plateau, not
+ * a knife edge, and matches the values the document modelled.
+ *
+ * Both margins (50) sit BELOW the worst observed true inter-group gap (77) and
+ * ABOVE the per-sample dispersion, so no single-sample perturbation can flip a
+ * verdict.  This is what distinguishes the reshape from the Part C failure,
+ * where the ranking itself was noise (see recalibration doc sec 4).
+ */
+#define IVH_CAP_TOPBAND     50   /* K: dest must be within K of the best CPU in this scan */
+#define IVH_CAP_MARGIN      50   /* D: dest must beat source by at least D            */
+
+/*
+ * Vestigial absolute rail -- deliberately far from the operating point, and it
+ * is a RAIL, NOT A CALIBRATION.  It exists so a scan in which every CPU is
+ * deeply stolen cannot promote one of them to "best tier" and migrate onto it
+ * (the saturated regime's 506-520 cluster).  It is never the binding
+ * constraint in the idle or hackbench regimes.
+ *
+ * If reject_reasons[REJ_CAPACITY_LOW] ever goes to ~100%, this has become the
+ * binding gate, the reshape has failed, and the answer is recalibration doc
+ * sec 8 (publish steal/elapsed instead) -- NOT lowering this number.
+ */
+#define IVH_CAP_HARDFLOOR  600
 
 struct task_ctx {
     struct task_struct *curr;          /* task that is to be moved */
@@ -295,11 +399,52 @@ struct task_ctx {
     int start;                         /* scan start offset (rotated, NOT necessarily the source CPU) */
     int source_cpu;                    /* actual source CPU -- never migrate here */
     u64 rq_last_preempt;               /* last_preemption of source rq (age reference) */
-    int source_capacity;               /* cpu_capacity of the source vCPU */
+    int source_capacity;               /* capacity of the source vCPU, on cap_source's scale */
     int total_cpus;                    /* total number of CPUs in system */
     int average_capacity;              /* system average capacity, for EDWARDS-style gate */
     int *found_active_worker_ptr;      /* 1 once a Tier 1 (active worker) target is found */
+    u32 cap_source;                    /* ivh_cfg[0], resolved ONCE per scan (see ivh_cap_of) */
+    u32 scan_max;                      /* max capacity over all CPUs, resolved ONCE per scan */
 };
+
+/*
+ * scan_max resolution pass (recalibration doc sec 5.1, and sec 7 risk 2).
+ *
+ * MUST be computed once, before the candidate bpf_loop(), and stashed in
+ * task_ctx -- exactly the discipline the retirement plan sec 6.2 imposes on
+ * cap_source, and for the same reason plus one more:
+ *
+ *   - reproducibility: scan_max is a live, unsynchronised read of 16 rqs.  Two
+ *     evaluations microseconds apart would otherwise compute different
+ *     scan_max values and reach different verdicts for the SAME candidate.
+ *   - self-consistency: recomputing per candidate would let the top-band test
+ *     compare candidate i against a population snapshot that candidate j never
+ *     saw, i.e. a candidate set that is half-old and half-new.
+ *
+ * The max is taken over ALL CPUs including the source, matching the offline
+ * model that produced the (D,K) plateau -- that model's per-sample max was
+ * likewise over all 16 CPUs.
+ */
+struct scan_max_ctx {
+    u32 max;
+    u32 cap_source;
+};
+
+static int scan_max_cpu(u32 iter, void *data)
+{
+    struct scan_max_ctx *c = data;
+    struct rq *rq_i = bpf_per_cpu_ptr(&runqueues, iter);
+    unsigned long cap;
+
+    if (!rq_i)
+        return 0;
+
+    cap = ivh_cap_of(rq_i, c->cap_source);
+    if (cap > c->max)
+        c->max = (u32)cap;
+
+    return 0;
+}
 
 static int process_cpu(u32 iter, void *data)
 {
@@ -339,7 +484,7 @@ static int process_cpu(u32 iter, void *data)
         u64 *sum = bpf_map_lookup_elem(&cap_sum, &key);
         u64 *cnt = bpf_map_lookup_elem(&cap_cnt, &key);
         if (sum && cnt) {
-            __sync_fetch_and_add(sum, select_rq->cpu_capacity);
+            __sync_fetch_and_add(sum, ivh_cap_of(select_rq, ctx->cap_source));
             __sync_fetch_and_add(cnt, 1);
         }
     }
@@ -419,19 +564,50 @@ static int process_cpu(u32 iter, void *data)
 #endif
 
 #if GATE_CAPACITY_LOW
-    /* Strict floor: only migrate to a vCPU well above the source trigger
-     * ceiling — see IVH_CAP_FLOOR comment above. */
-    if (select_rq->cpu_capacity <= IVH_CAP_FLOOR) {
-        bump_reason(REJ_CAPACITY_LOW);
-        return 0;
+    /* Reshaped 2026-08-03 (recalibration doc sec 5.1): population-normalised
+     * top-band test, plus a vestigial absolute rail.  Replaces the retired
+     * absolute IVH_CAP_FLOOR, which is a vcap-shaped artefact (see its comment
+     * above).  Asking "is this destination in the healthiest tier currently
+     * observable" is scale-free by construction, so the 126-point regime drift
+     * of sec 2.4 moves the threshold WITH the population instead of leaving it
+     * behind. */
+    {
+        unsigned long dcap = ivh_cap_of(select_rq, ctx->cap_source);
+
+        /* Rail first: never migrate onto a catastrophically stolen vCPU, even
+         * if it happens to be the best one in this scan. */
+        if (dcap <= IVH_CAP_HARDFLOOR) {
+            bump_reason(REJ_CAPACITY_LOW);
+            return 0;
+        }
+
+        /* Top band: within IVH_CAP_TOPBAND of the best CPU seen this scan.
+         * Written as an addition on the left rather than a subtraction on the
+         * right so it cannot underflow when scan_max < IVH_CAP_TOPBAND. */
+        if (dcap + IVH_CAP_TOPBAND < ctx->scan_max) {
+            bump_reason(REJ_CAPACITY_LOW);
+            return 0;
+        }
     }
 #endif
 
 #if GATE_NOT_BETTER
-    /* Target must be strictly better than the source — lateral migrations
-     * to equally-throttled vCPUs waste a schedule() call and stall under
-     * uniform host contention (e.g. all CPUs stolen). */
-    if (select_rq->cpu_capacity <= ctx->source_capacity) {
+    /* Reshaped 2026-08-03 (recalibration doc sec 5.2): target must beat the
+     * source by a fixed absolute MARGIN, not merely be strictly greater.
+     *
+     * A bare `>` is flipped by a single LSB of noise, which is exactly the
+     * mechanism behind the Part C migration storm.  A margin wider than the
+     * signal's per-sample dispersion is not.  Modelled at D=50 this removes
+     * 100% of lateral (contended -> contended) acceptances while keeping every
+     * useful accept and emptying no destination set.
+     *
+     * It also handles the uniform-contention case BETTER than the old absolute
+     * floor did: if every CPU is equally stolen, nothing clears src + D, the
+     * destination set empties, and IVH correctly does nothing -- by
+     * construction rather than by accident of where a constant happened to
+     * sit. */
+    if (ivh_cap_of(select_rq, ctx->cap_source)
+        < (unsigned long)ctx->source_capacity + IVH_CAP_MARGIN) {
         bump_reason(REJ_NOT_BETTER);
         return 0;
     }
@@ -648,6 +824,17 @@ int BPF_PROG(test3, struct rq *rq, struct task_struct *curr, u64 now_time, int a
 
     int found_active_worker = 0;
 
+    /* BUILD B: resolve the capacity source ONCE, here, before the bpf_loop().
+     * Both the source's own capacity and every candidate's capacity are then
+     * read on the same scale for the whole scan. */
+    u32 cap_src = ivh_cap_source_now();
+
+    /* Gate reshape (recalibration doc sec 5.1): resolve the population maximum
+     * ONCE, here, before the candidate bpf_loop() -- see scan_max_cpu(). */
+    struct scan_max_ctx smc = { .max = 0, .cap_source = cap_src };
+
+    bpf_loop(total_cpus, &scan_max_cpu, &smc, 0);
+
     struct task_ctx task_context = {
         .curr = curr,
         .target_cpu_ptr = &target_cpu,
@@ -655,10 +842,12 @@ int BPF_PROG(test3, struct rq *rq, struct task_struct *curr, u64 now_time, int a
         .start = rq->cpu,
         .source_cpu = rq->cpu,
         .rq_last_preempt = rq->last_preemption,
-        .source_capacity = rq->cpu_capacity,
+        .source_capacity = ivh_cap_of(rq, cap_src),
         .total_cpus = total_cpus,
         .average_capacity = average_capacity,
-        .found_active_worker_ptr = &found_active_worker
+        .found_active_worker_ptr = &found_active_worker,
+        .cap_source = cap_src,
+        .scan_max = smc.max
     };
 
     unsigned long mm_bits = curr->mm ? curr->mm->cpu_bitmap[0] : 0UL;
@@ -708,6 +897,7 @@ struct latency_ctx {
     u64 *longest_runtime_ptr;          /* pointer to track longest runtime */
     int total_cpus;                    /* total CPUs in system */
     int average_capacity;              /* average CPU capacity in system */
+    u32 cap_source;                    /* ivh_cfg[0], resolved once per scan */
 };
 
 static int search_latency(u32 iter, void *data)
@@ -737,8 +927,15 @@ static int search_latency(u32 iter, void *data)
     int *target_cpu_ptr = ctx->target_cpu_ptr;
     u64 *preemption_time_ptr = ctx->preemption_time_ptr;
 
+    /* NOTE: sched/cfs_latency_select has NO kernel call site (verified
+     * 2026-08-03: declared in include/linux/sched_hook_defs.h:11, never
+     * invoked -- see the comment at kernel/sched/core.c:1052).  These reads
+     * are dead today, but they are converted to ivh_cap_of() anyway so that
+     * no vcap-scale read survives anywhere in this program if the hook ever
+     * gains a call site.  Costs nothing. */
+
     //if the target is uncontested - no reason to hesitate
-    if (select_rq->cpu_capacity > 1000) {
+    if (ivh_cap_of(select_rq, ctx->cap_source) > 1000) {
         *target_cpu_ptr = cpu;
         return 1;
     }
@@ -746,7 +943,7 @@ static int search_latency(u32 iter, void *data)
     //path if there are only SCHED-IDLE tasks running
     if (select_rq->nr_running > 0) {
         //if it's a better than average core - that's good enough!
-        if (select_rq->cpu_capacity > (ctx->average_capacity)) {
+        if (ivh_cap_of(select_rq, ctx->cap_source) > (ctx->average_capacity)) {
             *target_cpu_ptr = cpu;
             return 1;
         }
@@ -762,7 +959,7 @@ static int search_latency(u32 iter, void *data)
 
     if (idle_cpu(select_rq)) {
         //normal loop, if a cpu is less than the median - ignore it. Otherwise pick lowest latency
-        if (select_rq->cpu_capacity > (ctx->average_capacity) &&
+        if (ivh_cap_of(select_rq, ctx->cap_source) > (ctx->average_capacity) &&
             select_rq->avg_latency <= *(ctx->min_latency_ptr)) {
 
             *(ctx->min_latency_ptr) = select_rq->avg_latency;
@@ -811,7 +1008,8 @@ int BPF_PROG(test32, int prev, struct task_struct *curr, struct cpumask *idle_cp
         .now = now,
         .longest_runtime_ptr = &longest_runtime,
         .total_cpus = total_cpus,
-        .average_capacity = average_capacity
+        .average_capacity = average_capacity,
+        .cap_source = ivh_cap_source_now()
     };
 
     bpf_loop(256, &search_latency, &latency_context, 0);
