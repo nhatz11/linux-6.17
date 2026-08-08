@@ -390,7 +390,7 @@ static __always_inline u32 ivh_cap_source_now(void)
  * binding gate, the reshape has failed, and the answer is recalibration doc
  * sec 8 (publish steal/elapsed instead) -- NOT lowering this number.
  */
-#define IVH_CAP_HARDFLOOR  600
+#define IVH_CAP_HARDFLOOR  950
 
 struct task_ctx {
     struct task_struct *curr;          /* task that is to be moved */
@@ -851,6 +851,17 @@ int BPF_PROG(test3, struct rq *rq, struct task_struct *curr, u64 now_time, int a
     };
 
     unsigned long mm_bits = curr->mm ? curr->mm->cpu_bitmap[0] : 0UL;
+
+    /* EXPERIMENT 2026-08-06 (ivh_four_questions_report, Q4 sec 1.3): both
+     * capacity gates are monotone in dcap, and dcap <= scan_max for every
+     * candidate by construction, so if scan_max itself cannot clear
+     * GATE_CAPACITY_LOW's hard rail or GATE_NOT_BETTER's margin, NO candidate
+     * can -- the whole per-candidate loop is provably dead work. Measured
+     * 80% regression recovery in isolation; being tested here stacked on top
+     * of ivh_selection_trylock. */
+    if (smc.max <= IVH_CAP_HARDFLOOR ||
+        smc.max < (u32)ivh_cap_of(rq, cap_src) + IVH_CAP_MARGIN)
+        return -1;
 
     bpf_loop(nr_loops, &process_cpu, &task_context, 0);
 

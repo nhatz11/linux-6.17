@@ -210,6 +210,16 @@ extern unsigned long ivh_ref_carry;
 extern unsigned long ivh_ref_trace;
 extern unsigned long ivh_ref_steal_enabled;
 extern unsigned long ivh_steal_source;
+/*
+ * Exit-overhead deadband (tools/bpf/docs/
+ * ivh_steal_accuracy_investigation_2026-08-04.md sec 4).
+ *   ivh_ref_method       0 off (default estimator) | 1 shadow | 2 authoritative
+ *   ivh_ref_exit_loc_ns  phantom ns charged per local-timer interrupt
+ *   ivh_ref_exit_oth_ns  phantom ns charged per CAL/RES/TLB/PMI/NMI interrupt
+ */
+extern unsigned long ivh_ref_method;
+extern unsigned long ivh_ref_exit_loc_ns;
+extern unsigned long ivh_ref_exit_oth_ns;
 extern int  migrate_task_to_async_fair(void *data);
 extern void ivh_scan_stuck_waiters(void); /* EXPERIMENT: bare-schedule() hang diagnosis, 2026-06-30 */
 
@@ -1500,6 +1510,55 @@ struct rq {
     u64                     ivh_ref_hlt_ns;        /* cumulative lock-path HLT, ns */
     u64                     ivh_ref_poll_ns;       /* cumulative lock-path bounded poll, ns */
     s64                     ivh_ref_debt_c;        /* ivh_ref_carry: signed residual, <= 0, floored at one interval */
+
+    /*
+     * Exit-overhead deadband (ivh_ref_method, tools/bpf/docs/
+     * ivh_steal_accuracy_investigation_2026-08-04.md sec 4.2-4.3): REF_TSC
+     * does not count host-side VM-exit servicing time, so d_tsc - d_ref
+     * contains a small per-interrupt phantom that is negligible against real
+     * steal on a heavily-contended CPU but dominates the reading on a barely
+     * -stolen one.  This block estimates that phantom from the guest's own
+     * interrupt counters and removes it, computed as a SECOND, PARALLEL
+     * pipeline alongside the original one above so ivh_ref_method==1 can run
+     * both at once and compare (shadow) before ivh_ref_method==2 lets the
+     * corrected pipeline become authoritative.
+     *
+     * A separate debt (_debt2_c) from ivh_ref_debt_c is required, not
+     * optional: the two pipelines subtract different sub_c values each tick,
+     * so carrying one debt across both would let a residual computed against
+     * one subtraction get applied to the other.
+     */
+    u64                     ivh_ref_prev_loc;      /* cumulative local-timer irqs at last accumulate */
+    u64                     ivh_ref_prev_oth;      /* cumulative CAL+RES+TLB+PMI+NMI irqs at last accumulate */
+    u64                     ivh_ref_ovh_ns;        /* cumulative exit-overhead subtracted, ns (diagnostic) */
+    u64                     ivh_ref_steal2_ns;     /* corrected pipeline's output; shadow at method==1 */
+    u64                     ivh_ref_steal_raw_ns;  /* the ORIGINAL pipeline's output, always tracked */
+    s64                     ivh_ref_debt2_c;       /* ivh_ref_carry applied to the corrected pipeline */
+    /*
+     * EPOCH FLAG, and why it exists -- it is the fix for a live misdiagnosis
+     * on 2026-08-04 that cost an evening.  The corrected pipeline only runs
+     * while ivh_ref_method != 0, so before this flag ivh_ref_steal2_ns was a
+     * SINCE-THE-LAST-ENABLE total while every counter it is naturally read
+     * against (real_steal_ns in /proc/vcap_steal_compare, ivh_ref_steal_ns,
+     * ivh_ref_steal_raw_ns) is SINCE-BOOT.  Two minutes of shadow mode on a
+     * ten-minute uptime therefore made a perfectly healthy corrected value
+     * look like it had "collapsed to 1-14% of real steal" on all 16 vCPUs at
+     * once -- which is exactly the signature of an epoch mismatch, not of an
+     * estimator fault, and it was reported as the latter.
+     *
+     * On the first corrected tick after every 0 -> non-0 transition,
+     * ivh_ref_steal2_ns is re-based to ivh_ref_steal_raw_ns.  The pre-enable
+     * segment is then credited at the UNCORRECTED value (which is the only
+     * value that was ever computed for it) and only the live segment carries
+     * the deadband, so the counter is directly comparable to real_steal_ns
+     * from the first read.  The re-base is a forward jump, so monotonicity --
+     * which get_steal_and_preemptions()'s consumers depend on -- is preserved.
+     *
+     * ivh_ref_ovh_ns deliberately does NOT get this treatment: it answers
+     * "how much phantom did the deadband remove while it was on", which is a
+     * live-window quantity by construction and has no since-boot meaning.
+     */
+    bool                    ivh_ref_steal2_live;   /* corrected pipeline accumulating (method != 0) */
 
     /*
      * ---------------------------------------------------------------------

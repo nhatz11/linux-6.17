@@ -250,13 +250,54 @@ unsigned long ivh_steal_source = 0UL;
 unsigned long ivh_ref_halt_correct = 0UL;
 unsigned long ivh_ref_trace = 0UL;
 /*
- * ivh_ref_carry -- 0 (default) discard the negative residual on every tick,
- * i.e. today's behavior; 1 carry it, bounded, into the next interval.  This is
- * a SEPARATE defect from the halt accounting and it is the larger of the two:
- * measured 63-74% under-report of real steal under load on this host.  Full
+ * ivh_ref_carry -- 0 discard the negative residual on every tick; 1 (default
+ * as of the exit-overhead deadband, 2026-08-04 -- was 0) carry it, bounded,
+ * into the next interval.  This is a SEPARATE defect from the halt
+ * accounting and it is the larger of the two: measured 63-74% under-report
+ * of real steal under load on this host prior to the halt/carry fixes. Full
  * reasoning at the use site in ivh_ref_accumulate().
+ *
+ * Defaulted ON because ivh_ref_method's exit-overhead deadband (below) is
+ * strictly positive and routinely drives the residual negative on
+ * lightly-stolen CPUs (tools/bpf/docs/
+ * ivh_steal_accuracy_investigation_2026-08-04.md sec 2.2/4.3) -- without
+ * carry, those negatives are rectified away and the deadband's correction is
+ * silently defeated. Live A/B (sec 2.4) found carry=1 safe and beneficial on
+ * its own; it is not a new behavior, only a new default.
  */
-unsigned long ivh_ref_carry = 0UL;
+unsigned long ivh_ref_carry = 1UL;
+
+/*
+ * ---------------------------------------------------------------------------
+ * Exit-overhead deadband (2026-08-04, tools/bpf/docs/
+ * ivh_steal_accuracy_investigation_2026-08-04.md)
+ * ---------------------------------------------------------------------------
+ *
+ * Root cause (sec 1.2/1.3): REF_TSC (CPU_CLK_UNHALTED.REF) is paused across
+ * every VM exit, but the plain TSC is not, so d_tsc - d_ref includes the
+ * host's own time servicing this vCPU's interrupts, not just genuine steal.
+ * That phantom is a near-constant ~2800ns per interrupt REGARDLESS of load,
+ * which is negligible against a heavily-stolen CPU's real steal and is the
+ * ENTIRE reading on a lightly-stolen one (measured +200% to +380% relative
+ * error on cpu8-15 in this document's baseline, against -1% to +1% on the
+ * contended cpu0-7).
+ *
+ * Same three-valued shape as every other IVH source knob (ivh_pv_preempt_src,
+ * ivh_cap_source): 0 off, byte-for-byte the pre-2026-08-04 estimator; 1
+ * shadow (both pipelines computed, rq->ivh_ref_steal_ns untouched,
+ * rq->ivh_ref_steal2_ns carries the corrected value); 2 authoritative
+ * (rq->ivh_ref_steal_ns becomes the corrected value, the original stays
+ * visible in rq->ivh_ref_steal_raw_ns).
+ *
+ * ivh_ref_exit_loc_ns / ivh_ref_exit_oth_ns are the per-interrupt-class cost
+ * coefficients from the two-term fit in sec 1.3, calibrated on THIS host.
+ * Sec 5 flags explicitly that this calibration has not been checked for
+ * host-portability -- see the G7 validation gate before trusting these
+ * defaults elsewhere.
+ */
+unsigned long ivh_ref_method = 0UL;
+unsigned long ivh_ref_exit_loc_ns = 1000UL;
+unsigned long ivh_ref_exit_oth_ns = 5300UL;
 #ifdef CONFIG_X86
 DEFINE_PER_CPU_ALIGNED(struct ivh_lock_halt, ivh_lock_halt);
 EXPORT_PER_CPU_SYMBOL_GPL(ivh_lock_halt);
@@ -497,6 +538,12 @@ static void ivh_ref_reset_seed(int cpu)
 	 * counterpart; carrying it across would silently swallow real steal
 	 * after every enable/disable or hotplug cycle. */
 	rq->ivh_ref_debt_c       = 0;
+	/* Same trap again for the exit-overhead deadband's own delta state and
+	 * its independent debt (tools/bpf/docs/
+	 * ivh_steal_accuracy_investigation_2026-08-04.md sec 4.2-4.3). */
+	rq->ivh_ref_prev_loc     = 0;
+	rq->ivh_ref_prev_oth     = 0;
+	rq->ivh_ref_debt2_c      = 0;
 }
 
 static int ivh_ref_event_create(int cpu)
@@ -600,7 +647,8 @@ void ivh_ref_accumulate(void)
 	u64 ref, tsc, idle_us, iowait_us, idle_ns;
 	u64 d_tsc, d_ref, d_idle_ns, d_idle_c, steal_c;
 	u64 hlt_c, poll_c, d_hlt_c, d_poll_c, sub_c;
-	unsigned long correct, trace;
+	u64 loc, oth, steal_c_base;
+	unsigned long correct, trace, method;
 
 	if (!ev || !READ_ONCE(ivh_ref_steal_enabled))
 		return;
@@ -644,6 +692,30 @@ void ivh_ref_accumulate(void)
 	ivh_lock_halt_flush(tsc);
 	hlt_c  = raw_cpu_read(ivh_lock_halt.hlt_cycles);
 	poll_c = raw_cpu_read(ivh_lock_halt.poll_cycles);
+
+	/*
+	 * Exit-overhead deadband's raw inputs (tools/bpf/docs/
+	 * ivh_steal_accuracy_investigation_2026-08-04.md sec 4.2). Read and
+	 * seeded UNCONDITIONALLY, regardless of ivh_ref_method, for the same
+	 * reason hlt_c/poll_c above are: a live 0->1 flip must not see a fake
+	 * jump from comparing against a never-initialised baseline. The actual
+	 * arithmetic that CONSUMES these deltas is gated on method below, so
+	 * this is two extra percpu loads at method==0, nothing more.
+	 *
+	 * __this_cpu_read(), not kstat_cpu_irqs_sum(): the latter walks every
+	 * irq_desc and is far too expensive for a per-tick hardirq-context
+	 * hook. This omits device IRQs, which sec 4.2's measurement found
+	 * negligible on this guest (99.7% of a lightly-loaded CPU's interrupt
+	 * count) -- a guest with heavy device-IRQ affinity on one CPU would
+	 * need this extended.
+	 */
+	loc = __this_cpu_read(irq_stat.apic_timer_irqs);
+	oth = (u64)__this_cpu_read(irq_stat.irq_call_count)
+	    + __this_cpu_read(irq_stat.irq_resched_count)
+	    + __this_cpu_read(irq_stat.irq_tlb_count)
+	    + __this_cpu_read(irq_stat.x86_platform_ipis)
+	    + __this_cpu_read(irq_stat.irq_spurious_count)
+	    + __this_cpu_read(irq_stat.__nmi_count);
 
 	/*
 	 * Trap 1 of three that silently manufacture phantom steal: reading
@@ -787,6 +859,14 @@ void ivh_ref_accumulate(void)
 	 * -600000ish toward 0 under load) before it is trusted, exactly as
 	 * ivh_steal_source itself was supposed to be.
 	 */
+	/*
+	 * Snapshot the pre-carry base (d_tsc - d_ref, idle-clamped) before the
+	 * block below consumes and overwrites `steal_c` -- the exit-overhead
+	 * pipeline needs this same base and must not re-derive it from
+	 * scratch, or the two pipelines could silently diverge on a future
+	 * edit to the lines above.
+	 */
+	steal_c_base = steal_c;
 	if (READ_ONCE(ivh_ref_carry)) {
 		s64 raw = (s64)d_tsc - (s64)d_ref - (s64)d_idle_c - (s64)sub_c
 			  + rq->ivh_ref_debt_c;
@@ -803,7 +883,95 @@ void ivh_ref_accumulate(void)
 		rq->ivh_ref_debt_c = 0;
 	}
 
-	rq->ivh_ref_steal_ns += mul_u64_u32_div(steal_c, USEC_PER_SEC, tsc_khz);
+	/*
+	 * `steal_c` above is the ORIGINAL pipeline's result -- untouched by
+	 * anything below.  Always track it as the raw/uncorrected trajectory,
+	 * regardless of ivh_ref_method, so it stays available for comparison
+	 * even once method==2 makes the corrected pipeline authoritative.
+	 */
+	rq->ivh_ref_steal_raw_ns += mul_u64_u32_div(steal_c, USEC_PER_SEC, tsc_khz);
+
+	method = READ_ONCE(ivh_ref_method);
+	if (likely(!method)) {
+		/*
+		 * method==0: every line below is dead, byte-for-byte the
+		 * pre-2026-08-04 estimator.  This is the G1/G2 guarantee --
+		 * the ORIGINAL pipeline's result is what becomes authoritative,
+		 * computed exactly as it always was above this block.
+		 *
+		 * The one store below changes no output: it only marks the
+		 * corrected pipeline as not-currently-accumulating, so that the
+		 * next 0 -> non-0 transition re-bases ivh_ref_steal2_ns onto the
+		 * since-boot timeline instead of resuming a stale partial total.
+		 * See the ivh_ref_steal2_live comment in sched.h for the
+		 * misdiagnosis this prevents.
+		 */
+		rq->ivh_ref_steal_ns += mul_u64_u32_div(steal_c, USEC_PER_SEC, tsc_khz);
+		rq->ivh_ref_steal2_live = false;
+	} else {
+		/*
+		 * The corrected, SECOND pipeline (tools/bpf/docs/
+		 * ivh_steal_accuracy_investigation_2026-08-04.md sec 4.2-4.3):
+		 * same base and same halt-correction sub_c as the original,
+		 * plus the exit-overhead deadband folded into its OWN sub_c2,
+		 * carried against its OWN debt2_c so the two pipelines' carry
+		 * states can never cross-contaminate.
+		 */
+		u64 d_loc, d_oth, ovh_c, sub_c2, steal_c2;
+
+		/*
+		 * Epoch alignment on every 0 -> non-0 transition: re-base the
+		 * corrected total onto the since-boot timeline so it can be
+		 * compared directly against real_steal_ns / ivh_ref_steal_ns
+		 * rather than against nothing.  Forward jump only, so
+		 * monotonicity holds.  Full rationale on ivh_ref_steal2_live in
+		 * sched.h.
+		 */
+		if (unlikely(!rq->ivh_ref_steal2_live)) {
+			rq->ivh_ref_steal2_live = true;
+			rq->ivh_ref_steal2_ns   = rq->ivh_ref_steal_raw_ns;
+		}
+
+		d_loc = (loc > rq->ivh_ref_prev_loc) ? loc - rq->ivh_ref_prev_loc : 0;
+		d_oth = (oth > rq->ivh_ref_prev_oth) ? oth - rq->ivh_ref_prev_oth : 0;
+		ovh_c = mul_u64_u32_div(d_loc * READ_ONCE(ivh_ref_exit_loc_ns)
+					+ d_oth * READ_ONCE(ivh_ref_exit_oth_ns),
+					tsc_khz, USEC_PER_SEC);
+		rq->ivh_ref_ovh_ns += mul_u64_u32_div(ovh_c, USEC_PER_SEC, tsc_khz);
+
+		sub_c2 = sub_c + ovh_c;
+
+		if (READ_ONCE(ivh_ref_carry)) {
+			s64 raw2 = (s64)d_tsc - (s64)d_ref - (s64)d_idle_c
+				   - (s64)sub_c2 + rq->ivh_ref_debt2_c;
+
+			if (raw2 > 0) {
+				steal_c2 = (u64)raw2;
+				rq->ivh_ref_debt2_c = 0;
+			} else {
+				steal_c2 = 0;
+				rq->ivh_ref_debt2_c = (raw2 < -(s64)d_tsc) ?
+						      -(s64)d_tsc : raw2;
+			}
+		} else {
+			steal_c2 = (steal_c_base > sub_c2) ?
+				   steal_c_base - sub_c2 : 0;
+			rq->ivh_ref_debt2_c = 0;
+		}
+
+		rq->ivh_ref_steal2_ns += mul_u64_u32_div(steal_c2, USEC_PER_SEC, tsc_khz);
+
+		/*
+		 * method==1 (shadow): steal2_ns just moved, steal_ns must NOT
+		 * -- that is G2's whole test.  method==2 (authoritative): the
+		 * corrected pipeline's result becomes what
+		 * get_steal_and_preemptions() actually returns.
+		 */
+		if (method >= 2)
+			rq->ivh_ref_steal_ns += mul_u64_u32_div(steal_c2, USEC_PER_SEC, tsc_khz);
+		else
+			rq->ivh_ref_steal_ns += mul_u64_u32_div(steal_c, USEC_PER_SEC, tsc_khz);
+	}
 	rq->ivh_ref_samples++;
 
 	/*
@@ -826,18 +994,23 @@ void ivh_ref_accumulate(void)
 		printk(KERN_INFO
 		       "ivh_ref_trace: cpu=%d d_tsc=%llu d_ref=%llu d_idle_c=%llu "
 		       "d_hlt_c=%llu d_poll_c=%llu sub_c=%llu debt_c=%lld steal_c=%llu "
-		       "steal_ns=%llu hlt_ns=%llu poll_ns=%llu samples=%llu skipped=%llu\n",
+		       "steal_ns=%llu hlt_ns=%llu poll_ns=%llu samples=%llu skipped=%llu "
+		       "method=%lu steal2_ns=%llu ovh_ns=%llu debt2_c=%lld raw_ns=%llu\n",
 		       cpu, d_tsc, d_ref, d_idle_c, d_hlt_c, d_poll_c, sub_c,
 		       rq->ivh_ref_debt_c,
 		       steal_c, rq->ivh_ref_steal_ns, rq->ivh_ref_hlt_ns,
 		       rq->ivh_ref_poll_ns, rq->ivh_ref_samples,
-		       rq->ivh_ref_skipped);
+		       rq->ivh_ref_skipped,
+		       method, rq->ivh_ref_steal2_ns, rq->ivh_ref_ovh_ns,
+		       rq->ivh_ref_debt2_c, rq->ivh_ref_steal_raw_ns);
 seed:
 	rq->ivh_ref_prev_tsc     = tsc;
 	rq->ivh_ref_prev_ref     = ref;
 	rq->ivh_ref_prev_idle_ns = idle_ns;
 	rq->ivh_ref_prev_hlt_c   = hlt_c;
 	rq->ivh_ref_prev_poll_c  = poll_c;
+	rq->ivh_ref_prev_loc     = loc;
+	rq->ivh_ref_prev_oth     = oth;
 }
 
 #ifdef CONFIG_SYSCTL
@@ -949,6 +1122,32 @@ static int ivh_ref_proc_halt_correct(const struct ctl_table *table, int write,
 	return 0;
 }
 
+/*
+ * Same "reject rather than silently clamp" posture as the two handlers
+ * above, same reason: a typo'd 3 must not be readable as "2, but stronger".
+ */
+static int ivh_ref_proc_method(const struct ctl_table *table, int write,
+				void *buffer, size_t *lenp, loff_t *ppos)
+{
+	unsigned long val = READ_ONCE(ivh_ref_method);
+	struct ctl_table tmp = *table;
+	int ret;
+
+	tmp.data = &val;
+	ret = proc_doulongvec_minmax(&tmp, write, buffer, lenp, ppos);
+	if (ret || !write)
+		return ret;
+
+	if (val > 2) {
+		pr_err("IVH: refusing ivh_ref_method=%lu: valid values are 0 (today's estimator), 1 (exit-overhead deadband, shadow) and 2 (deadband authoritative)\n",
+		       val);
+		return -EINVAL;
+	}
+
+	WRITE_ONCE(ivh_ref_method, val);
+	return 0;
+}
+
 static const struct ctl_table ivh_ref_sysctls[] = {
 	{
 		.procname	= "ivh_ref_steal_enabled",
@@ -981,6 +1180,27 @@ static const struct ctl_table ivh_ref_sysctls[] = {
 	{
 		.procname	= "ivh_ref_trace",
 		.data		= &ivh_ref_trace,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_ref_method",
+		.data		= &ivh_ref_method,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= ivh_ref_proc_method,
+	},
+	{
+		.procname	= "ivh_ref_exit_loc_ns",
+		.data		= &ivh_ref_exit_loc_ns,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_ref_exit_oth_ns",
+		.data		= &ivh_ref_exit_oth_ns,
 		.maxlen		= sizeof(unsigned long),
 		.mode		= 0644,
 		.proc_handler	= proc_doulongvec_minmax,

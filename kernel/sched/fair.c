@@ -14511,7 +14511,12 @@ skip_cs_hists:
 		seq_printf(m, "ivh_ref_carry:          %lu  (0=discard negative residual, 1=carry bounded)\n",
 			   READ_ONCE(ivh_ref_carry));
 		seq_printf(m, "ivh_ref_trace:          %lu\n", READ_ONCE(ivh_ref_trace));
-		seq_printf(m, "# cpu steal_ns hlt_ns poll_ns hlt_events poll_events samples skipped\n");
+		seq_printf(m, "ivh_ref_method:         %lu  (0=today's estimator, 1=exit-overhead deadband shadow, 2=deadband authoritative)\n",
+			   READ_ONCE(ivh_ref_method));
+		seq_printf(m, "ivh_ref_exit_loc_ns:    %lu\n", READ_ONCE(ivh_ref_exit_loc_ns));
+		seq_printf(m, "ivh_ref_exit_oth_ns:    %lu\n", READ_ONCE(ivh_ref_exit_oth_ns));
+		seq_printf(m, "# cpu steal_ns hlt_ns poll_ns hlt_events poll_events samples skipped "
+			      "steal_raw_ns steal2_ns ovh_ns debt2_c\n");
 		for_each_possible_cpu(cpu) {
 			struct rq *rq = cpu_rq(cpu);
 			struct ivh_lock_halt *h = &per_cpu(ivh_lock_halt, cpu);
@@ -14521,10 +14526,12 @@ skip_cs_hists:
 			t_poll  += rq->ivh_ref_poll_ns;
 			t_samp  += rq->ivh_ref_samples;
 			t_skip  += rq->ivh_ref_skipped;
-			seq_printf(m, "ivh_ref_cpu: %d %llu %llu %llu %llu %llu %llu %llu\n",
+			seq_printf(m, "ivh_ref_cpu: %d %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %lld\n",
 				   cpu, rq->ivh_ref_steal_ns, rq->ivh_ref_hlt_ns,
 				   rq->ivh_ref_poll_ns, h->hlt_events, h->poll_events,
-				   rq->ivh_ref_samples, rq->ivh_ref_skipped);
+				   rq->ivh_ref_samples, rq->ivh_ref_skipped,
+				   rq->ivh_ref_steal_raw_ns, rq->ivh_ref_steal2_ns,
+				   rq->ivh_ref_ovh_ns, rq->ivh_ref_debt2_c);
 		}
 		seq_printf(m, "ivh_ref_steal_ns_total: %llu\n", t_steal);
 		seq_printf(m, "ivh_ref_hlt_ns_total:   %llu\n", t_hlt);
