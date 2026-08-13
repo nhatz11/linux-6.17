@@ -14396,6 +14396,35 @@ skip_cs_hists:
 		   READ_ONCE(ivh_uc_used_source));
 	seq_printf(m, "ivh_uc_shadow:             %lu\n", READ_ONCE(ivh_uc_shadow));
 	seq_printf(m, "ivh_uc_avgcap_enabled:     %lu\n", READ_ONCE(ivh_uc_avgcap_enabled));
+	/*
+	 * Idle-keepalive state and cost.  Printed beside the uc block rather
+	 * than in one of its own because the only question worth asking about
+	 * the keepalive is answered by reading the two together: whether the
+	 * probes it paid for actually moved the "windows" column below off the
+	 * near-zero it sits at on an idle vCPU without them.
+	 *
+	 * duty_pct vs ivh_uc_min_avail_pct is the comparison that decides
+	 * whether they did -- an idle vCPU's entire avail comes from the probe,
+	 * so a duty cycle under the min-avail threshold leaves every window
+	 * EXTENDED and publishes nothing however reliably the probes fire.
+	 */
+	seq_printf(m, "ivh_ka_enabled:            %lu\n", READ_ONCE(ivh_ka_enabled));
+	seq_printf(m, "ivh_ka_interval_ns:        %lu\n", READ_ONCE(ivh_ka_interval_ns));
+	seq_printf(m, "ivh_ka_probe_ns:           %lu  (duty %lu%%, vs ivh_uc_min_avail_pct %lu)\n",
+		   READ_ONCE(ivh_ka_probe_ns),
+		   READ_ONCE(ivh_ka_probe_ns) * 100 /
+			max(READ_ONCE(ivh_ka_interval_ns), 1UL),
+		   READ_ONCE(ivh_uc_min_avail_pct));
+	seq_printf(m, "# cpu ka_probes ka_skipped_fresh ka_aborted ka_spin_ms ka_misdispatched\n");
+	for_each_possible_cpu(cpu) {
+		u64 probes, skipped_fresh, aborted, spin_ns, misdispatched;
+
+		get_ka_compare(cpu, &probes, &skipped_fresh, &aborted,
+			       &spin_ns, &misdispatched);
+		seq_printf(m, "ivh_ka_cpu: %d %llu %llu %llu %llu %llu\n",
+			   cpu, probes, skipped_fresh, aborted,
+			   spin_ns / 1000000, misdispatched);
+	}
 	seq_printf(m, "# cpu vcap_custom vcap_cpu_capacity uc_capacity uc_wall uc_acct raw_wall raw_acct "
 		      "win_avail_c win_stolen_c windows extended skipped vact_capacity\n");
 	for_each_possible_cpu(cpu) {

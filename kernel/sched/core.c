@@ -298,6 +298,142 @@ unsigned long ivh_ref_carry = 1UL;
 unsigned long ivh_ref_method = 0UL;
 unsigned long ivh_ref_exit_loc_ns = 1000UL;
 unsigned long ivh_ref_exit_oth_ns = 5300UL;
+
+/*
+ * IVH "tks" defaults (ivh_steal_source=2).  All three derived from the live
+ * sweep in tools/bpf/docs/ivh_cvm_steal_detector_2026-08-08.md sec 5.
+ *
+ * ivh_tks_deadband_ns = 50000 (50 us): measured tick-delivery jitter on this
+ * guest sits inside 1% of the nominal period (~10 us at HZ=1000), and the
+ * delta histogram has an empty band between 1.01 and 1.2 nominal ticks, so
+ * 50 us is comfortably above the noise and far below the smallest gap that
+ * carries signal.  The sweep is flat across 50/200/500 us -- this is the
+ * centre of a plateau, not a knife edge.  A deadband of ZERO is catastrophic
+ * and was measured so: it booked 27.8 s of phantom steal onto eight
+ * completely unstolen vCPUs in a 17 s window.
+ *
+ * ivh_tks_phase_pct = 0.  THIS DEFAULT AND ITS RATIONALE ARE SUPERSEDED --
+ * see tools/bpf/docs/ivh_undershoot_correction_2026-08-09.md.  The original
+ * reasoning was: the unbiased estimator for a preemption that spans a tick
+ * deadline is (T2-T1) - 0.5*tick, i.e. phase_pct = 50, but the correction is
+ * only valid on intervals where a preemption really did span the deadline,
+ * the deadband cannot establish that with certainty, and every false
+ * positive is then inflated by a fixed 500 us.  The measured
+ * destination-gate disagreement that justified shipping 0 (1.51% at 0, 1.47%
+ * at 10, 26.4% at 50) was taken under CONFIG_NO_HZ, where the estimator
+ * really did emit false positives at a high rate because un-ticked busy time
+ * is indistinguishable from host preemption.
+ *
+ * Under `nohz=off` (which the tks estimator now requires anyway -- see
+ * ivh_idle_ns() and ivh_tick_steal_accumulate()) that premise is gone:
+ * excess_i <= 0 structurally on any unpreempted vCPU, and the false-positive
+ * rate measured on eight genuinely-unstolen vCPUs is ZERO, at every
+ * phase_pct from 0 to 100, under real hackbench.  The correction is
+ * therefore no longer paying for itself in noise.
+ *
+ * Two further corrections to the record, both measured live:
+ *
+ *   - The right magnitude is 100, not 50.  With an ABSOLUTE periodic tick
+ *     (HRTIMER_MODE_ABS_PINNED_HARD forwarded by TICK_NSEC), a preemption
+ *     burst causes the pending expiry to fire immediately on resume and
+ *     hrtimer_forward() to skip the missed ones, so the burst costs the
+ *     estimator exactly ONE whole tick period, not half of one.  The half
+ *     tick above is the correct answer for a tick RE-ARMED relative to its
+ *     own delivery, which is not what this kernel does.
+ *   - Measured deficit against the kvm_steal_time page, continuously
+ *     runnable load, 8 contended vCPUs: (true steal - estimate) /
+ *     ivh_tks_events = 1.000 tick, invariant across a 5.6x range of true
+ *     steal (594 ms to 3311 ms per window).  At phase_pct=100 the estimate
+ *     lands at ratio 0.998-1.001 of truth, reproduced in 5 independent
+ *     blocks.  At 0 it is 0.64-0.66; at 50, 0.82-0.83.
+ *
+ * The default is left at 0 here only because changing it cannot be validated
+ * without a reboot; /home/nick/IVH sets the operating value.
+ *
+ * ivh_tks_carry_ticks = 8: floor on the signed carry.  The sweep is flat
+ * across 1/8/200 ticks on wall-clock throughput, but NOT on absolute
+ * accuracy -- it bounds the second, larger deficit term (see
+ * ivh_tks_idle_sub below), so lowering it raises the estimate on a vCPU that
+ * idles and raises phantom steal on one that does not.
+ */
+unsigned long ivh_tks_deadband_ns = 50000UL;
+unsigned long ivh_tks_phase_pct = 0UL;
+unsigned long ivh_tks_carry_ticks = 8UL;
+
+/*
+ * ivh_tks_idle_sub = 1 (subtract idle, the historical behaviour).
+ *
+ * ivh_tick_steal_accumulate() forms avail_c = (raw TSC delta) - (idle
+ * delta) and charges the excess over one nominal tick as steal.  The idle
+ * subtraction exists because under CONFIG_NO_HZ an idle CPU's inter-tick gap
+ * is unbounded and would otherwise read as pure steal.
+ *
+ * Under `nohz=off` that term is not merely unnecessary, it is the DOMINANT
+ * source of undershoot, and the mechanism is exact rather than statistical.
+ * With a periodic tick, elapsed_i - TICK_NSEC is already the delivery delay,
+ * i.e. already the steal, for idle and busy intervals alike: a halted vCPU
+ * becomes runnable at its own timer deadline, and the host's failure to run
+ * it from that instant is charged by KVM as steal in exactly the same way.
+ * Subtracting idle on top of that turns every idle tick into one whole tick
+ * of NEGATIVE carry, i.e. a debt that cancels real steal measured later in
+ * the same window.  Measured under real hackbench (fine-grained, ~35% idle
+ * on the contended vCPUs): the residual deficit that survives phase_pct=100
+ * is 0.6-0.9x the vCPU's own idle time in the window, and it is what holds
+ * hackbench recovery at 0.12-0.48 of truth while the same estimator is exact
+ * (1.000) on continuously runnable load.
+ *
+ * Shadow-first, same posture as ivh_ref_method / ivh_steal_source=2 /
+ * ivh_ka_enabled before it: 1 is byte-for-byte the historical estimator, and
+ * an operator only sets 0 together with `nohz=off`.  Setting 0 on a tickless
+ * boot would reinstate the unbounded-gap phantom this term was added to
+ * suppress, which is why it is a knob and not a `tick_nohz_active` test --
+ * the test would silently change behaviour on a kernel whose whole tks
+ * pipeline was calibrated with the subtraction in place.
+ *
+ * NOT LIVE-VALIDATED.  Written and compiled 2026-08-09; executing it needs a
+ * reboot.  tools/bpf/docs/ivh_undershoot_correction_2026-08-09.md sec 7.
+ */
+unsigned long ivh_tks_idle_sub = 1UL;
+
+/*
+ * IVH "ka" (idle keepalive) -- the fix for ivh_uc_capacity going stale on an
+ * idle vCPU.  tools/bpf/docs/ivh_idle_keepalive_2026-08-08.md.
+ *
+ * ivh_uc_tick() runs only from account_process_tick(), and an idle vCPU under
+ * NOHZ stops ticking, so nothing re-measures it.  Measured on this guest,
+ * completely idle: cpu2 published ZERO windows in 60 s against a nominal 300,
+ * its ivh_uc_capacity frozen at 951 while the CPUs that were still ticking
+ * read 1019-1021.  Two distinct mechanisms produce that, and only the second
+ * is the dominant one -- see the report sec 2.
+ *
+ * ivh_ka_enabled = 0.  Shadow-first, same posture as ivh_ref_steal_enabled
+ * and ivh_steal_source=2 before it: the per-CPU probes are not even queued
+ * until this is set, so nothing about an unconfigured kernel changes.
+ *
+ * ivh_ka_interval_ns = 100000000 (100 ms) = HALF the default
+ * ivh_uc_window_ns.  Not a freshness target -- a coverage requirement.  A
+ * window containing no probe at all has avail == 0, and ivh_uc_close()'s
+ * "!avail" branch then publishes a PERFECT SCHED_CAPACITY_SCALE into the EMA.
+ * An interval at or above the window would therefore feed "this vCPU is
+ * completely healthy" into exactly the idle vCPUs this mechanism exists to
+ * stop trusting.  Half the window is the loosest setting that still puts a
+ * probe in every window across timer phase drift.
+ *
+ * ivh_ka_probe_ns = 2000000 (2 ms) = two nominal ticks at HZ=1000.  It has to
+ * clear one tick period or the probe can retire without account_process_tick()
+ * ever running, which would make it pure cost.  The second tick is not
+ * margin against phase, it is margin against BIAS: measured converged
+ * capacity on an idle cpu2 whose true value is ~1020 was 975 at a 1 ms probe,
+ * 1013 at 2 ms, 1022 at 8 ms.  The fixed wake-up cost of the probe (IPI,
+ * kworker dispatch, cache-cold restart) is charged as steal against the
+ * probe's own duration, so a probe too short to amortise it under-reports
+ * capacity by ~4.5%.  Do not lower this to save duty cycle; lengthen the
+ * interval instead, which is cheaper per unit of freshness anyway (report
+ * sec 5.3).
+ */
+unsigned long ivh_ka_enabled = 0UL;
+unsigned long ivh_ka_interval_ns = 100000000UL;
+unsigned long ivh_ka_probe_ns = 2000000UL;
 #ifdef CONFIG_X86
 DEFINE_PER_CPU_ALIGNED(struct ivh_lock_halt, ivh_lock_halt);
 EXPORT_PER_CPU_SYMBOL_GPL(ivh_lock_halt);
@@ -307,19 +443,26 @@ EXPORT_PER_CPU_SYMBOL_GPL(ivh_lock_halt);
 void get_steal_and_preemptions(int cpunum,u64* preempt,u64* steals_time){
         struct rq *rq = cpu_rq(cpunum);
         *preempt= rq->preemptions;
-        if (READ_ONCE(ivh_steal_source)) {
-                /*
-                 * Same contract as the paravirt path below and it is
-                 * load-bearing: cumulative-since-boot nanoseconds, remotely
-                 * callable, and MONOTONICALLY NON-DECREASING.  Every consumer
-                 * (NHextend.c's read_vcap_steal() and friends) deltas this
-                 * across a window, so a single backward step underflows a u64
-                 * in userspace and reports a multi-exabyte "steal".
-                 * ivh_ref_accumulate() only ever ADDS a clamped non-negative
-                 * quantity, which is what makes that safe.
-                 */
+        /*
+         * Same contract on every branch below and it is load-bearing:
+         * cumulative-since-boot nanoseconds, remotely callable, and
+         * MONOTONICALLY NON-DECREASING.  Every consumer (NHextend.c's
+         * read_vcap_steal() and friends) deltas this across a window, so a
+         * single backward step underflows a u64 in userspace and reports a
+         * multi-exabyte "steal".  ivh_ref_accumulate() only ever ADDS a
+         * clamped non-negative quantity, and ivh_tick_steal_accumulate()
+         * only ever drains a strictly positive carry, which is what makes
+         * both safe.
+         */
+        switch (READ_ONCE(ivh_steal_source)) {
+        case 2:
+                *steals_time = READ_ONCE(rq->ivh_tks_steal_ns);
+                return;
+        case 1:
                 *steals_time = READ_ONCE(rq->ivh_ref_steal_ns);
                 return;
+        default:
+                break;
         }
 #ifdef CONFIG_PARAVIRT
         *steals_time= paravirt_steal_clock(cpunum);
@@ -422,6 +565,109 @@ EXPORT_SYMBOL(set_avg_latency);
 EXPORT_SYMBOL(reset_max_latency);
 EXPORT_SYMBOL(get_average_capacity_all);
 EXPORT_SYMBOL(set_average_capacity_all);
+
+/*
+ * ivh_idle_ns - cumulative halted (idle + iowait) nanoseconds on @cpu since
+ * boot, from whichever of the kernel's two idle-residency series is actually
+ * populated on this boot.
+ *
+ * ONE source for all four IVH tick estimators (ivh_ref_accumulate(),
+ * ivh_vact_idle_delta_c(), ivh_tick_steal_accumulate(), ivh_uc_tick()), and
+ * that is the point: every one of them computes "wall time minus idle" and
+ * they must never disagree about how much of an interval was idle.  All four
+ * previously open-coded the same two accessor calls and the same bail.
+ *
+ * PREFERRED SOURCE, unchanged: tick_nohz's idle_sleeptime + iowait_sleeptime,
+ * via get_cpu_{idle,iowait}_time_us().  BOTH are required, not one:
+ * tick_nohz_stop_idle() (kernel/time/tick-sched.c) files each idle episode
+ * into exactly one of them (a literal `if (nr_iowait_cpu(...) > 0) ... else
+ * ...`), and the two pass complementary compute_delta predicates down to
+ * get_cpu_sleep_time_us(), so summing them cannot double-count the episode
+ * currently in flight either.  They are derived from ktime_get() at idle
+ * entry/exit and so have real sub-tick resolution.
+ *
+ * FALLBACK, new: kcpustat's CPUTIME_IDLE + CPUTIME_IOWAIT.  Both accessors
+ * return (u64)-1 when !tick_nohz_active -- which is exactly what booting with
+ * `nohz=off` produces, since tick_nohz_activate() returns early on
+ * !tick_nohz_enabled and never sets the flag.  The four callers used to bail
+ * on that, on the reasoning that idle was then "unobtainable" and treating it
+ * as zero would report an idle vCPU as maximally stolen.  That reasoning was
+ * right about the danger and wrong about the availability: idle time IS
+ * obtainable, from the tick-driven accumulator, and fs/proc/stat.c's
+ * get_idle_time()/get_iowait_time() have always done precisely this
+ * substitution for the same reason.  Bailing instead would silently disable
+ * every IVH estimator for the whole boot.
+ *
+ * WHY THE FALLBACK IS NOT MERELY ACCEPTABLE BUT BETTER ON THAT BOOT.  The
+ * standing objection to kcpustat (recorded as "Trap 2" in ivh_ref_accumulate()
+ * before this change) is that account_idle_ticks()' NOHZ catch-up path fills
+ * it in whole-tick quanta, +/-1 ms per idle episode at HZ=1000, landing that
+ * quantisation straight in the inferred steal.  That objection is a statement
+ * about NOHZ, and it evaporates when NOHZ is off: with a periodic tick there
+ * is no catch-up path, account_process_tick() runs on every CPU every tick
+ * including idle ones, and it charges exactly TICK_NSEC per tick split across
+ * steal/user/system/idle -- so idle + busy + steal sums to elapsed exactly,
+ * per tick, with no residue.  Measured on this guest under NOHZ the same sum
+ * came to 7 200 ms of a 10 025 ms window under fragmented load (28% missing);
+ * that hole is the phantom steal documented in
+ * tools/bpf/docs/ivh_solution_search_2026-08-09.md sec 3, and closing it is
+ * the entire reason to boot nohz=off.
+ *
+ * NOT STEAL-TAINTED, checked rather than assumed, because the whole estimator
+ * would invert if it were: account_steal_time() (kernel/sched/cputime.c)
+ * writes CPUTIME_STEAL and nothing else, and account_idle_time() there has no
+ * CONFIG_PARAVIRT path at all.  steal_account_process_time() does consume the
+ * tick's budget BEFORE the idle/user/system split (`cputime -= steal`), so a
+ * partially-stolen idle tick books less than TICK_NSEC of idle -- which is the
+ * correct direction: the un-booked remainder reappears as unexplained avail,
+ * i.e. as steal, which is what it was.
+ *
+ * TWO PROPERTIES THE CALLERS RELY ON, both of which the fallback has:
+ *
+ *  - Monotonic.  kcpustat counters are only ever incremented, so the
+ *    `idle_ns > prev ? idle_ns - prev : 0` clamp every caller applies NEVER
+ *    FIRES on this source.  That matters: those clamps exist for the nohz
+ *    series, whose own kerneldoc admits to backward steps, and a clamp that
+ *    fires asymmetrically is the rectifier that ivh_ref_carry and
+ *    ivh_tks_carry_c exist to undo.  This source cannot rectify anything.
+ *
+ *  - Bounded, non-accumulating phase error.  All four hooks run at the TOP of
+ *    account_process_tick(), before that function books this tick's time, so
+ *    the value read at tick n reflects charges through tick n-1 while the raw
+ *    TSC read alongside it is current.  Under a periodic tick that is a pure
+ *    one-tick shift of a series sampled at the same rate: consecutive deltas
+ *    have identical length and the shift cancels at every window boundary
+ *    except the first and last tick.  It is the same one-tick lag ivh_uc_tick()
+ *    already documents for its kcpustat used_ns, and with this change idle and
+ *    used finally carry the SAME lag instead of different ones.  Do not "fix"
+ *    it by moving the calls after the accounting: that would put them after
+ *    vtime_accounting_enabled_this_cpu()'s early return, which is the NOHZ
+ *    hole the placement exists to avoid.
+ *
+ * SOURCE SWITCH, once per boot, on a NOHZ boot only.  tick_nohz_active goes
+ * 0 -> 1 exactly once (tick_nohz_activate(), during boot when the tick device
+ * goes high-res) and never back; under nohz=off it never moves at all.  At
+ * that single flip the series changes from the kcpustat value (which has been
+ * accumulating boot idle) to the nohz value (which starts near zero), i.e. it
+ * steps BACKWARD, i.e. every caller's non-negative clamp turns it into one
+ * delta of zero.  Cost: one tick on one CPU whose idle is not subtracted, at a
+ * point in boot where the tick is still periodic so that tick's raw-TSC gap is
+ * one nominal tick and the resulting excess is ~0.  Bounded to one tick, once,
+ * per CPU, per boot, absorbed by the signed carry; and it replaces the old
+ * behaviour of producing no signal at all until that moment.
+ */
+static u64 ivh_idle_ns(int cpu)
+{
+	u64 idle_us, iowait_us;
+
+	idle_us   = get_cpu_idle_time_us(cpu, NULL);
+	iowait_us = get_cpu_iowait_time_us(cpu, NULL);
+	if (likely(idle_us != (u64)-1 && iowait_us != (u64)-1))
+		return (idle_us + iowait_us) * NSEC_PER_USEC;
+
+	return kcpustat_cpu(cpu).cpustat[CPUTIME_IDLE]
+	     + kcpustat_cpu(cpu).cpustat[CPUTIME_IOWAIT];
+}
 
 /*
  * ===========================================================================
@@ -644,7 +890,7 @@ void ivh_ref_accumulate(void)
 	struct perf_event *ev = this_cpu_read(ivh_ref_event);
 	struct rq *rq = this_rq();
 	int cpu = smp_processor_id();
-	u64 ref, tsc, idle_us, iowait_us, idle_ns;
+	u64 ref, tsc, idle_ns;
 	u64 d_tsc, d_ref, d_idle_ns, d_idle_c, steal_c;
 	u64 hlt_c, poll_c, d_hlt_c, d_poll_c, sub_c;
 	u64 loc, oth, steal_c_base;
@@ -718,39 +964,20 @@ void ivh_ref_accumulate(void)
 	    + __this_cpu_read(irq_stat.__nmi_count);
 
 	/*
-	 * Trap 1 of three that silently manufacture phantom steal: reading
-	 * only get_cpu_idle_time_us() and missing every iowait episode.
-	 * tick_nohz_stop_idle() (kernel/time/tick-sched.c) puts each idle
-	 * episode into idle_sleeptime OR iowait_sleeptime EXCLUSIVELY -- a
-	 * literal `if (nr_iowait_cpu(...) > 0) ... else ...` -- so the total
-	 * halted time needs BOTH accumulators.  Summing them does not
-	 * double-count the currently-in-progress episode either, which is the
-	 * obvious worry: the two pass complementary compute_delta predicates
-	 * (!nr_iowait_cpu(cpu) vs nr_iowait_cpu(cpu)) down to
-	 * get_cpu_sleep_time_us(), so at most one of them ever adds the pending
-	 * delta.  The sum is the correct total.
+	 * Halted time, from ivh_idle_ns() -- read the long comment on that
+	 * function rather than duplicating it here.  In one line: the nohz
+	 * idle_sleeptime + iowait_sleeptime pair when tick_nohz_active, and
+	 * kcpustat's CPUTIME_IDLE + CPUTIME_IOWAIT when it is not (`nohz=off`),
+	 * which is the only case where those quanta are exact rather than
+	 * catch-up-rounded.
 	 *
-	 * Trap 2: NOT kcpustat_cpu(cpu).cpustat[CPUTIME_IDLE].  The nohz
-	 * catch-up path that fills it, account_idle_ticks(), is tick-quantized
-	 * (ticks * TICK_NSEC) -- +/-1 ms per idle episode at HZ=1000, landing
-	 * directly in the inferred steal.  These two are derived from
-	 * ktime_get() at idle entry/exit and have real resolution.
-	 *
-	 * Both return (u64)-1 when !tick_nohz_active, in which case idle time
-	 * is simply not obtainable and the whole subtraction is meaningless --
-	 * every idle nanosecond would be reported as steal.  Bail loudly into
-	 * `skipped` rather than quietly returning a wrong number.  (This case
-	 * is not reachable on this guest -- CONFIG_NO_HZ_COMMON=y and idle
-	 * dynticks are active -- but the failure it would cause is exactly the
-	 * kind that gets mistaken for a real measurement.)
+	 * This used to bail into `skipped` on the !tick_nohz_active case.  It
+	 * no longer can, so ivh_ref_skipped now counts only the two genuine
+	 * no-reading conditions above (no tsc_khz, no PMU reading); nothing
+	 * downstream depends on it counting this third one, which was never
+	 * reachable on a NOHZ boot anyway.
 	 */
-	idle_us   = get_cpu_idle_time_us(cpu, NULL);
-	iowait_us = get_cpu_iowait_time_us(cpu, NULL);
-	if (unlikely(idle_us == (u64)-1 || iowait_us == (u64)-1)) {
-		rq->ivh_ref_skipped++;
-		return;
-	}
-	idle_ns = (idle_us + iowait_us) * NSEC_PER_USEC;
+	idle_ns = ivh_idle_ns(cpu);
 
 	if (unlikely(!rq->ivh_ref_prev_tsc)) {
 		rq->ivh_ref_skipped++;
@@ -1081,17 +1308,232 @@ static int ivh_ref_proc_steal_source(const struct ctl_table *table, int write,
 	if (ret || !write)
 		return ret;
 
-	if (val > 1) {
-		pr_err("IVH: refusing ivh_steal_source=%lu: valid values are 0 (paravirt_steal_clock, host truth) and 1 (inferred REF_TSC)\n",
+	if (val > 2) {
+		pr_err("IVH: refusing ivh_steal_source=%lu: valid values are 0 (paravirt_steal_clock, host truth), 1 (inferred REF_TSC) and 2 (inferred tick-gap, CVM-safe)\n",
 		       val);
 		return -EINVAL;
 	}
-	if (val && !READ_ONCE(ivh_ref_steal_enabled)) {
+	/*
+	 * Only source 1 carries this precondition.  Source 2 deliberately has
+	 * no equivalent: ivh_tick_steal_accumulate() runs unconditionally from
+	 * the tick, needs no perf event, and is therefore never frozen -- which
+	 * is the entire reason it exists, since a confidential VM may offer
+	 * neither the vPMU that source 1 needs nor the steal page source 0
+	 * reads.
+	 */
+	if (val == 1 && !READ_ONCE(ivh_ref_steal_enabled)) {
 		pr_err("IVH: refusing ivh_steal_source=1 while ivh_ref_steal_enabled=0: the inferred counter is not running, so it would return a frozen value forever. Enable it first and validate against /proc/vcap_steal_compare.\n");
 		return -EINVAL;
 	}
 
 	WRITE_ONCE(ivh_steal_source, val);
+	return 0;
+}
+
+/*
+ * Bound the phase correction at one whole tick.  Above 100 the estimator
+ * would credit more unobserved steal than a whole tick period can contain,
+ * which is not a stronger correction but an arithmetically impossible one --
+ * the same "mode selector, not a magnitude" reasoning ivh_ref_proc_method()
+ * records for its own range check.
+ */
+static int ivh_tks_proc_phase_pct(const struct ctl_table *table, int write,
+				  void *buffer, size_t *lenp, loff_t *ppos)
+{
+	unsigned long val = READ_ONCE(ivh_tks_phase_pct);
+	struct ctl_table tmp = *table;
+	int ret;
+
+	tmp.data = &val;
+	ret = proc_doulongvec_minmax(&tmp, write, buffer, lenp, ppos);
+	if (ret || !write)
+		return ret;
+
+	if (val > 100) {
+		pr_err("IVH: refusing ivh_tks_phase_pct=%lu: valid range is 0..100 percent of one tick period (0 = shipped default, 50 = the phase-unbiased value that measured WORSE, see tools/bpf/docs/ivh_cvm_steal_detector_2026-08-08.md)\n",
+		       val);
+		return -EINVAL;
+	}
+
+	WRITE_ONCE(ivh_tks_phase_pct, val);
+	return 0;
+}
+
+static void ivh_ka_start_all(void);
+
+/*
+ * The coverage invariant, enforced from BOTH knobs that can break it because
+ * either write order can be the one that breaks it.
+ *
+ * An ivh_uc window that contains no keepalive probe accumulates avail == 0,
+ * and ivh_uc_close()'s "!avail" branch publishes a full SCHED_CAPACITY_SCALE
+ * -- a perfect-health sample -- into the EMA.  That failure is not a missed
+ * measurement, it is an actively WRONG one, and it points the wrong way:
+ * it makes an unmeasured idle vCPU look like the most attractive migration
+ * destination available, which is precisely the outcome this whole mechanism
+ * exists to prevent.  Refusing the configuration is therefore the only safe
+ * response; clamping would silently ship a different mechanism than the
+ * operator asked for.
+ */
+static bool ivh_ka_interval_covers_window(unsigned long interval_ns)
+{
+	unsigned long win = READ_ONCE(ivh_uc_window_ns);
+
+	if (interval_ns * 2 <= win)
+		return true;
+
+	pr_err("IVH: refusing ivh_ka_interval_ns=%lu against ivh_uc_window_ns=%lu: the interval must be at most HALF the window (%lu) or timer phase drift leaves some windows with no probe at all, and ivh_uc_close() publishes a perfect 1024 for an empty window -- see tools/bpf/docs/ivh_idle_keepalive_2026-08-08.md sec 5.2\n",
+	       interval_ns, win, win / 2);
+	return false;
+}
+
+static int ivh_ka_proc_interval_ns(const struct ctl_table *table, int write,
+				   void *buffer, size_t *lenp, loff_t *ppos)
+{
+	unsigned long val = READ_ONCE(ivh_ka_interval_ns);
+	struct ctl_table tmp = *table;
+	int ret;
+
+	tmp.data = &val;
+	ret = proc_doulongvec_minmax(&tmp, write, buffer, lenp, ppos);
+	if (ret || !write)
+		return ret;
+
+	/*
+	 * Floor at 4 ticks so the interval can always hold a probe that clears
+	 * one tick with room to spare; ceiling at 10s is arbitrary but keeps
+	 * nsecs_to_jiffies() far from anything interesting.
+	 */
+	if (val < 4 * (unsigned long)TICK_NSEC || val > 10000000000UL) {
+		pr_err("IVH: refusing ivh_ka_interval_ns=%lu: valid range is %lu..10000000000 (4 ticks .. 10s)\n",
+		       val, 4 * (unsigned long)TICK_NSEC);
+		return -EINVAL;
+	}
+	if (!ivh_ka_interval_covers_window(val))
+		return -EINVAL;
+	if (val <= READ_ONCE(ivh_ka_probe_ns)) {
+		pr_err("IVH: refusing ivh_ka_interval_ns=%lu: must exceed ivh_ka_probe_ns=%lu\n",
+		       val, READ_ONCE(ivh_ka_probe_ns));
+		return -EINVAL;
+	}
+
+	WRITE_ONCE(ivh_ka_interval_ns, val);
+	return 0;
+}
+
+static int ivh_ka_proc_probe_ns(const struct ctl_table *table, int write,
+				void *buffer, size_t *lenp, loff_t *ppos)
+{
+	unsigned long val = READ_ONCE(ivh_ka_probe_ns);
+	struct ctl_table tmp = *table;
+	int ret;
+
+	tmp.data = &val;
+	ret = proc_doulongvec_minmax(&tmp, write, buffer, lenp, ppos);
+	if (ret || !write)
+		return ret;
+
+	/*
+	 * Below one tick period the probe can begin and retire inside a single
+	 * tick interval without account_process_tick() ever running, which
+	 * makes it pure cost with no measurement -- the one outcome that is
+	 * strictly worse than not probing.  Rejected rather than clamped for
+	 * the same reason as above.  Half the interval is a sanity ceiling: a
+	 * keepalive at a >50% duty cycle is not a keepalive.
+	 */
+	if (val <= (unsigned long)TICK_NSEC) {
+		pr_err("IVH: refusing ivh_ka_probe_ns=%lu: must exceed one tick period (%lu ns) or the probe can retire without account_process_tick() running at all\n",
+		       val, (unsigned long)TICK_NSEC);
+		return -EINVAL;
+	}
+	if (val * 2 > READ_ONCE(ivh_ka_interval_ns)) {
+		pr_err("IVH: refusing ivh_ka_probe_ns=%lu: must be at most half of ivh_ka_interval_ns=%lu\n",
+		       val, READ_ONCE(ivh_ka_interval_ns));
+		return -EINVAL;
+	}
+	if (val < 2 * (unsigned long)TICK_NSEC)
+		pr_warn("IVH: ivh_ka_probe_ns=%lu is under two tick periods; measured capacity under-reports by ~4.5%% at one tick because the probe's fixed wake-up cost is charged as steal against its own duration (ivh_idle_keepalive_2026-08-08.md sec 5.4)\n",
+			val);
+
+	WRITE_ONCE(ivh_ka_probe_ns, val);
+	return 0;
+}
+
+/*
+ * Enabling the keepalive is refused while ivh_uc_enabled=0 for the same
+ * reason ivh_steal_source=1 is refused while ivh_ref_steal_enabled=0 above:
+ * the mechanism exists solely to keep rq->ivh_uc_capacity fresh, it detects
+ * staleness by reading rq->ivh_uc_prev_tsc which only ivh_uc_tick() writes,
+ * and with ivh_uc off that timestamp never advances -- so every probe would
+ * fire, forever, measuring nothing.  Pure cost is not a safe default state to
+ * let an operator configure by accident.
+ */
+static int ivh_ka_proc_enabled(const struct ctl_table *table, int write,
+			       void *buffer, size_t *lenp, loff_t *ppos)
+{
+	unsigned long val = READ_ONCE(ivh_ka_enabled);
+	struct ctl_table tmp = *table;
+	unsigned long interval, probe, duty_pct, min_avail;
+	int ret;
+
+	tmp.data = &val;
+	ret = proc_doulongvec_minmax(&tmp, write, buffer, lenp, ppos);
+	if (ret || !write)
+		return ret;
+
+	if (val > 1) {
+		pr_err("IVH: refusing ivh_ka_enabled=%lu: valid values are 0 (off) and 1 (on)\n",
+		       val);
+		return -EINVAL;
+	}
+	if (!val) {
+		/*
+		 * No cancel_delayed_work() here and none needed: ivh_ka_fn()
+		 * re-arms itself only while enabled, so clearing the flag lets
+		 * every in-flight probe retire naturally within one interval.
+		 * Cancelling would have to be per-CPU and synchronous to be
+		 * worth anything, and would buy at most 100 ms.
+		 */
+		WRITE_ONCE(ivh_ka_enabled, 0);
+		return 0;
+	}
+
+	if (!READ_ONCE(ivh_uc_enabled)) {
+		pr_err("IVH: refusing ivh_ka_enabled=1 while ivh_uc_enabled=0: the keepalive only exists to keep rq->ivh_uc_capacity fresh and detects staleness via rq->ivh_uc_prev_tsc, which ivh_uc_tick() alone writes. It would burn CPU on every idle vCPU and measure nothing.\n");
+		return -EINVAL;
+	}
+	interval = READ_ONCE(ivh_ka_interval_ns);
+	probe    = READ_ONCE(ivh_ka_probe_ns);
+	if (!ivh_ka_interval_covers_window(interval))
+		return -EINVAL;
+
+	/*
+	 * The duty-cycle/min-avail interaction, warned about rather than
+	 * refused because ivh_uc_min_avail_pct is somebody else's knob and a
+	 * degraded publish cadence is still an improvement over none.
+	 *
+	 * ivh_uc_maybe_close_window() extends any window whose avail is under
+	 * ivh_uc_min_avail_pct of the window.  On an otherwise idle vCPU ALL
+	 * the avail there is comes from this probe, so avail/window is exactly
+	 * the keepalive duty cycle, and if that is under the threshold no
+	 * window ever closes no matter how reliably the probes fire.  Measured
+	 * (report sec 5.2), publish interval tracked
+	 * window * min_avail_pct / (100 * duty) across a 40x range: 1.08% duty
+	 * against the default 10% threshold gave 1.82 s per publish where the
+	 * model says 1.85 s.  This was the DOMINANT term in the original
+	 * staleness, well ahead of the missing ticks.
+	 */
+	duty_pct  = probe * 100 / interval;
+	min_avail = READ_ONCE(ivh_uc_min_avail_pct);
+	if (duty_pct < min_avail)
+		pr_warn("IVH: ivh_ka duty cycle is %lu%% (probe %lu / interval %lu) but ivh_uc_min_avail_pct=%lu: windows on idle vCPUs will still be EXTENDED rather than published, at roughly %lu ms per publish instead of %lu ms. Lower ivh_uc_min_avail_pct to at most %lu to get the full benefit.\n",
+			duty_pct, probe, interval, min_avail,
+			(READ_ONCE(ivh_uc_window_ns) / 1000000UL) * min_avail /
+				(duty_pct ? duty_pct : 1),
+			READ_ONCE(ivh_uc_window_ns) / 1000000UL, duty_pct);
+
+	WRITE_ONCE(ivh_ka_enabled, 1);
+	ivh_ka_start_all();
 	return 0;
 }
 
@@ -1204,6 +1646,64 @@ static const struct ctl_table ivh_ref_sysctls[] = {
 		.maxlen		= sizeof(unsigned long),
 		.mode		= 0644,
 		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_tks_deadband_ns",
+		.data		= &ivh_tks_deadband_ns,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_tks_phase_pct",
+		.data		= &ivh_tks_phase_pct,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= ivh_tks_proc_phase_pct,
+	},
+	{
+		.procname	= "ivh_tks_carry_ticks",
+		.data		= &ivh_tks_carry_ticks,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		/*
+		 * No .extra1/.extra2: SYSCTL_ZERO/SYSCTL_ONE are `int *` and
+		 * proc_doulongvec_minmax() dereferences its extras as
+		 * `unsigned long *`, which reads four bytes of adjacent
+		 * rodata as the high half of the bound.  Every other
+		 * unsigned-long IVH knob here (ivh_tks_carry_ticks,
+		 * ivh_tks_deadband_ns) omits them for the same reason; the
+		 * consumer treats any nonzero value as "subtract".
+		 */
+		.procname	= "ivh_tks_idle_sub",
+		.data		= &ivh_tks_idle_sub,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_ka_enabled",
+		.data		= &ivh_ka_enabled,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= ivh_ka_proc_enabled,
+	},
+	{
+		.procname	= "ivh_ka_interval_ns",
+		.data		= &ivh_ka_interval_ns,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= ivh_ka_proc_interval_ns,
+	},
+	{
+		.procname	= "ivh_ka_probe_ns",
+		.data		= &ivh_ka_probe_ns,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= ivh_ka_proc_probe_ns,
 	},
 };
 #endif /* CONFIG_SYSCTL */
@@ -1470,16 +1970,18 @@ static u64 ivh_vact_gap_split(struct rq *rq, u64 avail, u64 tick_c)
 
 /*
  * ivh_vact_idle_delta_c - cycles this CPU spent halted in the IDLE LOOP since
- * the previous armed tick.  Returns U64_MAX when idle time is not obtainable,
- * which the caller treats as "do not run the split at all".
+ * the previous armed tick.
  *
- * Same two source accessors, and the same two traps, that ivh_ref_accumulate()
- * documents at length one screen up -- read that comment rather than
- * duplicating it here.  In one line each: BOTH idle_sleeptime and
- * iowait_sleeptime are needed because tick_nohz_stop_idle() puts each episode
- * in exactly one of them; and NOT kcpustat's CPUTIME_IDLE, which is
- * tick-quantised to +/-1 ms per episode and would land that quantisation
- * straight in the capacity ratio.
+ * Source is ivh_idle_ns(); read that function's comment rather than
+ * duplicating it here.
+ *
+ * The U64_MAX return is RETAINED as a contract but is now UNREACHABLE: it
+ * meant "idle time is not obtainable", which was true only on the
+ * !tick_nohz_active path that ivh_idle_ns() now serves from kcpustat instead.
+ * The caller's handling of it (disarm the split for this tick and fall back to
+ * the validated ivh_vact_residual == 0 arithmetic) is deliberately left in
+ * place as the belt to that braces: if a future source is added that really
+ * can fail, the safe response is already written.
  *
  * NOT read from rq->ivh_ref_* even though ivh_ref_accumulate() computes the
  * identical delta one call earlier on this very tick.  Doing so would make
@@ -1499,15 +2001,9 @@ static u64 ivh_vact_gap_split(struct rq *rq, u64 avail, u64 tick_c)
  */
 static u64 ivh_vact_idle_delta_c(struct rq *rq)
 {
-	int cpu = cpu_of(rq);
-	u64 idle_us, iowait_us, idle_ns, prev;
+	u64 idle_ns, prev;
 
-	idle_us   = get_cpu_idle_time_us(cpu, NULL);
-	iowait_us = get_cpu_iowait_time_us(cpu, NULL);
-	if (unlikely(idle_us == (u64)-1 || iowait_us == (u64)-1))
-		return U64_MAX;			/* !tick_nohz_active: unusable */
-
-	idle_ns = (idle_us + iowait_us) * NSEC_PER_USEC;
+	idle_ns = ivh_idle_ns(cpu_of(rq));
 	prev = rq->ivh_vact_prev_idle_ns;
 	rq->ivh_vact_prev_idle_ns = idle_ns;
 
@@ -1830,6 +2326,185 @@ EXPORT_SYMBOL_GPL(get_vact_compare);
  */
 
 /*
+ * ivh_tick_steal_accumulate - fold one tick's worth of tick-gap steal into
+ * rq->ivh_tks_steal_ns.  ivh_steal_source=2, the CVM-safe estimator.
+ *
+ * Called from account_process_tick() (kernel/sched/cputime.c) on the owning
+ * CPU with IRQs already disabled, immediately after ivh_ref_accumulate().
+ *
+ * THE MECHANISM.  A tick fires when a TSC-deadline interrupt is DELIVERED,
+ * and delivery only happens once the vCPU is actually running.  Raw TSC, by
+ * contrast, keeps advancing while the host has the vCPU descheduled.  So for
+ * consecutive tick deliveries T1, T2:
+ *
+ *     excess = (T2 - T1) - idle_in_interval - TICK_NSEC
+ *
+ * is time that elapsed in the world, was not idle, and was not the one tick
+ * of execution the delivery itself evidences -- i.e. time the vCPU wanted
+ * the CPU and did not have it.  Every input is guest-local: raw TSC, the
+ * NOHZ idle residency series, and a compile-time constant.  Nothing is read
+ * from the kvm_steal_time page and nothing from the vPMU, which is the whole
+ * point: both may be absent or untrusted under TDX/SEV-SNP.
+ *
+ * IDLE IS SUBTRACTED FIRST AND THAT IS NOT A REFINEMENT, IT IS THE
+ * DIFFERENCE BETWEEN THIS WORKING AND NOT WORKING.  Under NOHZ an idle vCPU
+ * stops ticking, so idle produces exactly the same signature as preemption:
+ * a large raw-TSC gap between deliveries.  Measured on this guest, 34% of
+ * tick intervals on a vCPU with 0.2% steal exceeded 1.5 nominal ticks, all
+ * of it idle.  A detector that skipped this term would report a mostly-idle
+ * vCPU as catastrophically stolen.
+ *
+ * THE BIAS, STATED PLAINLY.  A preemption of duration D beginning at offset
+ * s into the interval only delays delivery if it spans the deadline, and
+ * then T2-T1 = s+D, so excess = s+D-TICK_NSEC, which understates D by
+ * (TICK_NSEC - s).  Averaged over uniform phase that is half a tick, so the
+ * unbiased estimator is (T2-T1) - 0.5*TICK_NSEC and this one reads low.  A
+ * preemption shorter than one tick that resolves before the deadline is
+ * never seen at all.  Both are structural properties of piggybacking on
+ * deadline delivery, not defects to be patched here.
+ *
+ * WHY THE UNBIASED FORM IS NOT THE DEFAULT.  ivh_tks_phase_pct exists to add
+ * that half tick back and defaults to 0 anyway; the reasoning and the
+ * measured numbers are on the sysctl's definition above.  Short version: the
+ * correction is only sound on intervals where a preemption really did span
+ * the deadline, the deadband cannot prove that, and it multiplies every
+ * false positive by 500 us.
+ *
+ * WHY THE CARRY IS SIGNED.  Clamping each tick's excess at zero
+ * independently would rectify symmetric accounting noise into a positive
+ * mean -- the same trap ivh_ref_carry exists to avoid in
+ * ivh_ref_accumulate(), and the reason ivh_tks_carry_c is s64 and negative
+ * residue is kept rather than discarded.  It is floored at
+ * ivh_tks_carry_ticks nominal ticks so a long idle stretch cannot bank an
+ * unbounded debt that silently suppresses the next real preemption.
+ *
+ * The OUTPUT contract is the one get_steal_and_preemptions() documents:
+ * cumulative-since-boot nanoseconds, monotonically non-decreasing.  Only a
+ * strictly positive carry is ever drained into it.
+ */
+void ivh_tick_steal_accumulate(void)
+{
+	struct rq *rq = this_rq();
+	int cpu = smp_processor_id();
+	u64 now, idle_ns, d_idle_c, avail_c, tick_c;
+	s64 excess_c, carry, floor_c;
+
+	if (unlikely(!tsc_khz)) {
+		rq->ivh_tks_skipped++;
+		return;
+	}
+
+	now = ivh_raw_tsc();
+
+	/*
+	 * Halted time, from ivh_idle_ns().  This site is the one the whole
+	 * fallback exists for: `nohz=off` is the structural cure for the
+	 * phantom steal this function produces (tools/bpf/docs/
+	 * ivh_solution_search_2026-08-09.md sec 3 and sec 8) -- with a periodic
+	 * tick, consecutive deliveries are exactly TICK_NSEC apart absent
+	 * preemption, so avail_c = TICK - idle <= TICK and excess_c <= 0 for any
+	 * vCPU that is not being preempted, and un-ticked busy time (the entire
+	 * mechanism of the phantom) cannot exist because there is no such thing
+	 * as un-ticked time.  But `nohz=off` also clears tick_nohz_active, and
+	 * this function used to bail on every single tick when that is clear --
+	 * so the boot parameter alone would have silently produced a
+	 * permanently-zero estimator rather than a fixed one.  That is the bug
+	 * this fallback prevents, and it is why the two must ship together.
+	 */
+	idle_ns = ivh_idle_ns(cpu);
+
+	if (unlikely(!rq->ivh_tks_prev_tsc)) {
+		rq->ivh_tks_skipped++;
+		goto seed;			/* first tick: no delta yet */
+	}
+
+	/*
+	 * SANITY FLOOR, same reasoning and same provenance as the identical
+	 * check in ivh_vact_tick() and ivh_uc_maybe_close_window(): this exact
+	 * conversion returned 1 in a shipped binary because TICK_NSEC and
+	 * USEC_PER_SEC are numerically equal at CONFIG_HZ=1000 and GCC aliased
+	 * them into one register.  A tick period under 1000 cycles implies a
+	 * sub-1 MHz TSC, which does not exist.  Here a wrong tick_c would not
+	 * add noise, it would make every interval look like pure steal.
+	 */
+	tick_c = ivh_tsc_ns_to_cycles(TICK_NSEC);
+	if (unlikely(tick_c < 1000)) {
+		rq->ivh_tks_skipped++;
+		goto seed;
+	}
+
+	/*
+	 * ivh_tks_idle_sub == 0 drops the idle subtraction entirely, which is
+	 * the correct form once the tick is periodic -- the raw inter-delivery
+	 * gap is already the delay, on an idle vCPU as much as a busy one.  The
+	 * delta is still computed and still seeds prev_idle_ns either way, so
+	 * the two modes stay switchable at runtime without a discontinuity in
+	 * the series.  See the sysctl's definition for why this is not simply
+	 * conditioned on tick_nohz_active.
+	 */
+	d_idle_c = ivh_tsc_ns_to_cycles(idle_ns > rq->ivh_tks_prev_idle_ns
+					? idle_ns - rq->ivh_tks_prev_idle_ns : 0);
+	if (!READ_ONCE(ivh_tks_idle_sub))
+		d_idle_c = 0;
+
+	avail_c  = now - rq->ivh_tks_prev_tsc;
+	avail_c  = (avail_c > d_idle_c) ? avail_c - d_idle_c : 0;
+
+	excess_c = (s64)avail_c - (s64)tick_c;
+	if (excess_c > (s64)ivh_tsc_ns_to_cycles(READ_ONCE(ivh_tks_deadband_ns))) {
+		unsigned long pct = READ_ONCE(ivh_tks_phase_pct);
+
+		if (pct)
+			excess_c += (s64)div64_u64(tick_c * pct, 100);
+		rq->ivh_tks_events++;
+	}
+
+	carry = rq->ivh_tks_carry_c + excess_c;
+	if (carry > 0) {
+		rq->ivh_tks_steal_ns += ivh_tsc_cycles_to_ns((u64)carry);
+		carry = 0;
+	} else {
+		/*
+		 * clamp_val() before the multiply, not after: ivh_tks_carry_ticks
+		 * is a plain proc_doulongvec_minmax sysctl with no range of its
+		 * own, and tick_c * ULONG_MAX would wrap into a POSITIVE s64 --
+		 * turning the debt floor into a debt ceiling and letting the
+		 * carry run away in the one direction this clamp exists to
+		 * prevent.  10000 nominal ticks is ten seconds at HZ=1000, far
+		 * beyond any useful setting and ~2.2e10 cycles, which is nowhere
+		 * near overflowing s64.
+		 */
+		floor_c = -(s64)(tick_c * clamp_val(READ_ONCE(ivh_tks_carry_ticks),
+						    1UL, 10000UL));
+		if (carry < floor_c)
+			carry = floor_c;
+	}
+	rq->ivh_tks_carry_c = carry;
+	rq->ivh_tks_samples++;
+
+seed:
+	rq->ivh_tks_prev_tsc     = now;
+	rq->ivh_tks_prev_idle_ns = idle_ns;
+}
+
+/*
+ * Side-by-side comparator feed, shipped with no in-tree caller for the same
+ * reason get_vact_compare() and get_uc_compare() are.
+ */
+void get_tks_compare(int cpunum, u64 *steal_ns, u64 *samples,
+		     u64 *events, u64 *skipped, s64 *carry_c)
+{
+	struct rq *rq = cpu_rq(cpunum);
+
+	*steal_ns = READ_ONCE(rq->ivh_tks_steal_ns);
+	*samples  = READ_ONCE(rq->ivh_tks_samples);
+	*events   = READ_ONCE(rq->ivh_tks_events);
+	*skipped  = READ_ONCE(rq->ivh_tks_skipped);
+	*carry_c  = READ_ONCE(rq->ivh_tks_carry_c);
+}
+EXPORT_SYMBOL_GPL(get_tks_compare);
+
+/*
  * ivh_uc_steal_ns - the same steal number vcap itself consumes.
  *
  * Deliberately honours the existing global ivh_steal_source rather than a
@@ -1845,8 +2520,14 @@ EXPORT_SYMBOL_GPL(get_vact_compare);
  */
 static __always_inline u64 ivh_uc_steal_ns(int cpu)
 {
-	if (READ_ONCE(ivh_steal_source))
+	switch (READ_ONCE(ivh_steal_source)) {
+	case 2:
+		return READ_ONCE(cpu_rq(cpu)->ivh_tks_steal_ns);
+	case 1:
 		return READ_ONCE(cpu_rq(cpu)->ivh_ref_steal_ns);
+	default:
+		break;
+	}
 #ifdef CONFIG_PARAVIRT
 	return paravirt_steal_clock(cpu);
 #else
@@ -2083,7 +2764,7 @@ void ivh_uc_tick(void)
 {
 	struct rq *rq = this_rq();
 	int cpu = smp_processor_id();
-	u64 now, idle_us, iowait_us, idle_ns, steal_ns, used_ns;
+	u64 now, idle_ns, steal_ns, used_ns;
 	u64 d_elapsed_c, d_idle_c, d_steal_c, d_used_c, avail_c, used_c;
 
 	if (unlikely(!READ_ONCE(ivh_uc_enabled)))
@@ -2095,13 +2776,18 @@ void ivh_uc_tick(void)
 
 	now = ivh_raw_tsc();
 
-	idle_us   = get_cpu_idle_time_us(cpu, NULL);
-	iowait_us = get_cpu_iowait_time_us(cpu, NULL);
-	if (unlikely(idle_us == (u64)-1 || iowait_us == (u64)-1)) {
-		rq->ivh_uc_skipped++;		/* !tick_nohz_active: idle unobtainable */
-		return;				/* do NOT touch prev_*: next sample spans the gap */
-	}
-	idle_ns  = (idle_us + iowait_us) * NSEC_PER_USEC;
+	/*
+	 * Halted time, from ivh_idle_ns() (kcpustat CPUTIME_IDLE + CPUTIME_IOWAIT
+	 * when !tick_nohz_active, i.e. under `nohz=off`) instead of the bail this
+	 * used to take.  Note what that does to the paragraph above about the
+	 * one-tick lag: on the fallback source idle_ns and used_ns are BOTH
+	 * kcpustat accumulators read at the same instant on the same tick, so
+	 * they carry the identical lag and the WALL and ACCT numerators are
+	 * finally sampled in phase with each other.  Only d_elapsed_c (raw TSC)
+	 * is current, and under a periodic tick its per-interval length is
+	 * constant, so the shift cancels at every window boundary.
+	 */
+	idle_ns  = ivh_idle_ns(cpu);
 	steal_ns = ivh_uc_steal_ns(cpu);
 	used_ns  = kcpustat_this_cpu->cpustat[CPUTIME_USER]
 		 + kcpustat_this_cpu->cpustat[CPUTIME_NICE]
@@ -2221,6 +2907,213 @@ static int __init ivh_uc_avgcap_init(void)
 	return 0;
 }
 late_initcall(ivh_uc_avgcap_init);
+
+/*
+ * ---------------------------------------------------------------------------
+ * IVH "ka" (idle keepalive): keep ivh_uc_capacity fresh on idle vCPUs.
+ * tools/bpf/docs/ivh_idle_keepalive_2026-08-08.md.
+ * ---------------------------------------------------------------------------
+ *
+ * WHY A SPIN AND NOT A PING, WHICH IS THE WHOLE DESIGN.  The obvious cheap
+ * fix -- an hrtimer that wakes the idle vCPU and calls ivh_uc_tick() directly
+ * -- cannot work, for a reason that is structural rather than a matter of
+ * tuning, and it is worth stating before the code so nobody re-derives the
+ * cheap version and wonders why it publishes nothing:
+ *
+ *   ivh_uc's ratio is used/avail where avail is elapsed-minus-idle, i.e. the
+ *   time this vCPU WANTED the CPU.  A halted vCPU wants nothing, so avail is
+ *   zero however often it is interrupted, and a zero-avail window is not a
+ *   measurement of a healthy CPU, it is not a measurement at all.  The same
+ *   is true one level down: all three ivh_steal_source estimators are blind
+ *   on a halted vCPU by construction.  Source 0 reads a host counter that
+ *   only advances while the vCPU is RUNNABLE-and-not-running, and a halted
+ *   vCPU is not runnable, so the host has nothing to charge it.  Sources 1
+ *   and 2 accumulate only from account_process_tick(), which a halted vCPU
+ *   does not reach.  Contention on the underlying pCPU is therefore not
+ *   merely unmeasured while we idle, it is unmeasurABLE.
+ *
+ * The only thing that makes host contention observable is genuinely demanding
+ * the CPU and seeing how much of it arrives.  That is what the retired vcap
+ * daemon's SCHED_IDLE spinners were actually for, and it is why this is a
+ * bounded busy-wait rather than a timer callback.  Being real demand is also
+ * what makes it work under every ivh_steal_source without knowing which one
+ * is selected: it restarts the tick, and whichever estimator is armed then
+ * accumulates on its own normal path.  Nothing here reads or selects a steal
+ * source.
+ *
+ * WHY A KWORKER.  The probe must run in a context that can spin for
+ * milliseconds without blocking interrupts or softirqs on the CPU it is
+ * measuring, and it must itself be a runnable task -- both so the vCPU leaves
+ * idle in the scheduler's own view and so that a host preemption during the
+ * probe is charged to a runnable vCPU where source 0 can see it.  A per-CPU
+ * delayed_work satisfies all of that with the timer wake-up built in, and is
+ * the same mechanism ivh_uc_avgcap_work above already uses.  Deliberately
+ * system_percpu_wq at normal priority and not system_highpri_wq: the probe
+ * must YIELD to real work, never preempt it.
+ */
+struct ivh_ka_state {
+	struct delayed_work work;
+	int cpu;
+	u64 probes;		/* probes actually spun */
+	u64 skipped_fresh;	/* wake-ups where the CPU was already ticking */
+	u64 aborted;		/* probes cut short because real work arrived */
+	u64 spin_ns;		/* cumulative wall time spent spinning */
+	u64 misdispatched;	/* ran on the wrong CPU (offline at queue time) */
+};
+static DEFINE_PER_CPU(struct ivh_ka_state, ivh_ka);
+
+static void ivh_ka_arm(struct ivh_ka_state *ka)
+{
+	unsigned long delay = nsecs_to_jiffies(READ_ONCE(ivh_ka_interval_ns));
+
+	queue_delayed_work_on(ka->cpu, system_percpu_wq, &ka->work,
+			      delay ? delay : 1);
+}
+
+/*
+ * The probe.  Spins on the RAW TSC, not on any accumulated-time helper,
+ * because raw TSC is the one clock that keeps advancing while the host has
+ * this vCPU descheduled -- which means a probe that is preempted for longer
+ * than its own budget returns immediately on resume rather than making up the
+ * lost execution.  The cost of a probe is therefore bounded by probe_ns of
+ * WALL time even under heavy host contention, exactly when adding load would
+ * be worst.  The steal it just experienced is not lost by returning early: it
+ * was already recorded by whichever tick fired during the preemption.
+ *
+ * Both abort conditions exist to keep constraint 4 (never add overhead to a
+ * vCPU that is already busy) true even when the CPU stops being idle mid-probe.
+ * need_resched() alone is not sufficient -- a woken task that does not win the
+ * wake-up preemption check sets no such flag but is still real work waiting
+ * behind a probe that has nothing left to learn.
+ */
+static void ivh_ka_probe(struct ivh_ka_state *ka)
+{
+	struct rq *rq = cpu_rq(ka->cpu);
+	u64 start = ivh_raw_tsc();
+	u64 deadline = start + ivh_tsc_ns_to_cycles(READ_ONCE(ivh_ka_probe_ns));
+	u64 now = start;
+
+	ka->probes++;
+	for (;;) {
+		now = ivh_raw_tsc();
+		if ((s64)(now - deadline) >= 0)
+			break;
+		if (need_resched() || READ_ONCE(rq->nr_running) > 1) {
+			ka->aborted++;
+			break;
+		}
+		cpu_relax();
+	}
+	ka->spin_ns += ivh_tsc_cycles_to_ns(now - start);
+}
+
+static void ivh_ka_fn(struct work_struct *work)
+{
+	struct ivh_ka_state *ka = container_of(to_delayed_work(work),
+					       struct ivh_ka_state, work);
+	struct rq *rq;
+	u64 now, last;
+
+	/*
+	 * Returning WITHOUT re-arming is how ivh_ka_enabled=0 takes effect;
+	 * there is no cancel path anywhere else.  Every chain therefore drains
+	 * within one interval of the flag clearing.
+	 */
+	if (!READ_ONCE(ivh_ka_enabled))
+		return;
+
+	/*
+	 * queue_delayed_work_on() against a CPU that went offline falls back
+	 * to running the item elsewhere.  Probing the CPU we happen to have
+	 * landed on would measure the wrong rq and, worse, add load to a CPU
+	 * that never asked for it, so count it and re-arm instead.
+	 */
+	if (unlikely(smp_processor_id() != ka->cpu)) {
+		ka->misdispatched++;
+		goto rearm;
+	}
+	if (unlikely(!tsc_khz))
+		goto rearm;
+
+	rq = cpu_rq(ka->cpu);
+
+	/*
+	 * THE TARGETING TEST, and the reason this needs no idle-entry or
+	 * idle-exit hook at all.  rq->ivh_uc_prev_tsc is written by
+	 * ivh_uc_tick() on every tick, so "how long since that timestamp" IS
+	 * the staleness this mechanism exists to bound -- the quantity is
+	 * measured directly rather than inferred from an idle transition.  A
+	 * CPU that has ticked within the last interval needs nothing and costs
+	 * nothing but this comparison.
+	 *
+	 * Hooking idle entry/exit instead was considered and is worse on its
+	 * own terms: a bursty vCPU crosses those paths thousands of times a
+	 * second to arm and disarm a timer that fires ten times a second,
+	 * whereas an always-armed timer on a busy CPU costs one expiry per
+	 * interval on a CPU that is awake anyway.  The hook would put its cost
+	 * exactly where constraint 4 says there should be none.
+	 *
+	 * Unseeded (prev_tsc == 0) counts as stale: a CPU that has never
+	 * ticked is the strongest possible case for probing it.
+	 */
+	now  = ivh_raw_tsc();
+	last = READ_ONCE(rq->ivh_uc_prev_tsc);
+	if (last && (s64)(now - last) <
+		    (s64)ivh_tsc_ns_to_cycles(READ_ONCE(ivh_ka_interval_ns))) {
+		ka->skipped_fresh++;
+		goto rearm;
+	}
+
+	ivh_ka_probe(ka);
+rearm:
+	ivh_ka_arm(ka);
+}
+
+static void ivh_ka_start_all(void)
+{
+	int cpu;
+
+	for_each_online_cpu(cpu)
+		ivh_ka_arm(per_cpu_ptr(&ivh_ka, cpu));
+}
+
+/*
+ * Initialised but NOT queued: shadow-first, so an unconfigured kernel runs
+ * exactly the code it ran before.  ivh_ka_proc_enabled() is the only thing
+ * that ever starts a chain.
+ *
+ * KNOWN GAP, stated rather than hidden: a CPU brought online AFTER
+ * ivh_ka_enabled=1 gets no chain, because there is no cpuhp callback here.
+ * Re-writing ivh_ka_enabled=1 re-arms every online CPU and is idempotent for
+ * the ones already running (queue_delayed_work_on() on a pending item is a
+ * no-op), so that is the workaround until this is worth a hotplug state.
+ */
+static int __init ivh_ka_init(void)
+{
+	int cpu;
+
+	for_each_possible_cpu(cpu) {
+		struct ivh_ka_state *ka = per_cpu_ptr(&ivh_ka, cpu);
+
+		ka->cpu = cpu;
+		INIT_DELAYED_WORK(&ka->work, ivh_ka_fn);
+	}
+	return 0;
+}
+late_initcall(ivh_ka_init);
+
+void get_ka_compare(int cpunum, u64 *probes, u64 *skipped_fresh, u64 *aborted,
+		    u64 *spin_ns, u64 *misdispatched)
+{
+	struct ivh_ka_state *ka = per_cpu_ptr(&ivh_ka, cpunum);
+
+	*probes        = READ_ONCE(ka->probes);
+	*skipped_fresh = READ_ONCE(ka->skipped_fresh);
+	*aborted       = READ_ONCE(ka->aborted);
+	*spin_ns       = READ_ONCE(ka->spin_ns);
+	*misdispatched = READ_ONCE(ka->misdispatched);
+}
+EXPORT_SYMBOL_GPL(get_ka_compare);
 
 /* lhp tick-time lockholder classification — per-CPU snapshot */
 DEFINE_PER_CPU(struct lhp_classify_snapshot, lhp_last_class);

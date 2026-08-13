@@ -127,6 +127,31 @@ extern void ivh_ref_accumulate(void);
  * sysctl globals and the rq block in scope.
  */
 extern void ivh_vact_tick(void);
+/*
+ * IVH "tks": CVM-safe tick-gap steal inference, ivh_steal_source=2.  Called
+ * from account_process_tick() immediately after ivh_ref_accumulate() and
+ * therefore before ivh_uc_tick(), so the value ivh_uc_steal_ns() reads is
+ * this tick's, not last tick's.  Produced ALWAYS and consumed only at
+ * ivh_steal_source=2, the same always-produce/never-consume discipline
+ * ivh_vact_tick() records -- a signal that is only computed once someone has
+ * decided to trust it can never be compared against the signal it replaces.
+ */
+extern void ivh_tick_steal_accumulate(void);
+/* Side-by-side comparator feed, no in-tree caller, same rationale as
+ * get_vact_compare()/get_uc_compare(): adding an accessor later costs a
+ * kernel build and a reboot, reformatting in the module costs an insmod. */
+extern void get_tks_compare(int cpunum, u64 *steal_ns, u64 *samples,
+			    u64 *events, u64 *skipped, s64 *carry_c);
+/*
+ * IVH "ka" (idle keepalive) counters, for /proc/ivh_debug.  Unlike the three
+ * comparator feeds around it this one HAS an in-tree caller (fair.c), because
+ * the keepalive's cost is the thing an operator has to be able to see before
+ * deciding whether to leave it on -- probes tells them the wake-up rate they
+ * are paying for, spin_ns the CPU time, and skipped_fresh how much of the
+ * armed timer never cost a probe at all because the CPU was already ticking.
+ */
+extern void get_ka_compare(int cpunum, u64 *probes, u64 *skipped_fresh,
+			   u64 *aborted, u64 *spin_ns, u64 *misdispatched);
 /* Side-by-side comparator feed for the module's /proc/ivh_vact_compare.  Ships
  * in Build 1 even though nothing in-tree calls it, because adding a kernel
  * accessor later costs a build and a reboot while reformatting in the module
@@ -220,6 +245,48 @@ extern unsigned long ivh_steal_source;
 extern unsigned long ivh_ref_method;
 extern unsigned long ivh_ref_exit_loc_ns;
 extern unsigned long ivh_ref_exit_oth_ns;
+/*
+ * IVH "tks" (tick steal), ivh_steal_source=2 -- the CVM-safe estimator.
+ * tools/bpf/docs/ivh_cvm_steal_detector_2026-08-08.md.
+ *   ivh_tks_deadband_ns   excess below this is noise, contributes nothing
+ *   ivh_tks_phase_pct     percent of one tick added to a cleared excess as the
+ *                         phase correction.  0 is the shipped DEFAULT only
+ *                         because changing it cannot be validated without a
+ *                         reboot; the MEASURED-correct value on this kernel
+ *                         is 100, not the theoretically unbiased 50, because
+ *                         the tick is an ABSOLUTE periodic hrtimer and a
+ *                         preemption burst therefore costs the estimator one
+ *                         WHOLE tick period.  See the rationale block above
+ *                         the definition in core.c and
+ *                         tools/bpf/docs/ivh_undershoot_correction_2026-08-09.md.
+ *   ivh_tks_carry_ticks   floor on the signed carry, in nominal ticks
+ *   ivh_tks_idle_sub      1 (default) subtracts the idle delta from the raw
+ *                         inter-tick gap, the historical behaviour; 0 drops
+ *                         the subtraction, which is the correct form under
+ *                         `nohz=off` and is a NO-OP on continuously-runnable
+ *                         load (where the idle delta is identically zero).
+ *                         Set 0 only together with `nohz=off`.
+ */
+extern unsigned long ivh_tks_deadband_ns;
+extern unsigned long ivh_tks_phase_pct;
+extern unsigned long ivh_tks_carry_ticks;
+extern unsigned long ivh_tks_idle_sub;
+/*
+ * IVH "ka" (idle keepalive) -- forces ivh_uc_capacity to keep being measured
+ * on vCPUs that would otherwise idle out of the tick and freeze.
+ * tools/bpf/docs/ivh_idle_keepalive_2026-08-08.md.
+ *   ivh_ka_enabled      master gate, 0 (off) by default; no chain is queued at
+ *                       all until this is set, and clearing it lets every
+ *                       chain drain within one interval
+ *   ivh_ka_interval_ns  probe cadence; must be <= ivh_uc_window_ns / 2 or a
+ *                       window can contain no probe, and an empty window
+ *                       publishes a PERFECT capacity rather than none
+ *   ivh_ka_probe_ns     how long each probe spins; must exceed one tick period
+ *                       or account_process_tick() may never run during it
+ */
+extern unsigned long ivh_ka_enabled;
+extern unsigned long ivh_ka_interval_ns;
+extern unsigned long ivh_ka_probe_ns;
 extern int  migrate_task_to_async_fair(void *data);
 extern void ivh_scan_stuck_waiters(void); /* EXPERIMENT: bare-schedule() hang diagnosis, 2026-06-30 */
 
@@ -1624,9 +1691,12 @@ struct rq {
      * tick -- the prev_* snapshot for ivh_vact_idle_delta_c()
      * (kernel/sched/core.c).  Nanoseconds, not cycles, and that is the one
      * exception to this block's "everything is raw TSC cycles" rule: the
-     * source (get_cpu_idle_time_us) is a microsecond counter with no TSC
-     * relationship, so the DELTA is what gets converted, once, at the point
-     * of use.  Converting the cumulative value instead would put a tsc_khz
+     * source (ivh_idle_ns(): get_cpu_idle_time_us() in microseconds under
+     * NOHZ, kcpustat CPUTIME_IDLE+CPUTIME_IOWAIT in nanoseconds under
+     * `nohz=off`) has no TSC relationship either way, so the DELTA is what
+     * gets converted, once, at the point of use -- and the field stays in
+     * nanoseconds so the two sources are interchangeable without touching any
+     * consumer.  Converting the cumulative value instead would put a tsc_khz
      * multiply on a since-boot quantity and hand the split a rounding error
      * that grows with uptime.
      *
@@ -1702,6 +1772,39 @@ struct rq {
     u64                     ivh_uc_raw_wall;       /* last pre-EMA sample, wall (1..1024) */
     u64                     ivh_uc_raw_acct;       /* last pre-EMA sample, acct (1..1024) */
     u64                     ivh_uc_vcap_at_close;  /* rq->cpu_capacity_custom snapshotted at window close */
+
+    /*
+     * IVH "tks" (tick steal) -- CVM-safe steal inference, the third
+     * ivh_steal_source.  tools/bpf/docs/ivh_cvm_steal_detector_2026-08-08.md.
+     *
+     * Reads NOTHING the host authors and NOTHING the vPMU provides: raw TSC
+     * (which keeps advancing through host preemption), the NOHZ idle
+     * residency series, and the compile-time constant TICK_NSEC.  That is
+     * the entire input set, which is what makes it survive a confidential VM
+     * where both CPU_CLK_UNHALTED.REF (ivh_steal_source=1) and the
+     * kvm_steal_time page (ivh_steal_source=0) may be unavailable or
+     * untrusted.
+     *
+     * The mechanism is the tick-delivery gap: a tick fires only once the
+     * vCPU is actually running, so the raw-TSC distance between consecutive
+     * tick deliveries, less the idle that interval contained, less one
+     * nominal tick of assumed execution, is time the vCPU wanted the CPU and
+     * did not have it.  See ivh_tick_steal_accumulate() for the estimator's
+     * bias, its deadband, and the measured reason the theoretically
+     * unbiased half-tick phase correction is NOT the shipped default.
+     *
+     * Written only by ivh_tick_steal_accumulate() on the OWNING CPU from the
+     * scheduler tick, read remotely by ivh_uc_steal_ns() /
+     * get_steal_and_preemptions() -- the same access pattern, and so the
+     * same placement in struct rq, as the ivh_ref_* block above.
+     */
+    u64                     ivh_tks_prev_tsc;      /* ivh_raw_tsc() at last tick; 0 == unseeded */
+    u64                     ivh_tks_prev_idle_ns;  /* idle+iowait ns at last tick */
+    s64                     ivh_tks_carry_c;       /* signed residual, <= 0, floored (anti-rectification) */
+    u64                     ivh_tks_steal_ns;      /* THE OUTPUT: cumulative inferred steal, monotonic */
+    u64                     ivh_tks_samples;       /* ticks that produced a usable delta */
+    u64                     ivh_tks_events;        /* intervals whose excess cleared the deadband */
+    u64                     ivh_tks_skipped;       /* ticks bailed (unusable idle / no tsc_khz) */
 
     struct __call_single_data preempt_migrate;
     u64                       wakeup_stamp;

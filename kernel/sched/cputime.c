@@ -566,6 +566,27 @@ void account_process_tick(struct task_struct *p, int user_tick)
 	ivh_ref_accumulate();
 
 	/*
+	 * IVH "tks": CVM-safe tick-gap steal inference, ivh_steal_source=2
+	 * (kernel/sched/core.c).  tools/bpf/docs/
+	 * ivh_cvm_steal_detector_2026-08-08.md.
+	 *
+	 * Same placement rationale as the three calls around it -- before the
+	 * vtime_accounting_enabled_this_cpu() early return, so the signal is
+	 * produced on every tick on every CPU regardless of accounting
+	 * flavour.  For THIS signal that placement is not merely consistent,
+	 * it is required: the estimator measures the raw-TSC distance between
+	 * consecutive tick DELIVERIES, so a tick that skipped the hook would
+	 * be indistinguishable from a tick the hypervisor stole.
+	 *
+	 * Ordered BEFORE ivh_uc_tick() below so that when ivh_steal_source is
+	 * 2 the number ivh_uc_steal_ns() reads is this tick's, not last
+	 * tick's.  Sources 0 and 1 keep their documented one-tick lag; do not
+	 * "fix" that asymmetry by moving this call after ivh_uc_tick(), which
+	 * would only make source 2 lag as well.
+	 */
+	ivh_tick_steal_accumulate();
+
+	/*
 	 * IVH Part C tick-only stamp + jump detection (kernel/sched/core.c).
 	 *
 	 * Placed here for the same reason clock_preempt and ivh_ref_accumulate()

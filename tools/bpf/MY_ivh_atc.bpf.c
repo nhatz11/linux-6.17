@@ -377,7 +377,42 @@ static __always_inline u32 ivh_cap_source_now(void)
  * where the ranking itself was noise (see recalibration doc sec 4).
  */
 #define IVH_CAP_TOPBAND     50   /* K: dest must be within K of the best CPU in this scan */
-#define IVH_CAP_MARGIN      50   /* D: dest must beat source by at least D            */
+#define IVH_CAP_MARGIN      20   /* D: dest must beat source by at least D            */
+
+/*
+ * 2026-08-08 (WALL-path validation doc sec 4): SCALE-FREE margin.
+ *
+ * The absolute D above is only correct for a signal whose dynamic range is
+ * stable.  ivh_uc_capacity's WALL variant (ivh_uc_used_source=0) is not: its
+ * contended/clean spread wanders over a ~150-point range with recent load
+ * history, because x_wall = 1 - steal/avail inherits the tick-gap estimator's
+ * 6-24% metric recovery (final_tsc_only doc sec 6.4) and its denominator
+ * `avail` is itself load-dependent.  Measured live, back-to-back protocol:
+ *
+ *   regime (cap_cont/cap_clean)   D=50            D=20
+ *   compressed  ~980 / 1023       14.1-14.7 s     11.5 s
+ *   wide        ~810 /  940       12.3-12.6 s     13.9-14.2 s
+ *
+ * A crossed interaction: no single D is right for both.  The fix is the same
+ * one sec 5.1 already applied to the top-band test -- normalise to the
+ * population actually observed in this scan instead of to a constant.
+ *
+ * Form: the destination must close at least half the gap between the source
+ * and the best CPU seen this scan.  Written as `2*dcap >= src + scan_max` so
+ * there is no subtraction to underflow when scan_max < src (which happens
+ * whenever the source is itself the healthiest CPU in the scan).
+ *
+ * IVH_CAP_MARGIN_MIN remains as a pure noise rail: under uniform contention
+ * scan_max collapses onto src, the midpoint collapses onto src too, and a
+ * single LSB of jitter would otherwise flip the verdict -- exactly the Part C
+ * migration-storm mechanism the absolute D was introduced to stop.
+ *
+ * Set IVH_CAP_MARGIN_REL to 0 to restore the plain absolute D.
+ */
+#define IVH_CAP_MARGIN_REL   0
+#define IVH_CAP_MARGIN_MIN  20   /* noise rail under the relative form */
+#define IVH_CAP_MARGIN_NUM   1   /* dest must close NUM/DEN of the src..scan_max gap */
+#define IVH_CAP_MARGIN_DEN   3
 
 /*
  * Vestigial absolute rail -- deliberately far from the operating point, and it
@@ -390,7 +425,7 @@ static __always_inline u32 ivh_cap_source_now(void)
  * binding gate, the reshape has failed, and the answer is recalibration doc
  * sec 8 (publish steal/elapsed instead) -- NOT lowering this number.
  */
-#define IVH_CAP_HARDFLOOR  950
+#define IVH_CAP_HARDFLOOR  880
 
 struct task_ctx {
     struct task_struct *curr;          /* task that is to be moved */
@@ -606,11 +641,34 @@ static int process_cpu(u32 iter, void *data)
      * destination set empties, and IVH correctly does nothing -- by
      * construction rather than by accident of where a constant happened to
      * sit. */
+#if IVH_CAP_MARGIN_REL
+    {
+        unsigned long dcap = ivh_cap_of(select_rq, ctx->cap_source);
+        unsigned long src  = (unsigned long)ctx->source_capacity;
+
+        /* Noise rail first -- cheap, and it is the binding one under uniform
+         * contention where the midpoint test degenerates. */
+        if (dcap < src + IVH_CAP_MARGIN_MIN) {
+            bump_reason(REJ_NOT_BETTER);
+            return 0;
+        }
+        /* Close at least IVH_CAP_MARGIN_NUM/IVH_CAP_MARGIN_DEN of the
+         * src..scan_max gap.  Multiplied out so there is no subtraction to
+         * underflow when scan_max < src. */
+        if (dcap * IVH_CAP_MARGIN_DEN <
+            src * (IVH_CAP_MARGIN_DEN - IVH_CAP_MARGIN_NUM)
+            + (unsigned long)ctx->scan_max * IVH_CAP_MARGIN_NUM) {
+            bump_reason(REJ_NOT_BETTER);
+            return 0;
+        }
+    }
+#else
     if (ivh_cap_of(select_rq, ctx->cap_source)
         < (unsigned long)ctx->source_capacity + IVH_CAP_MARGIN) {
         bump_reason(REJ_NOT_BETTER);
         return 0;
     }
+#endif
 #endif
 
 #if GATE_PREEMPTED
@@ -859,9 +917,19 @@ int BPF_PROG(test3, struct rq *rq, struct task_struct *curr, u64 now_time, int a
      * can -- the whole per-candidate loop is provably dead work. Measured
      * 80% regression recovery in isolation; being tested here stacked on top
      * of ivh_selection_trylock. */
+    /* The early-out must DOMINATE the per-candidate gate: it may only reject
+     * scans in which no candidate could possibly pass.  Under the relative
+     * margin the per-candidate test at dcap == scan_max reduces to
+     * scan_max >= src (implied), so the binding term is the noise rail. */
+#if IVH_CAP_MARGIN_REL
+    if (smc.max <= IVH_CAP_HARDFLOOR ||
+        smc.max < (u32)ivh_cap_of(rq, cap_src) + IVH_CAP_MARGIN_MIN)
+        return -1;
+#else
     if (smc.max <= IVH_CAP_HARDFLOOR ||
         smc.max < (u32)ivh_cap_of(rq, cap_src) + IVH_CAP_MARGIN)
         return -1;
+#endif
 
     bpf_loop(nr_loops, &process_cpu, &task_context, 0);
 
