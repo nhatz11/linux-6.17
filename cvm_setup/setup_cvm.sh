@@ -69,23 +69,35 @@ phase_preflight() {
     fi
 
     info "Preflight: sibling repos"
-    if [ ! -d "$VSCHED/.git" ]; then
-        info "Cloning vsched_main (submodules: vcapacity, vsched_kernel, vtopology)"
-        git clone --recurse-submodules git@github.com:nhatz11/vsched_main.git "$VSCHED" \
-            || git clone --recurse-submodules https://github.com/nhatz11/vsched_main.git "$VSCHED"
+    # vsched_main is NOT auto-cloned. Its vcapacity submodule points at
+    # vSched/vcapacity (a different org's repo, not this project's), and
+    # vcap_probe.cpp — the file the running daemon is actually built from —
+    # has never been pushed there (no push access to that remote as of
+    # 2026-08-15). A git clone here would silently produce a checkout
+    # missing the one file everything downstream depends on. Until that's
+    # resolved upstream, vsched_main has to be copied onto this machine by
+    # hand from a machine that already has the working tree, e.g.:
+    #   rsync -avz --exclude='*.o' /home/nick/vsched_main/ <this-host>:/home/nick/vsched_main/
+    if [ ! -f "$VCAP_DIR/vcap_probe.cpp" ]; then
+        fail "vsched_main/vcapacity/vcap_probe.cpp not found at $VCAP_DIR"
+        echo "    vsched_main can't be auto-cloned (see comment above this check in"
+        echo "    cvm_setup/setup_cvm.sh). Copy it from a machine that has it, e.g.:"
+        echo "      rsync -avz --exclude='*.o' <source-host>:/home/nick/vsched_main/ /home/nick/vsched_main/"
+        echo "    then re-run: $0 preflight"
+        exit 1
     else
-        info "vsched_main already present at $VSCHED"
+        info "vsched_main/vcapacity present with vcap_probe.cpp"
     fi
 
     # ebizzy: this project's copy was hand-dropped from LTP with no git
     # history, so pull it straight from upstream LTP instead of depending on
     # that ad-hoc directory existing on the new machine.
-    if [ ! -f /home/nick/Desktop/ebizzy/ebizzy.c ] && [ ! -f "$HOME/ebizzy-src/ebizzy.c" ]; then
+    if [ ! -f /home/nick/Desktop/ebizzy/ebizzy.c ] && [ ! -f "$HOME/ebizzy-src/utils/benchmark/ebizzy-0.3/ebizzy.c" ]; then
         info "Fetching ebizzy source from upstream LTP (sparse, shallow)"
         rm -rf "$HOME/ebizzy-src"
         git clone --filter=blob:none --no-checkout --depth 1 \
             https://github.com/linux-test-project/ltp.git "$HOME/ebizzy-src" 2>/dev/null
-        (cd "$HOME/ebizzy-src" && git sparse-checkout set testcases/kernel/mem/ebizzy && git checkout)
+        (cd "$HOME/ebizzy-src" && git sparse-checkout set utils/benchmark/ebizzy-0.3 && git checkout)
         mkdir -p "$HOME/Desktop/ebizzy" 2>/dev/null || true
     fi
 
@@ -214,8 +226,8 @@ phase_post_reboot() {
     info "Building ebizzy"
     local ebz_src=""
     [ -f /home/nick/Desktop/ebizzy/ebizzy.c ] && ebz_src=/home/nick/Desktop/ebizzy/ebizzy.c
-    [ -z "$ebz_src" ] && [ -f "$HOME/ebizzy-src/testcases/kernel/mem/ebizzy/ebizzy.c" ] \
-        && ebz_src="$HOME/ebizzy-src/testcases/kernel/mem/ebizzy/ebizzy.c"
+    [ -z "$ebz_src" ] && [ -f "$HOME/ebizzy-src/utils/benchmark/ebizzy-0.3/ebizzy.c" ] \
+        && ebz_src="$HOME/ebizzy-src/utils/benchmark/ebizzy-0.3/ebizzy.c"
     if [ -n "$ebz_src" ]; then
         gcc -O2 -o /home/nick/Desktop/ebizzy "$ebz_src"
     else
