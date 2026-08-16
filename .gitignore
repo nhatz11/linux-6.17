@@ -14,7 +14,10 @@ build.log
 preemptions
 outdated_session.md
 activate.sh
-setup.sh
+# setup.sh is NOT a local artifact — it loads vsched_module.ko and sets up
+# cgroups, and install_module.sh/cvm_setup/setup_cvm.sh both depend on it
+# existing on a fresh clone. Un-ignored 2026-08-15 after it broke a fresh
+# CVM bring-up.
 # Normal rules (sorted alphabetically)
 #
 .*
