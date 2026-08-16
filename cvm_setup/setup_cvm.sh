@@ -91,14 +91,16 @@ phase_preflight() {
 
     # ebizzy: this project's copy was hand-dropped from LTP with no git
     # history, so pull it straight from upstream LTP instead of depending on
-    # that ad-hoc directory existing on the new machine.
-    if [ ! -f /home/nick/Desktop/ebizzy/ebizzy.c ] && [ ! -f "$HOME/ebizzy-src/utils/benchmark/ebizzy-0.3/ebizzy.c" ]; then
+    # that ad-hoc directory existing on the new machine. (Note:
+    # /home/nick/Desktop/ebizzy on the reference machine is the BUILT
+    # BINARY, a file, not a directory — never check inside it as a path.)
+    if [ ! -f /home/nick/Desktop/ltp-src/ltp/utils/benchmark/ebizzy-0.3/ebizzy.c ] \
+        && [ ! -f "$HOME/ebizzy-src/utils/benchmark/ebizzy-0.3/ebizzy.c" ]; then
         info "Fetching ebizzy source from upstream LTP (sparse, shallow)"
         rm -rf "$HOME/ebizzy-src"
         git clone --filter=blob:none --no-checkout --depth 1 \
             https://github.com/linux-test-project/ltp.git "$HOME/ebizzy-src" 2>/dev/null
         (cd "$HOME/ebizzy-src" && git sparse-checkout set utils/benchmark/ebizzy-0.3 && git checkout)
-        mkdir -p "$HOME/Desktop/ebizzy" 2>/dev/null || true
     fi
 
     step_done preflight
@@ -213,6 +215,16 @@ phase_post_reboot() {
     info "Loading vsched_module + cgroup setup (setup.sh)"
     sudo "$REPO/setup.sh"
 
+    # vmlinux.h is BPF CO-RE input generated from the *running* kernel's own
+    # BTF — machine- and boot-specific, correctly gitignored, so a fresh
+    # clone never has it and it must be regenerated here, post-reboot,
+    # against this exact kernel. A stale or missing one compiles against
+    # the wrong struct rq/task_struct layout and fails with "no member
+    # named ivh_uc_capacity" style errors (this struct rq addition is
+    # IVH-specific, not in any stock vmlinux.h).
+    info "Regenerating tools/bpf/vmlinux.h from this kernel's live BTF"
+    sudo bpftool btf dump file /sys/kernel/btf/vmlinux format c > "$REPO/tools/bpf/vmlinux.h"
+
     info "Building MY_ivh_atc + ivh_exec"
     make -C "$REPO/tools/bpf" MY_ivh_atc ivh_exec
 
@@ -225,13 +237,26 @@ phase_post_reboot() {
 
     info "Building ebizzy"
     local ebz_src=""
-    [ -f /home/nick/Desktop/ebizzy/ebizzy.c ] && ebz_src=/home/nick/Desktop/ebizzy/ebizzy.c
-    [ -z "$ebz_src" ] && [ -f "$HOME/ebizzy-src/utils/benchmark/ebizzy-0.3/ebizzy.c" ] \
+    [ -f "$HOME/ebizzy-src/utils/benchmark/ebizzy-0.3/ebizzy.c" ] \
         && ebz_src="$HOME/ebizzy-src/utils/benchmark/ebizzy-0.3/ebizzy.c"
+    [ -z "$ebz_src" ] && [ -f /home/nick/Desktop/ltp-src/ltp/utils/benchmark/ebizzy-0.3/ebizzy.c ] \
+        && ebz_src=/home/nick/Desktop/ltp-src/ltp/utils/benchmark/ebizzy-0.3/ebizzy.c
     if [ -n "$ebz_src" ]; then
+        mkdir -p /home/nick/Desktop
         gcc -O2 -o /home/nick/Desktop/ebizzy "$ebz_src"
     else
-        fail "ebizzy source not found — skipping (not required for core IVH verification)"
+        fail "ebizzy source not found (expected from preflight's LTP fetch) — skipping, not required for core IVH verification"
+    fi
+
+    # /home/nick/IVH itself was never in git (a gap found live on this
+    # bring-up) — it's tracked here now as cvm_setup/IVH_start.sh. Every
+    # other script (this one included, and ivh_verify.sh) hardcodes the
+    # /home/nick/IVH path, so install it there rather than changing every
+    # caller.
+    if [ ! -f /home/nick/IVH ]; then
+        info "Installing cvm_setup/IVH_start.sh as /home/nick/IVH"
+        cp "$REPO/cvm_setup/IVH_start.sh" /home/nick/IVH
+        chmod +x /home/nick/IVH
     fi
 
     info "Starting IVH (sysctls + MY_ivh_atc + vcap_probe daemons)"
