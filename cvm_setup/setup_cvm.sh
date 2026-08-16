@@ -227,6 +227,11 @@ phase_post_reboot() {
 
     info "Building MY_ivh_atc + ivh_exec"
     make -C "$REPO/tools/bpf" MY_ivh_atc ivh_exec
+    # ivh_verify.sh (and phase_test below) hardcode /home/nick/ivh_exec —
+    # a separate path from where the build actually puts it ($REPO/ivh_exec).
+    # On the reference machine that's a manually-placed, un-synced copy;
+    # keep it current with a symlink instead so a rebuild can't go stale.
+    ln -sf "$REPO/ivh_exec" /home/nick/ivh_exec
 
     info "Building vcap + vcap_probe"
     make -C "$VCAP_DIR" all
