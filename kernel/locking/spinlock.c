@@ -410,7 +410,31 @@ static __always_inline void cs_enter(raw_spinlock_t *lock)
 			this_cpu_inc(ivh_cs_publishes);
 		}
 #endif
-		current->cs_start_ts = sched_clock();
+		/*
+		 * Diagnostic-only gate (2026-08-24): skip the CS-timing TSC
+		 * reads and cumulative_cs_time/last_cs_ns bookkeeping entirely
+		 * when ivh_cs_track_enabled==0. cs_start_ts staying 0 makes
+		 * cs_exit()'s whole body a no-op too (it's gated on
+		 * current->cs_start_ts being nonzero), so this one check
+		 * covers both ends of the pair. Default ON (1), bit-for-bit
+		 * unchanged from prior behavior.
+		 */
+		if (!READ_ONCE(ivh_cs_track_enabled))
+			return;
+		if (unlikely(READ_ONCE(ivh_cs_track_enabled) == 3)) {
+			/*
+			 * TSC-only isolation mode: pay the real sched_clock()
+			 * cost and discard it -- no cs_start_ts write, no
+			 * bookkeeping at all. Pairs with mode 2 (bookkeeping
+			 * only, fake clock) to separate the TSC read's share
+			 * of the tax from the bookkeeping's share. Diagnostic
+			 * only: do not flip ivh_cs_track_enabled mid-hold, see
+			 * cs_exit()'s matching branch.
+			 */
+			(void)sched_clock();
+			return;
+		}
+		current->cs_start_ts = ivh_cs_clock();
 		current->cs_wall_start_ts = current->cs_start_ts;
 		/* 2026-07-20: PF_IVH_ELIGIBLE no longer consulted here --
 		 * ivh_universal_eligible is the sole eligibility gate now, not
@@ -418,7 +442,16 @@ static __always_inline void cs_enter(raw_spinlock_t *lock)
 		 * -v stats tool, and stays, unaffected by ivh_exclude -- an
 		 * excluded task can still be observed).
 		 * if (current->flags & PF_IVH_ELIGIBLE) || */
-		if ((READ_ONCE(ivh_universal_eligible) && !current->ivh_exclude) ||
+		/*
+		 * Diagnostic-only gate (2026-08-24): this steal_start capture
+		 * is a real PV steal_time-page touch. Only take it when
+		 * cs_exit() will actually read it back -- Hot Threads
+		 * (ivh_hot_preempt_gate_enabled, the sole reader of
+		 * ivh_preempt_decay) or the -v observe stats. See cs_exit()
+		 * for the matching gate on the consumer side.
+		 */
+		if ((READ_ONCE(ivh_hot_preempt_gate_enabled) &&
+		     READ_ONCE(ivh_universal_eligible) && !current->ivh_exclude) ||
 		    current->ivh_observe)
 			current->cs_steal_start = ivh_this_cpu_steal_ns();
 	}
@@ -426,8 +459,21 @@ static __always_inline void cs_enter(raw_spinlock_t *lock)
 
 static __always_inline void cs_exit(raw_spinlock_t *lock)
 {
+	if (current->lock_depth == 0 &&
+	    unlikely(READ_ONCE(ivh_cs_track_enabled) == 3)) {
+		/*
+		 * TSC-only isolation mode: matching dummy read for the one
+		 * taken in cs_enter(), no bookkeeping. See cs_enter()'s
+		 * comment. cs_start_ts was never set on this path (mode 3
+		 * returns before writing it), so this check must come before
+		 * the cs_start_ts gate below, not fall through to it.
+		 */
+		(void)sched_clock();
+		return;
+	}
+
 	if (current->lock_depth == 0 && current->cs_start_ts) {
-		u64 now = sched_clock();
+		u64 now = ivh_cs_clock();
 		/* Hold length of this outermost CS, computed once and reused by
 		 * both cumulative_cs_time and the observe-only sum below. */
 		u64 cs_ns = now - current->cs_start_ts;
@@ -506,7 +552,6 @@ static __always_inline void cs_exit(raw_spinlock_t *lock)
 		}
 #endif
 		current->last_cs_ns = now - current->cs_wall_start_ts;
-		current->cumulative_cs_time += cs_ns;
 		current->cs_start_ts = 0;
 		current->cs_wall_start_ts = 0;
 		/*
@@ -523,16 +568,34 @@ static __always_inline void cs_exit(raw_spinlock_t *lock)
 		 * (ivh_observe is separate, for the -v stats tool, and stays,
 		 * unaffected by ivh_exclude -- an excluded task can still be
 		 * observed). if ((current->flags & PF_IVH_ELIGIBLE) || ...) */
-		if ((READ_ONCE(ivh_universal_eligible) && !current->ivh_exclude) ||
+		/*
+		 * wait_decay needs no steal data (release event only) and
+		 * stays on the plain eligibility gate -- it feeds the
+		 * validated gate, unlike preempt_decay below. Moved out of
+		 * the steal-gated block so it keeps running even when the
+		 * steal read (a real PV touch) is skipped. (2026-08-24)
+		 */
+		if (READ_ONCE(ivh_universal_eligible) && !current->ivh_exclude)
+			ivh_hot_wait_decay_sample_zero();
+
+		/*
+		 * Diagnostic-only gate (2026-08-24): the steal_now read below
+		 * is a real PV steal_time-page touch (ivh_this_cpu_steal_ns).
+		 * Only take it when the result will actually be consumed --
+		 * Hot Threads (ivh_hot_preempt_gate_enabled, the sole reader
+		 * of ivh_preempt_decay) or the -v observe stats, which also
+		 * need `stolen` below.
+		 */
+		if ((READ_ONCE(ivh_hot_preempt_gate_enabled) &&
+		     READ_ONCE(ivh_universal_eligible) && !current->ivh_exclude) ||
 		    current->ivh_observe) {
 			u64 steal_now = ivh_this_cpu_steal_ns();
 			bool stolen = steal_now - current->cs_steal_start
 					> IVH_HOT_STEAL_FLOOR_NS;
 
-			if (READ_ONCE(ivh_universal_eligible) && !current->ivh_exclude) {
+			if (READ_ONCE(ivh_hot_preempt_gate_enabled) &&
+			    READ_ONCE(ivh_universal_eligible) && !current->ivh_exclude)
 				ivh_hot_preempt_update(stolen);
-				ivh_hot_wait_decay_sample_zero();
-			}
 			/*
 			 * Observe-only stats (ivh_exec -v): independent of the
 			 * EWMA feed above, and independent of eligibility --

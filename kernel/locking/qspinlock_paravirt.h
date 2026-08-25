@@ -337,14 +337,13 @@ static struct pv_node *pv_unhash(struct qspinlock *lock)
  */
 static inline bool is_wait_preempted(int cpu)
 {
-	bool kvm = vcpu_is_preempted(cpu);
 	unsigned long src = READ_ONCE(ivh_pv_preempt_src);
 	s64 age, min_age;
-	bool beat;
+	bool beat, kvm;
 	int bucket;
 
 	if (likely(!src))
-		return kvm;
+		return vcpu_is_preempted(cpu);
 
 	age  = ivh_beat_age(cpu);
 	beat = age > (s64)READ_ONCE(ivh_pv_beat_threshold);
@@ -357,10 +356,29 @@ static inline bool is_wait_preempted(int cpu)
 	 * silent and one-directional -- it never faults, it just makes one vCPU
 	 * look permanently preempted to one set of neighbours.  Costs one
 	 * compare, and the store is taken only when a new minimum is found.
+	 * TSC-only, no PV read -- kept unconditional so drift tracking stays
+	 * continuous across a live src flip between 1 and 2.
 	 */
 	min_age = raw_cpu_read(ivh_beat_min_age);
 	if (age < min_age)
 		raw_cpu_write(ivh_beat_min_age, age);
+
+	/*
+	 * Diagnostic-only gate (2026-08-24): everything below this point --
+	 * the PV vcpu_is_preempted() read (a real steal_time-page touch) and
+	 * the shadow-comparison histograms/counters -- exists to calibrate
+	 * the heartbeat against host ground truth.  src==1 ("measurement
+	 * mode", see the comment above this function) still needs all of it:
+	 * it explicitly returns kvm and uses the histograms to find the
+	 * threshold.  Once src==2 is committed in production the decision is
+	 * `return beat` regardless of what kvm says, so nothing here is read
+	 * by anything -- skipping it removes the last unconditional paravirt
+	 * touch from the qspinlock wait path when running PV-free.
+	 */
+	if (src == 2)
+		return beat;
+
+	kvm = vcpu_is_preempted(cpu);
 
 	/*
 	 * Log2-bucketed age histogram, split by the HOST's verdict, same raw
@@ -395,9 +413,6 @@ static inline bool is_wait_preempted(int cpu)
 	} else {
 		this_cpu_inc(ivh_beat_false_neg);  /* host says preempted, TSC missed it */
 	}
-
-	if (src == 2)
-		return beat;
 
 	return kvm;
 }

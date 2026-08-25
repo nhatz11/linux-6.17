@@ -8212,23 +8212,30 @@ prepare_task_switch(struct rq *rq, struct task_struct *prev,
 	/*
 	 * Pause the outermost-CS clock before going off-CPU.  cs_start_ts
 	 * must NOT tick while the task is preempted: off-CPU time is not
-	 * CS time.  We accumulate the on-CPU portion now and clear the stamp;
-	 * finish_task_switch will reopen it if the task still holds locks.
-	 * This must happen before lock_depth-- so the check below sees the
-	 * full (rq-lock-inclusive) depth.
+	 * CS time.  Clear the stamp so cs_exit()'s eventual last_cs_ns
+	 * doesn't include this off-CPU gap; finish_task_switch will reopen
+	 * it if the task still holds locks. This must happen before
+	 * lock_depth-- so the check below sees the full (rq-lock-inclusive)
+	 * depth.
+	 *
+	 * No sched_clock() read needed here (2026-08-24): this used to also
+	 * accumulate into cumulative_cs_time, which has no live consumer
+	 * anywhere in the tree (confirmed by audit) and was removed -- see
+	 * cs_exit() in kernel/locking/spinlock.c.
 	 */
-	if (prev->cs_start_ts) {
-		prev->cumulative_cs_time += sched_clock() - prev->cs_start_ts;
-		prev->cs_start_ts = 0;
-	}
+	prev->cs_start_ts = 0;
 
 	prev->lock_depth--;
 
-	/* Accumulate on-CPU time for the task being switched out. */
-	if (prev->sched_in_stamp) {
-		prev->cumulative_active_time += sched_clock() - prev->sched_in_stamp;
-		prev->sched_in_stamp = 0;
-	}
+	/*
+	 * sched_in_stamp/cumulative_active_time removed (2026-08-24): same
+	 * audit found cumulative_active_time has no live consumer either
+	 * (only reader was lhp_class_show()'s lhp_last_class, which is never
+	 * written anywhere in the tree). This was an unconditional
+	 * sched_clock() read on every context switch for a stat nothing
+	 * reads; see finish_task_switch() for the matching removal on the
+	 * switch-in side.
+	 */
 }
 
 /**
@@ -8298,9 +8305,24 @@ static struct rq *finish_task_switch(struct task_struct *prev)
 	 * cancels out).  If the task was preempted mid-CS, reopen the CS clock
 	 * so cumulative_cs_time resumes counting from schedule-in.
 	 */
-	if (current->lock_depth > 0)
-		current->cs_start_ts = sched_clock();
-	current->sched_in_stamp = sched_clock();
+	/*
+	 * Diagnostic-only gate (2026-08-24): skip the TSC read below when
+	 * ivh_cs_track_enabled==0. cs_start_ts is a real consumer (feeds
+	 * last_cs_ns, read by the Gate 2 migration check in fair.c), so it
+	 * stays. The former sched_in_stamp write here was removed outright
+	 * (not just gated) -- it only ever fed cumulative_active_time, which
+	 * has no live consumer anywhere in the tree; see prepare_task_switch()
+	 * for the matching removal on the switch-out side. Default ON (1),
+	 * bit-for-bit unchanged from prior behavior for cs_start_ts.
+	 */
+	if (current->lock_depth > 0) {
+		unsigned long track = READ_ONCE(ivh_cs_track_enabled);
+
+		if (track == 3)
+			(void)sched_clock();	/* TSC-only isolation mode, see cs_enter() */
+		else if (track)
+			current->cs_start_ts = ivh_cs_clock();
+	}
 	finish_arch_post_lock_switch();
 	kcov_finish_switch(current);
 	/*

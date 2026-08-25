@@ -1,0 +1,4 @@
+962 records/s
+real 20.00 s
+user  5.36 s
+sys  96.04 s

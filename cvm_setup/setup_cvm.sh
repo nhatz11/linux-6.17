@@ -318,7 +318,7 @@ phase_test() {
         got=$(grep -oP "^#define $1\s+\K[0-9]+" "$BPFSRC")
         [ "$got" == "$2" ] && pass "$1 = $got" || fail "$1 = $got, expected $2"
     }
-    check_define IVH_CAP_HARDFLOOR 880
+    check_define IVH_CAP_HARDFLOOR 850
     check_define IVH_CAP_TOPBAND   50
     check_define IVH_CAP_MARGIN    20
 

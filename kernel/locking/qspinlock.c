@@ -277,7 +277,6 @@ void __lockfunc queued_spin_lock_slowpath(struct qspinlock *lock, u32 val)
 	if (val & _Q_LOCKED_MASK) {
 		/* pending-bit holder spinning for owner to release */
 		if (!in_interrupt()) {
-			current->wait_depth++;
 			/* Hot Threads: per-task contended-wait event (pending spin). */
 			/* 2026-07-20: PF_IVH_ELIGIBLE no longer consulted here --
 			 * ivh_universal_eligible is the sole gate now, not an
@@ -287,9 +286,6 @@ void __lockfunc queued_spin_lock_slowpath(struct qspinlock *lock, u32 val)
 				ivh_hot_note_wait_event();
 		}
 		smp_cond_load_acquire(&lock->locked, !VAL);
-		/* owner released; we acquire below — spinning done */
-		if (!in_interrupt())
-			current->wait_depth--;
 	}
 
 	/*
@@ -339,7 +335,6 @@ pv_queue:
 	 * Balanced by decrement at release:.
 	 */
 	if (!in_interrupt()) {
-		current->wait_depth++;
 		/* Hot Threads: per-task contended-wait event (MCS queue). */
 		/* 2026-07-20: PF_IVH_ELIGIBLE no longer consulted here --
 		 * ivh_universal_eligible is the sole gate now, not an
@@ -534,9 +529,6 @@ locked:
 
 release:
 	trace_contention_end(lock, 0);
-	/* lock acquired; MCS queue spinning done */
-	if (!in_interrupt())
-		current->wait_depth--;
 	/* Covers every goto release: (no-node fallback, post-init trylock,
 	 * uncontended cmpxchg) as well as the contended fallthrough -- all of
 	 * them are acquisitions. */

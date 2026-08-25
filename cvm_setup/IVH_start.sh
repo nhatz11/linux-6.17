@@ -135,13 +135,24 @@ set_ivh_sysctl ivh_ka_enabled 0              # idle-vCPU keepalive stays off; vc
                                              # does that job now
 
 # BPF gate constants (tools/bpf/MY_ivh_atc.bpf.c) must be built as
-# IVH_CAP_HARDFLOOR=880, IVH_CAP_TOPBAND=50, IVH_CAP_MARGIN=20 for
+# IVH_CAP_HARDFLOOR=850, IVH_CAP_TOPBAND=50, IVH_CAP_MARGIN=20 for
 # ivh_capacity_threshold=1010 above to land in the validated regime. These are
 # compile-time #defines, not sysctls, so they are asserted here rather than
 # set — MARGIN and ivh_capacity_threshold must move together, neither works
 # alone (wall-path-validation report sec 6). To change them, use the helper
 # scratchpad setbpf.sh <HARDFLOOR> <TOPBAND> <MARGIN>, which edits + rebuilds
 # + reloads in one step.
+#
+# HARDFLOOR lowered 880 -> 850 on 2026-08-19: under the -s 200 vcap_probe fix
+# below, cpu8-15's own ivh_uc_capacity was still observed dipping to 853-876
+# during hackbench, which the 880 floor rejected outright (REJ_CAPACITY_LOW
+# 47-64.5% of scans that batch, and the run went slow, 30-50%+ of runs).
+# 850 cleared that band with no new problems: two 6-run batches, 12/12 fast
+# (15-18s, mean 16.0s, sd 1.04s), cpu8-15 readings never sampled below 913
+# during that test, and 0 of ~2040 sampled last_migration destinations landed
+# on cpu0-7 (cpu0-7 capacity stayed 328-597, nowhere near either floor value).
+# Not yet proven as a root-cause fix — why cpu8-15's own capacity dips at all
+# is still unexplained — this only widens the gate's tolerance for it.
 BPFSRC=$REPO/tools/bpf/MY_ivh_atc.bpf.c
 check_define() {
     local got
@@ -151,7 +162,7 @@ check_define() {
         echo "*** the ~11.5s result will NOT reproduce with this build ***" >&2
     fi
 }
-check_define IVH_CAP_HARDFLOOR   880
+check_define IVH_CAP_HARDFLOOR   850
 check_define IVH_CAP_TOPBAND     50
 check_define IVH_CAP_MARGIN      20
 check_define IVH_CAP_MARGIN_REL  0    # relative-margin gate stays compiled OUT
@@ -184,17 +195,27 @@ done
 sudo bpftool map update name ivh_cfg key 0 0 0 0 value $CFG 0 0 0 \
   || echo "*** ERROR: ivh_cfg map update FAILED — IVH will make no migrations ***" >&2
 
-# vcap_probe replaces vcap: same -p 200 -s 5000 probe cadence to keep idle
-# vCPUs measurable, but publishes NOTHING of its own (verified via `strings`
-# — zero references to any vsched procfs node). All capacity/steal
-# calculation now happens in-kernel (ivh_uc_capacity above), fed by this
-# probe's job of keeping ivh_uc_tick() from going stale on idle vCPUs.
+# vcap_probe replaces vcap: keeps idle vCPUs measurable, but publishes
+# NOTHING of its own (verified via `strings` — zero references to any vsched
+# procfs node). All capacity/steal calculation now happens in-kernel
+# (ivh_uc_capacity above), fed by this probe's job of keeping ivh_uc_tick()
+# from going stale on idle vCPUs.
+#
+# -s 5000 -> 200 on 2026-08-19: the shipped -s 5000 (5000ms sleep between
+# probes) was 26x longer than ivh_uc_window_ns's 200ms window, so ~96% of
+# window-close checks saw zero probe overlap on this vCPU and the window
+# just extended instead of publishing — this is what let ivh_uc_capacity
+# collapse toward the HARDFLOOR under load in the first place. -s 200
+# matches the probe cadence to the window period (same as -p 200). Live
+# result: hackbench went from a persistent ~30-50%+ slow-run rate to 0
+# slow runs across two 6-run batches post-fix.
+#
 # The original, fully-calculating vcap is preserved at
 # /home/nick/vsched_main/vcapacity_ORIGINAL_BACKUP_2026-08-08/ as an
 # emergency revert path — swap this line for that binary's `vcap -p 200 -s
 # 5000` and revert ivh_cap_source to 0 / ivh_steal_source to 0 or 1 to go
 # fully back to the old, real-steal-page-and-UNHALTED.REF-capable build.
-cd /home/nick/vsched_main/vcapacity && sudo setsid nohup ./vcap_probe -p 200 -s 5000 \
+cd /home/nick/vsched_main/vcapacity && sudo setsid nohup ./vcap_probe -p 200 -s 200 \
   > /home/nick/ivh_logs/vcap_probe.log 2>&1 < /dev/null &
 
 # DO NOT BENCHMARK IMMEDIATELY. The published ivh_uc_capacity is an EMA and its

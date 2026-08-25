@@ -163,6 +163,29 @@ unsigned long ivh_hot_threads_enabled = 0UL;
 unsigned long ivh_universal_eligible = 0UL;
 
 /*
+ * Diagnostic-only 3-way gate (default 1, bit-for-bit original behavior)
+ * around cs_enter()/cs_exit()'s (kernel/locking/spinlock.c) and
+ * finish_task_switch()'s (kernel/sched/core.c) CS-timing sched_clock()
+ * reads and the lock_depth/task_struct bookkeeping wrapped around them.
+ * Those run on every outermost raw_spinlock_t acquire/release and every
+ * context switch, kernel-wide, regardless of ivh_universal_eligible --
+ * added 2026-08-24 to measure their cost, and isolate the TSC-read share
+ * from the bookkeeping share, on a TDX guest showing a broad ~60-80%
+ * throughput gap vs a stock kernel with IVH fully disabled.
+ *   0 - fully off. cs_start_ts never set; both functions' bodies no-op.
+ *   1 - default. Original behavior, real sched_clock() TSC reads.
+ *   2 - bookkeeping only. Same lock_depth/struct writes, but the clock
+ *       read is a cheap per-CPU counter (ivh_cs_clock(), bpf_sched.h)
+ *       instead of a real TSC read. DIAGNOSTIC ONLY -- do not pair with
+ *       ivh_universal_eligible=1, last_cs_ns becomes meaningless.
+ * cumulative_cs_time/cumulative_active_time no longer exist (removed
+ * 2026-08-24, zero live consumers); last_cs_ns still does at 1 and 2.
+ *   echo 0|1|2 > /proc/sys/kernel/ivh_cs_track_enabled
+ */
+unsigned long ivh_cs_track_enabled = 1UL;
+DEFINE_PER_CPU(u64, ivh_cs_fake_clock_ctr);
+
+/*
  * Whether ivh_pre_lock()'s Hot Threads gate also consults ivh_preempt_decay
  * (restoring the old AND-gate) or only ivh_wait_decay (default, validated).
  * Default OFF: ivh_preempt_decay's real-KVM-steal-during-a-kernel-raw-
@@ -605,6 +628,13 @@ static const struct ctl_table ivh_sysctls[] = {
 	{
 		.procname	= "ivh_universal_eligible",
 		.data		= &ivh_universal_eligible,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_cs_track_enabled",
+		.data		= &ivh_cs_track_enabled,
 		.maxlen		= sizeof(unsigned long),
 		.mode		= 0644,
 		.proc_handler	= proc_doulongvec_minmax,

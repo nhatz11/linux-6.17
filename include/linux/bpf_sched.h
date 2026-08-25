@@ -3,6 +3,7 @@
 #define _BPF_SCHED_H
 
 #include <linux/bpf.h>
+#include <linux/sched/clock.h>
 
 #ifdef CONFIG_BPF_SYSCALL
 
@@ -122,6 +123,41 @@ extern unsigned long ivh_hot_threads_enabled;
  *   echo 1 > /proc/sys/kernel/ivh_universal_eligible
  */
 extern unsigned long ivh_universal_eligible;
+
+/*
+ * Diagnostic-only gate around cs_enter()/cs_exit()'s and
+ * finish_task_switch()'s CS-timing sched_clock() reads. See bpf_sched.c
+ * for the full comment. Defined in bpf_sched.c.
+ *   0 - off entirely: cs_start_ts never gets set, so cs_enter()/cs_exit()'s
+ *       whole bodies (and the reopen in finish_task_switch()) are no-ops.
+ *   1 - default, bit-for-bit original behavior: real sched_clock() TSC
+ *       reads plus the full lock_depth/task_struct bookkeeping.
+ *   2 - bookkeeping only: every call site below still runs (lock_depth
+ *       transitions, cs_start_ts/cs_wall_start_ts writes, last_cs_ns,
+ *       wait_decay sampling, ...) but the underlying clock read is a cheap
+ *       per-CPU counter instead of sched_clock() -- see ivh_cs_clock().
+ *       Isolates "cost of the bookkeeping" from "cost of the TSC read"
+ *       itself: (1) vs (0) is the whole tax, (2) vs (0) is the
+ *       bookkeeping's share, (1) vs (2) is the TSC read's share.
+ *       DIAGNOSTIC ONLY -- last_cs_ns becomes meaningless at this setting,
+ *       so never pair it with ivh_universal_eligible=1 (Gate 2 would see
+ *       garbage deltas). Added 2026-08-24.
+ *   echo 0|1|2 > /proc/sys/kernel/ivh_cs_track_enabled
+ */
+extern unsigned long ivh_cs_track_enabled;
+DECLARE_PER_CPU(u64, ivh_cs_fake_clock_ctr);
+
+/*
+ * ivh_cs_clock() - sched_clock(), or (ivh_cs_track_enabled==2 only) a cheap
+ * monotonic per-CPU counter standing in for it. See ivh_cs_track_enabled's
+ * comment above for why this exists and its diagnostic-only caveat.
+ */
+static __always_inline u64 ivh_cs_clock(void)
+{
+	if (unlikely(READ_ONCE(ivh_cs_track_enabled) == 2))
+		return __this_cpu_inc_return(ivh_cs_fake_clock_ctr);
+	return sched_clock();
+}
 
 /* Advisory (non-authoritative) Gate 1+2 re-check for task @t's current CPU,
  * called from kernel/rseq.c's rseq_update_cpu_node_id() to publish
