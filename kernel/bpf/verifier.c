@@ -22,6 +22,7 @@
 #include <linux/ctype.h>
 #include <linux/error-injection.h>
 #include <linux/bpf_lsm.h>
+#include <linux/bpf_sched.h>	/* vsched: bpf_sched_verify_prog */
 #include <linux/btf_ids.h>
 #include <linux/poison.h>
 #include <linux/module.h>
@@ -23745,6 +23746,16 @@ int bpf_check_attach_target(struct bpf_verifier_log *log,
 	case BPF_LSM_CGROUP:
 	case BPF_TRACE_FENTRY:
 	case BPF_TRACE_FEXIT:
+	/*
+	 * vsched: BPF_SCHED programs use the same BTF-based trampoline attach
+	 * mechanism as LSM/TRACING/MODIFY_RETURN. Without this case, the switch
+	 * falls through to the unreachable `default:` branch in callers and
+	 * returns -EINVAL *before* any verifier log line is written, so the load
+	 * fails with -EINVAL and an empty verifier log. Joining the fall-through
+	 * group routes BPF_SCHED through the btf_type_is_func() check and the
+	 * normal verifier setup path, so failures emit real log messages.
+	 */
+	case BPF_SCHED:
 		if (!btf_type_is_func(t)) {
 			bpf_log(log, "attach_btf_id %u is not a function\n",
 				btf_id);
@@ -23948,7 +23959,9 @@ static int check_attach_btf_id(struct bpf_verifier_env *env)
 
 	if (prog->type != BPF_PROG_TYPE_TRACING &&
 	    prog->type != BPF_PROG_TYPE_LSM &&
-	    prog->type != BPF_PROG_TYPE_EXT)
+	    prog->type != BPF_PROG_TYPE_EXT &&
+	    /* vsched: SCHED uses BTF-based trampoline attach, needs check_attach_btf_id */
+	    prog->type != BPF_PROG_TYPE_SCHED)
 		return 0;
 
 	ret = bpf_check_attach_target(&env->log, prog, tgt_prog, btf_id, &tgt_info);
@@ -23983,6 +23996,11 @@ static int check_attach_btf_id(struct bpf_verifier_env *env)
 
 	if (prog->type == BPF_PROG_TYPE_LSM) {
 		ret = bpf_lsm_verify_prog(&env->log, prog);
+		if (ret < 0)
+			return ret;
+	} else if (prog->type == BPF_PROG_TYPE_SCHED) {
+		/* vsched: verify that attach_btf_id points to a known bpf_sched_ hook */
+		ret = bpf_sched_verify_prog(&env->log, prog);
 		if (ret < 0)
 			return ret;
 	} else if (prog->type == BPF_PROG_TYPE_TRACING &&
