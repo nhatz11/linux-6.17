@@ -1418,6 +1418,26 @@ struct task_struct {
 # endif
 #endif
 
+	int				lock_depth;	/* kernel spinlocks held in process context */
+
+	/*
+	 * Kernel spinlock critical-section timing (outermost CS only).
+	 * cs_start_ts: sched_clock() snapshot at outermost acquire; paused
+	 *   (zeroed) in prepare_task_switch() while off-CPU and reopened in
+	 *   finish_task_switch() so a preemption gap is never counted as CS
+	 *   time. Cleared at outermost release.
+	 * cs_wall_start_ts: sched_clock() snapshot at outermost acquire; never
+	 *   touched by context-switch handlers. Cleared only at outermost
+	 *   release. Wall-clock CS duration, mirroring rseq::last_cs_overall_ns
+	 *   semantics.
+	 * last_cs_ns: wall-clock duration of the most recently completed
+	 *   outermost CS (sched_clock() - cs_wall_start_ts at release).
+	 * Updated only in process context (!in_interrupt()) by spinlock.c.
+	 */
+	u64				cs_start_ts;
+	u64				cs_wall_start_ts;
+	u64				last_cs_ns;
+
 #ifdef CONFIG_SCHED_MM_CID
 	int				mm_cid;		/* Current cid in mm */
 	int				last_mm_cid;	/* Most recent cid in mm */

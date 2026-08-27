@@ -37,6 +37,7 @@
 #include <linux/sched/nohz.h>
 #include <linux/sched/rseq_api.h>
 #include <linux/sched/rt.h>
+#include <linux/bpf_sched.h>
 
 #include <linux/blkdev.h>
 #include <linux/context_tracking.h>
@@ -4475,6 +4476,8 @@ int wake_up_state(struct task_struct *p, unsigned int state)
 static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
 {
 	p->on_rq			= 0;
+	p->lock_depth			= 0;
+	p->cs_start_ts			= 0;
 
 	p->se.on_rq			= 0;
 	p->se.exec_start		= 0;
@@ -5158,6 +5161,24 @@ prepare_task_switch(struct rq *rq, struct task_struct *prev,
 	kmap_local_sched_out();
 	prepare_task(next);
 	prepare_arch_switch(next);
+
+	/*
+	 * Pause the outermost-CS clock before going off-CPU. cs_start_ts must
+	 * NOT tick while the task is preempted: off-CPU time is not CS time.
+	 * Clear the stamp so cs_exit()'s eventual last_cs_ns doesn't include
+	 * this off-CPU gap; finish_task_switch() reopens it if the task still
+	 * holds locks. Must happen before lock_depth-- so that decrement below
+	 * sees the full (rq-lock-inclusive) depth is irrelevant here -- no
+	 * conditional read of lock_depth in this pause, just an unconditional
+	 * clear (cs_exit() itself no-ops if cs_start_ts is already 0).
+	 *
+	 * lock_depth--: undoes prev's rq->lock acquisition (a real raw_spinlock,
+	 * taken via the normal _raw_spin_lock() wrapper inside __schedule())
+	 * so prev does not resume carrying a phantom +1 from a lock it no
+	 * longer holds once it's scheduled back in.
+	 */
+	prev->cs_start_ts = 0;
+	prev->lock_depth--;
 }
 
 /**
@@ -5221,6 +5242,25 @@ static struct rq *finish_task_switch(struct task_struct *prev)
 	finish_task(prev);
 	tick_nohz_task_switch();
 	finish_lock_switch(rq);
+	/*
+	 * rq->lock is now released. lock_depth here reflects only real user
+	 * spinlocks (the rq-lock +1/-1 in finish_lock_switch/raw_spin_rq_unlock
+	 * cancels out). If the task was preempted mid-CS, reopen the CS clock
+	 * so last_cs_ns (at the eventual outermost release) doesn't include
+	 * this off-CPU gap.
+	 *
+	 * Diagnostic gate (ivh_cs_track_enabled): skip the TSC read entirely
+	 * when 0; track==3 pays the real sched_clock() cost and discards it
+	 * (TSC-only isolation mode, see cs_enter()/cs_exit() in spinlock.c).
+	 */
+	if (current->lock_depth > 0) {
+		unsigned long track = READ_ONCE(ivh_cs_track_enabled);
+
+		if (track == 3)
+			(void)sched_clock();
+		else if (track)
+			current->cs_start_ts = ivh_cs_clock();
+	}
 	finish_arch_post_lock_switch();
 	kcov_finish_switch(current);
 	/*

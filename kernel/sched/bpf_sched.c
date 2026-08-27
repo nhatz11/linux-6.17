@@ -4,6 +4,7 @@
 #include <linux/bpf_verifier.h>
 #include <linux/bpf_sched.h>
 #include <linux/btf_ids.h>
+#include <linux/sysctl.h>
 #include "sched.h"
 
 /*
@@ -16,6 +17,33 @@
  */
 
 DEFINE_STATIC_KEY_FALSE(bpf_sched_enabled_key);
+
+/*
+ * Step 3 (ivh-rebuild-main): CS-hold timing storage + the ivh_cs_track_enabled
+ * diagnostic sysctl -- see include/linux/bpf_sched.h for the mode
+ * documentation and kernel/locking/spinlock.c's cs_enter()/cs_exit() for the
+ * consumers. Default 1 (real sched_clock() TSC reads, bit-for-bit the
+ * original always-on behavior this step's mechanism replaces).
+ */
+unsigned long ivh_cs_track_enabled = 1UL;
+DEFINE_PER_CPU(u64, ivh_cs_fake_clock_ctr);
+
+static const struct ctl_table ivh_sysctls[] = {
+	{
+		.procname	= "ivh_cs_track_enabled",
+		.data		= &ivh_cs_track_enabled,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+};
+
+static int __init ivh_sysctl_init(void)
+{
+	register_sysctl_init("kernel", ivh_sysctls);
+	return 0;
+}
+late_initcall(ivh_sysctl_init);
 
 /*
  * For every hook declare a nop function where a BPF program can be attached.

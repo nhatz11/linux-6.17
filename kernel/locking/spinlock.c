@@ -21,6 +21,75 @@
 #include <linux/interrupt.h>
 #include <linux/debug_locks.h>
 #include <linux/export.h>
+#include <linux/sched.h>
+#include <linux/bpf_sched.h>
+
+/*
+ * cs_enter / cs_exit -- helpers called around lock_depth transitions.
+ * cs_enter: called after lock_depth reaches 1 (outermost acquire); records
+ *   the start timestamp.
+ * cs_exit: called after lock_depth reaches 0 (outermost release); computes
+ *   last_cs_ns and clears cs_start_ts/cs_wall_start_ts.
+ * Both are no-ops for nested locks (lock_depth > 1 after enter, > 0 after
+ * exit).
+ *
+ * sched_clock() is used instead of ktime_get_ns() because spinlocks fire
+ * before timekeeping is initialized; sched_clock() is safe in any context.
+ *
+ * Step 3 (ivh-rebuild-main): CS-hold timing only -- the CS-preemption-stamp
+ * mechanism (IVH_HAVE_CS_BEAT / ivh_cs_beat_publish / ivh_cs_preempt_src,
+ * cs_beat_lock) and the Hot Threads contention/preemption classifier
+ * (ivh_pre_lock, ivh_hot_note_wait_event, ivh_hot_preempt_update, the
+ * ivh_obs_* observe-only counters) that production fuses into these same two
+ * functions are both later-step material with no dependency on CS-hold
+ * timing itself, and are deliberately not ported here.
+ */
+static __always_inline void cs_enter(raw_spinlock_t *lock)
+{
+	if (current->lock_depth == 1) {
+		if (!READ_ONCE(ivh_cs_track_enabled))
+			return;
+		if (unlikely(READ_ONCE(ivh_cs_track_enabled) == 3)) {
+			/*
+			 * TSC-only isolation mode: pay the real sched_clock()
+			 * cost and discard it -- no cs_start_ts write, no
+			 * bookkeeping at all. Pairs with mode 2 (bookkeeping
+			 * only, fake clock) to separate the TSC read's share
+			 * of the tax from the bookkeeping's share. Diagnostic
+			 * only: do not flip ivh_cs_track_enabled mid-hold, see
+			 * cs_exit()'s matching branch.
+			 */
+			(void)sched_clock();
+			return;
+		}
+		current->cs_start_ts = ivh_cs_clock();
+		current->cs_wall_start_ts = current->cs_start_ts;
+	}
+}
+
+static __always_inline void cs_exit(raw_spinlock_t *lock)
+{
+	if (current->lock_depth == 0 &&
+	    unlikely(READ_ONCE(ivh_cs_track_enabled) == 3)) {
+		/*
+		 * TSC-only isolation mode: matching dummy read for the one
+		 * taken in cs_enter(), no bookkeeping. cs_start_ts was never
+		 * set on this path (mode 3 returns before writing it), so
+		 * this check must come before the cs_start_ts gate below, not
+		 * fall through to it.
+		 */
+		(void)sched_clock();
+		return;
+	}
+
+	if (current->lock_depth == 0 && current->cs_start_ts) {
+		u64 now = ivh_cs_clock();
+
+		current->last_cs_ns = now - current->cs_wall_start_ts;
+		current->cs_start_ts = 0;
+		current->cs_wall_start_ts = 0;
+	}
+}
 
 #ifdef CONFIG_MMIOWB
 #ifndef arch_mmiowb_state
@@ -135,7 +204,12 @@ BUILD_LOCK_OPS(write, rwlock);
 #ifndef CONFIG_INLINE_SPIN_TRYLOCK
 noinline int __lockfunc _raw_spin_trylock(raw_spinlock_t *lock)
 {
-	return __raw_spin_trylock(lock);
+	int ret = __raw_spin_trylock(lock);
+	if (ret && !in_interrupt()) {
+		current->lock_depth++;
+		cs_enter(lock);
+	}
+	return ret;
 }
 EXPORT_SYMBOL(_raw_spin_trylock);
 #endif
@@ -143,7 +217,13 @@ EXPORT_SYMBOL(_raw_spin_trylock);
 #ifndef CONFIG_INLINE_SPIN_TRYLOCK_BH
 noinline int __lockfunc _raw_spin_trylock_bh(raw_spinlock_t *lock)
 {
-	return __raw_spin_trylock_bh(lock);
+	bool track = !in_interrupt();
+	int ret = __raw_spin_trylock_bh(lock);
+	if (ret && track) {
+		current->lock_depth++;
+		cs_enter(lock);
+	}
+	return ret;
 }
 EXPORT_SYMBOL(_raw_spin_trylock_bh);
 #endif
@@ -152,6 +232,10 @@ EXPORT_SYMBOL(_raw_spin_trylock_bh);
 noinline void __lockfunc _raw_spin_lock(raw_spinlock_t *lock)
 {
 	__raw_spin_lock(lock);
+	if (!in_interrupt()) {
+		current->lock_depth++;
+		cs_enter(lock);
+	}
 }
 EXPORT_SYMBOL(_raw_spin_lock);
 #endif
@@ -159,7 +243,14 @@ EXPORT_SYMBOL(_raw_spin_lock);
 #ifndef CONFIG_INLINE_SPIN_LOCK_IRQSAVE
 noinline unsigned long __lockfunc _raw_spin_lock_irqsave(raw_spinlock_t *lock)
 {
-	return __raw_spin_lock_irqsave(lock);
+	unsigned long flags;
+
+	flags = __raw_spin_lock_irqsave(lock);
+	if (!in_interrupt()) {
+		current->lock_depth++;
+		cs_enter(lock);
+	}
+	return flags;
 }
 EXPORT_SYMBOL(_raw_spin_lock_irqsave);
 #endif
@@ -168,6 +259,10 @@ EXPORT_SYMBOL(_raw_spin_lock_irqsave);
 noinline void __lockfunc _raw_spin_lock_irq(raw_spinlock_t *lock)
 {
 	__raw_spin_lock_irq(lock);
+	if (!in_interrupt()) {
+		current->lock_depth++;
+		cs_enter(lock);
+	}
 }
 EXPORT_SYMBOL(_raw_spin_lock_irq);
 #endif
@@ -175,7 +270,12 @@ EXPORT_SYMBOL(_raw_spin_lock_irq);
 #ifndef CONFIG_INLINE_SPIN_LOCK_BH
 noinline void __lockfunc _raw_spin_lock_bh(raw_spinlock_t *lock)
 {
+	bool track = !in_interrupt();
 	__raw_spin_lock_bh(lock);
+	if (track) {
+		current->lock_depth++;
+		cs_enter(lock);
+	}
 }
 EXPORT_SYMBOL(_raw_spin_lock_bh);
 #endif
@@ -183,6 +283,10 @@ EXPORT_SYMBOL(_raw_spin_lock_bh);
 #ifdef CONFIG_UNINLINE_SPIN_UNLOCK
 noinline void __lockfunc _raw_spin_unlock(raw_spinlock_t *lock)
 {
+	if (!in_interrupt()) {
+		current->lock_depth--;
+		cs_exit(lock);
+	}
 	__raw_spin_unlock(lock);
 }
 EXPORT_SYMBOL(_raw_spin_unlock);
@@ -191,6 +295,10 @@ EXPORT_SYMBOL(_raw_spin_unlock);
 #ifndef CONFIG_INLINE_SPIN_UNLOCK_IRQRESTORE
 noinline void __lockfunc _raw_spin_unlock_irqrestore(raw_spinlock_t *lock, unsigned long flags)
 {
+	if (!in_interrupt()) {
+		current->lock_depth--;
+		cs_exit(lock);
+	}
 	__raw_spin_unlock_irqrestore(lock, flags);
 }
 EXPORT_SYMBOL(_raw_spin_unlock_irqrestore);
@@ -199,6 +307,10 @@ EXPORT_SYMBOL(_raw_spin_unlock_irqrestore);
 #ifndef CONFIG_INLINE_SPIN_UNLOCK_IRQ
 noinline void __lockfunc _raw_spin_unlock_irq(raw_spinlock_t *lock)
 {
+	if (!in_interrupt()) {
+		current->lock_depth--;
+		cs_exit(lock);
+	}
 	__raw_spin_unlock_irq(lock);
 }
 EXPORT_SYMBOL(_raw_spin_unlock_irq);
@@ -208,6 +320,11 @@ EXPORT_SYMBOL(_raw_spin_unlock_irq);
 noinline void __lockfunc _raw_spin_unlock_bh(raw_spinlock_t *lock)
 {
 	__raw_spin_unlock_bh(lock);
+	/* decrement after unlock; cs_exit measures slightly past actual release */
+	if (!in_interrupt()) {
+		current->lock_depth--;
+		cs_exit(lock);
+	}
 }
 EXPORT_SYMBOL(_raw_spin_unlock_bh);
 #endif
