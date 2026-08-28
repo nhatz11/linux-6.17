@@ -21,6 +21,7 @@
  *  Copyright (C) 2007 Red Hat, Inc., Peter Zijlstra
  */
 #include <linux/energy_model.h>
+#include <linux/bpf_sched.h>
 #include <linux/mmap_lock.h>
 #include <linux/hugetlb_inline.h>
 #include <linux/jiffies.h>
@@ -13625,3 +13626,24 @@ __init void init_sched_fair_class(void)
 	zalloc_cpumask_var(&nohz.idle_cpus_mask, GFP_NOWAIT);
 #endif
 }
+
+/*
+ * ivh_task_rq_in_danger - IVH rebuild Step 5 stub.
+ *
+ * See the doc comment on the declaration in <linux/bpf_sched.h>. Production's
+ * real implementation is a Gate 1+2 (capacity/time-left) re-check that
+ * depends on the capacity/migration engine ported in Step 6/8. That engine
+ * doesn't exist yet in this tree, and its sole real gate
+ * (ivh_universal_eligible) is always 0 until Step 8 -- at which point
+ * production's own function would unconditionally return false here anyway.
+ * This stub reproduces exactly that behavior directly, so
+ * RSEQ_SCHED_STATE_FLAG_IVH_DANGER is never set (correct: no migration
+ * mechanism exists yet to be in danger of triggering) without pulling in
+ * Step 6's plumbing early. Replace with the real Gate 1+2 body when Step 6
+ * lands.
+ */
+bool ivh_task_rq_in_danger(struct task_struct *t)
+{
+	return false;
+}
+EXPORT_SYMBOL_GPL(ivh_task_rq_in_danger);

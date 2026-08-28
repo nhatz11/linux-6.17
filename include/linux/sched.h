@@ -993,6 +993,9 @@ struct task_struct {
 #ifdef CONFIG_RT_MUTEXES
 	unsigned			sched_rt_mutex:1;
 #endif
+#if defined(CONFIG_RSEQ) && defined(CONFIG_SCHED_HRTICK)
+	unsigned			rseq_sched_delay:1;
+#endif
 
 	/* Bit to tell TOMOYO we're in execve(): */
 	unsigned			in_execve:1;
@@ -1407,6 +1410,12 @@ struct task_struct {
 	 * with respect to preemption.
 	 */
 	unsigned long rseq_event_mask;
+	/*
+	 * Pointer to the userspace rseq_sched_state structure, or NULL if
+	 * the thread did not register one.  Set at rseq registration from
+	 * struct rseq::sched_state_ptr; cleared on unregister and execve.
+	 */
+	struct rseq_sched_state __user *rseq_sched_state;
 # ifdef CONFIG_DEBUG_RSEQ
 	/*
 	 * This is a place holder to save a copy of the rseq fields for
@@ -1941,6 +1950,22 @@ union thread_union {
 #endif
 	unsigned long stack[THREAD_SIZE/sizeof(long)];
 };
+
+#if defined(CONFIG_RSEQ) && defined(CONFIG_SCHED_HRTICK)
+extern bool rseq_delay_resched(void);
+extern void rseq_delay_resched_fini(unsigned long ti_work);
+extern void rseq_delay_resched_tick(void);
+#else
+static inline bool rseq_delay_resched(void) { return false; }
+static inline void rseq_delay_resched_fini(unsigned long ti_work) { }
+static inline void rseq_delay_resched_tick(void) { }
+#endif
+
+#ifdef CONFIG_SCHED_HRTICK
+extern void hrtick_local_start(u64 delay);
+#else
+static inline void hrtick_local_start(u64 delay) { }
+#endif
 
 #ifndef CONFIG_THREAD_INFO_IN_TASK
 extern struct thread_info init_thread_info;

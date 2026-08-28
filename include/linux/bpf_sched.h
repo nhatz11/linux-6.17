@@ -89,4 +89,23 @@ static inline bool bpf_sched_enabled(void)
 
 #endif /* CONFIG_BPF_SYSCALL */
 
+/*
+ * Advisory (non-authoritative) Gate 1+2 re-check for task @t's current CPU,
+ * called from kernel/rseq.c's rseq_update_cpu_node_id() to publish
+ * RSEQ_SCHED_STATE_FLAG_IVH_DANGER (include/uapi/linux/rseq.h) on every
+ * return-to-userspace. Defined in kernel/sched/fair.c.
+ *
+ * IVH rebuild Step 5 (tools/bpf/docs/ivh_rebuild_plan.md sec 4): production's
+ * real implementation depends entirely on the capacity/migration engine
+ * (ivh_universal_eligible, ivh_cap_source, ivh_gate_capacity(),
+ * ivh_gate_time_left_reject()) -- Step 6/8 material not yet ported. Since
+ * ivh_universal_eligible is always 0 until Step 8 turns it on, production's
+ * own function would always return false anyway at this point in the
+ * rebuild; kernel/sched/fair.c defines a minimal stub that does the same
+ * thing directly, without pulling in Step 6's plumbing early. Same posture
+ * as Step 3's ivh_cs_track_enabled and Step 4's out-of-scope exclusions.
+ */
+struct task_struct;
+bool ivh_task_rq_in_danger(struct task_struct *t);
+
 #endif /* _BPF_CGROUP_H */

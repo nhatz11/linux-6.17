@@ -14,6 +14,8 @@
 #include <linux/rseq.h>
 #include <linux/types.h>
 #include <linux/ratelimit.h>
+#include <linux/sysctl.h>
+#include <linux/bpf_sched.h>
 #include <asm/ptrace.h>
 
 #define CREATE_TRACE_POINTS
@@ -160,10 +162,22 @@ static int rseq_validate_ro_fields(struct task_struct *t)
 
 static int rseq_update_cpu_node_id(struct task_struct *t)
 {
+	struct rseq_sched_state __user *rseq_sched_state = t->rseq_sched_state;
 	struct rseq __user *rseq = t->rseq;
 	u32 cpu_id = raw_smp_processor_id();
 	u32 node_id = cpu_to_node(cpu_id);
 	u32 mm_cid = task_mm_cid(t);
+	u32 sched_state = RSEQ_SCHED_STATE_FLAG_ON_CPU;
+
+	/*
+	 * Advisory IVH danger bit -- see RSEQ_SCHED_STATE_FLAG_IVH_DANGER
+	 * (include/uapi/linux/rseq.h) and ivh_task_rq_in_danger()
+	 * (kernel/sched/fair.c). ivh_task_rq_in_danger() itself short-circuits
+	 * in one branch (READ_ONCE(ivh_universal_eligible)) when IVH is off,
+	 * which is the overwhelmingly common case system-wide.
+	 */
+	if (ivh_task_rq_in_danger(t))
+		sched_state |= RSEQ_SCHED_STATE_FLAG_IVH_DANGER;
 
 	/*
 	 * Validate read-only rseq fields.
@@ -178,6 +192,19 @@ static int rseq_update_cpu_node_id(struct task_struct *t)
 	rseq_unsafe_put_user(t, cpu_id, cpu_id, efault_end);
 	rseq_unsafe_put_user(t, node_id, node_id, efault_end);
 	rseq_unsafe_put_user(t, mm_cid, mm_cid, efault_end);
+	/*
+	 * Mark the task as on-CPU in the sched_state structure.
+	 *
+	 * Null-check required: rseq_sched_state is NULL for any thread that
+	 * registered with a short rseq_len (e.g. glibc ORIG_RSEQ_SIZE=32) or
+	 * that left sched_state_ptr=0 in struct rseq.  Upstream omits this
+	 * check; without it, the unsafe_put_user targets user address 0x4
+	 * (offsetof(state)=4 from NULL), faults, and force_sigsegv kills the
+	 * process on every return to userspace.
+	 */
+	if (rseq_sched_state)
+		unsafe_put_user(sched_state, &rseq_sched_state->state,
+				efault_end);
 
 	/*
 	 * Additional feature fields added after ORIG_RSEQ_SIZE
@@ -448,6 +475,167 @@ error:
 	force_sigsegv(sig);
 }
 
+/*
+ * __rseq_set_sched_state - write state to the registered rseq_sched_state.
+ *
+ * Called from the scheduler preemption path via rseq_preempt() to clear
+ * RSEQ_SCHED_STATE_FLAG_ON_CPU (state=0) when the task is being scheduled
+ * out.  Uses pagefault_disable so that the write can be attempted from
+ * non-faultable context; if the page is not present the update is silently
+ * dropped — userspace must fault the page in before registering.
+ *
+ * The caller (rseq_set_sched_state) has already checked that
+ * t->rseq_sched_state is non-NULL.
+ */
+void __rseq_set_sched_state(struct task_struct *t, unsigned int state)
+{
+	if (unlikely(t->flags & PF_EXITING))
+		return;
+	pagefault_disable();
+	(void) put_user(state, &t->rseq_sched_state->state);
+	pagefault_enable();
+}
+
+#ifdef CONFIG_SCHED_HRTICK
+__read_mostly unsigned int rseq_sched_extend_usec = 50;
+
+void rseq_delay_resched_fini(unsigned long ti_work)
+{
+	struct task_struct *t = current;
+
+	if (!t->rseq)
+		return;
+
+	if (!(ti_work & _TIF_NEED_RESCHED_LAZY)) {
+		t->rseq_sched_delay = 0;
+		return;
+	}
+
+	if (t->rseq_sched_delay)
+		return;
+
+	/*
+	 * Extension disabled: let the lazy resched fire immediately on the
+	 * next opportunity instead of giving userspace a grace period.
+	 */
+	if (!rseq_sched_extend_usec)
+		return;
+
+	/*
+	 * Give userspace rseq_sched_extend_usec microseconds to notice the
+	 * KERNEL_REQUEST_SCHED bit we set in rseq_delay_resched() and call
+	 * sched_yield() cooperatively.  If the timer fires before that
+	 * happens, rseq_delay_resched_tick() forces the resched.
+	 * Tunable at runtime via /proc/sys/kernel/rseq_sched_extend_usec.
+	 */
+	t->rseq_sched_delay = 1;
+	hrtick_local_start((u64)rseq_sched_extend_usec * NSEC_PER_USEC);
+}
+
+bool rseq_delay_resched(void)
+{
+	struct task_struct *t = current;
+	u32 flags;
+
+	if (!t->rseq)
+		goto nodelay;
+
+	/*
+	 * Extension is disabled at runtime; fall through to normal scheduling.
+	 * cr_counter bits 2-31 (lock nesting depth) are unaffected — the BPF
+	 * lock-holder check in running_migration() still works correctly.
+	 */
+	if (!rseq_sched_extend_usec)
+		goto nodelay;
+
+	/* Task registered with the old 32-byte rseq ABI, which has no cr_counter. */
+	if (current->rseq_len <= offsetof(struct rseq, cr_counter))
+		goto nodelay;
+
+	if (copy_from_user_nofault(&flags, &t->rseq->cr_counter, sizeof(flags)))
+		goto nodelay;
+
+	/*
+	 * Only delay if userspace is inside a critical section (bit 0 set).
+	 * Bare bit 0 is the entry marker; bits 2-31 are the lock nesting depth
+	 * incremented by extend()/inc_extend() in userspace.
+	 */
+	if (!(flags & RSEQ_CR_FLAG_IN_CRITICAL_SECTION_MASK))
+		goto nodelay;
+
+	trace_printk("Extend time slice\n");
+	flags |= RSEQ_CR_FLAG_KERNEL_REQUEST_SCHED;
+
+	if (copy_to_user_nofault(&t->rseq->cr_counter, &flags, sizeof(flags))) {
+		trace_printk("Faulted writing rseq\n");
+		goto nodelay;
+	}
+
+	return true;
+
+nodelay:
+	t->rseq_sched_delay = 0;
+	return false;
+}
+
+void rseq_delay_resched_tick(void)
+{
+	struct task_struct *t = current;
+
+	if (t->rseq_sched_delay) {
+		u32 flags;
+
+		set_tsk_need_resched(t);
+		t->rseq_sched_delay = 0;
+		trace_printk("timeout -- force resched\n");
+
+		if (!t->rseq)
+			return;
+
+		if (copy_from_user_nofault(&flags, &t->rseq->cr_counter,
+					   sizeof(flags)))
+			return;
+
+		flags &= ~RSEQ_CR_FLAG_KERNEL_REQUEST_SCHED;
+		copy_to_user_nofault(&t->rseq->cr_counter, &flags, sizeof(flags));
+	}
+}
+#endif /* CONFIG_SCHED_HRTICK */
+
+#if defined(CONFIG_SYSCTL) && defined(CONFIG_SCHED_HRTICK)
+/*
+ * Expose rseq_sched_extend_usec under /proc/sys/kernel/rseq_sched_extend_usec.
+ *
+ * Write a non-zero value to change the grace period the kernel gives a task
+ * inside an rseq critical section before it forces preemption.  Write 0 to
+ * disable the extension entirely — useful when you only care about cr_counter
+ * for lock-holder identification (BPF IVH) and don't want the cooperative
+ * yield logic running at all.
+ *
+ * Example usage:
+ *   echo 100 | sudo tee /proc/sys/kernel/rseq_sched_extend_usec   # 100 µs
+ *   echo 0   | sudo tee /proc/sys/kernel/rseq_sched_extend_usec   # disabled
+ */
+static const struct ctl_table rseq_sysctls[] = {
+	{
+		.procname	= "rseq_sched_extend_usec",
+		.data		= &rseq_sched_extend_usec,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		/* minimum 0 (disabled); no upper bound enforced by kernel */
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+	},
+};
+
+static int __init rseq_sysctl_init(void)
+{
+	register_sysctl_init("kernel", rseq_sysctls);
+	return 0;
+}
+late_initcall(rseq_sysctl_init);
+#endif /* CONFIG_SYSCTL && CONFIG_SCHED_HRTICK */
+
 #ifdef CONFIG_DEBUG_RSEQ
 
 /*
@@ -469,6 +657,42 @@ void rseq_syscall(struct pt_regs *regs)
 #endif
 
 /*
+ * rseq_get_sched_state_ptr - extract and validate the sched_state_ptr field.
+ *
+ * If the registered rseq_len is too short to include sched_state_ptr (e.g.
+ * ORIG_RSEQ_SIZE=32 or the previous 64-byte extended ABI), returns 0 with
+ * *_sched_state_ptr left as NULL — the feature is simply absent for that
+ * thread.  If the user populated sched_state_ptr with a non-NULL address,
+ * this function writes version=0 to the structure (probing that the page is
+ * mapped and writable) and stores the pointer in *_sched_state_ptr.
+ */
+static int rseq_get_sched_state_ptr(struct rseq __user *rseq, u32 rseq_len,
+				    struct rseq_sched_state __user **_sched_state_ptr)
+{
+	struct rseq_sched_state __user *sched_state_ptr;
+	u64 sched_state_ptr_value;
+	u32 version = 0;
+	int ret;
+
+	/* Feature absent for threads using a short rseq registration. */
+	if (rseq_len < offsetofend(struct rseq, sched_state_ptr))
+		return 0;
+	ret = get_user(sched_state_ptr_value, &rseq->sched_state_ptr);
+	if (ret)
+		return ret;
+	sched_state_ptr = (struct rseq_sched_state __user *)(unsigned long)sched_state_ptr_value;
+	/* User did not opt into the sched_state feature. */
+	if (!sched_state_ptr)
+		return 0;
+	/* Write version=0, confirming the page is present and writable. */
+	ret = put_user(version, &sched_state_ptr->version);
+	if (ret)
+		return ret;
+	*_sched_state_ptr = sched_state_ptr;
+	return 0;
+}
+
+/*
  * sys_rseq - setup restartable sequences for caller thread.
  */
 SYSCALL_DEFINE4(rseq, struct rseq __user *, rseq, u32, rseq_len,
@@ -476,6 +700,7 @@ SYSCALL_DEFINE4(rseq, struct rseq __user *, rseq, u32, rseq_len,
 {
 	int ret;
 	u64 rseq_cs;
+	struct rseq_sched_state __user *sched_state_ptr = NULL;
 
 	if (flags & RSEQ_FLAG_UNREGISTER) {
 		if (flags & ~RSEQ_FLAG_UNREGISTER)
@@ -493,6 +718,7 @@ SYSCALL_DEFINE4(rseq, struct rseq __user *, rseq, u32, rseq_len,
 		current->rseq = NULL;
 		current->rseq_sig = 0;
 		current->rseq_len = 0;
+		current->rseq_sched_state = NULL;
 		return 0;
 	}
 
@@ -530,6 +756,8 @@ SYSCALL_DEFINE4(rseq, struct rseq __user *, rseq, u32, rseq_len,
 		return -EINVAL;
 	if (!access_ok(rseq, rseq_len))
 		return -EFAULT;
+	if (rseq_get_sched_state_ptr(rseq, rseq_len, &sched_state_ptr))
+		return -EFAULT;
 
 	/*
 	 * If the rseq_cs pointer is non-NULL on registration, clear it to
@@ -561,6 +789,7 @@ SYSCALL_DEFINE4(rseq, struct rseq __user *, rseq, u32, rseq_len,
 	current->rseq = rseq;
 	current->rseq_len = rseq_len;
 	current->rseq_sig = sig;
+	current->rseq_sched_state = sched_state_ptr;
 
 	/*
 	 * If rseq was previously inactive, and has just been
