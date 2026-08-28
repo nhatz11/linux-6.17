@@ -22,6 +22,8 @@
 #include <linux/reboot.h>
 #include <linux/hash.h>
 #include <linux/sched.h>
+#include <linux/smp.h>
+#include <trace/events/ipi.h>
 #include <linux/slab.h>
 #include <linux/kprobes.h>
 #include <linux/nmi.h>
@@ -41,6 +43,8 @@
 #include <asm/tlb.h>
 #include <asm/cpuidle_haltpoll.h>
 #include <asm/msr.h>
+#include <asm/mwait.h>
+#include <linux/sysctl.h>
 #include <asm/ptrace.h>
 #include <asm/reboot.h>
 #include <asm/svm.h>
@@ -1031,40 +1035,628 @@ arch_initcall(activate_jump_labels);
 
 #ifdef CONFIG_PARAVIRT_SPINLOCKS
 
-/* Kick a cpu by its apicid. Used to wake up a halted vcpu */
-static void kvm_kick_cpu(int cpu)
-{
-	unsigned long flags = 0;
-	u32 apicid;
+#include <asm/qspinlock.h>
+#include <asm/ivh_tsc_beat.h>
 
-	apicid = per_cpu(x86_cpu_to_apicid, cpu);
-	kvm_hypercall2(KVM_HC_KICK_CPU, flags, apicid);
+/*
+ * IVH rebuild Step 4 (tools/bpf/docs/ivh_rebuild_plan.md sec 4): this
+ * replaces vanilla's kvm_kick_cpu()/kvm_wait()/kvm_spinlock_init() with
+ * IVH's own ivh_pv_kick()/ivh_pv_wait() substitute, mechanism=0 (stock-
+ * mimicking) by default. Ported from production's kvm.c per sec 1.4 items
+ * 1-5, EXCLUDING two mechanisms production fuses into this same file:
+ *
+ *   - The CS-preemption-stamp system (ivh_cs_beat, ivh_cs_preempt_src,
+ *     ivh_cs_predicate_form, ivh_cs_head_check() in
+ *     kernel/locking/qspinlock_paravirt.h) -- sec 1.7's artifact list:
+ *     "fully wired, large, but default-OFF, never enabled in production,
+ *     predicate has a measured hard ceiling of 78.57% sensitivity."
+ *   - Hot Threads' ivh_this_cpu_steal_ns() and the lock-holder-identity
+ *     ownership-transfer call sites (A6/A7/A8/R3/R4 in
+ *     kernel/locking/qspinlock.c and qspinlock_paravirt.h) -- same sec 1.7
+ *     entry bundles these with the CS-stamp predicate as one archived,
+ *     do-not-port unit. Step 2 already ported the holder-table STORAGE
+ *     (arch/x86/kernel/ivh_lock_holder.c) and the release-side clear call
+ *     sites (arch/x86/include/asm/qspinlock.h's R2/R2b) inertly; the
+ *     acquire-side stamp sites stay unported, so the table stays
+ *     permanently empty -- exactly production's own runtime behavior,
+ *     since ivh_lock_holder_enabled is never armed there either.
+ *   - Part C (ivh_vact_capacity/ivh_vact_jump_threshold) -- sec 1.7:
+ *     "attempted, measured regression, root-caused, not shipped."
+ *
+ * Project thesis: mitigate lock-holder preemption in a KVM guest WITHOUT
+ * hypervisor cooperation. The stock kvm_wait() HLTs the waiting vCPU and
+ * relies on the host waking it via KVM_HC_KICK_CPU (KVM_FEATURE_PV_UNHALT).
+ * Mechanism 0 below reproduces that byte-for-byte (the safe default);
+ * mechanisms 1-3 are IVH's own non-hypervisor-cooperative substitutes,
+ * runtime-selectable via the ivh_pv_wait_mechanism sysctl -- see
+ * <asm/qspinlock.h>'s comment on that extern for the full mode table.
+ */
+#define IVH_PV_WAIT_TSC		65536ULL	/* max cycles per wait call, unused by shipped mechanisms */
+#define IVH_PV_TPAUSE_CYCLES	512ULL		/* per-iteration C0.2 nap, mechanism==1/2 poll */
+
+/*
+ * IVH_PV_ADAPTIVE_TSC (~1 ms @ 3 GHz): the deadline used by ivh_pv_wait()'s
+ * mechanism==1 branch and mechanism==2's bounded-poll fallback, paired with
+ * the real pv_kick_node()/ivh_pv_kick() IPI wake in
+ * kernel/locking/qspinlock_paravirt.h. The two are a package deal: with a
+ * real smp_send_reschedule() wake, the IPI is the common-case wake and the
+ * deadline becomes a worst-case backstop for a lost/misdelivered IPI, not
+ * the primary mechanism, so it can (and should) be long. Do not widen this
+ * without the IPI wake in place.
+ */
+#define IVH_PV_ADAPTIVE_TSC	3000000ULL	/* max cycles/wait, mechanism==1 and the mechanism==2 fallback poll */
+
+DEFINE_PER_CPU(u64, ivh_pv_wait_calls);
+
+/*
+ * Runtime toggle for which pv_wait()/pv_kick()/pv_wait_early() behavior
+ * ivh_pv_wait(), ivh_pv_kick() and kernel/locking/qspinlock_paravirt.h's
+ * pv_wait_early() use. Declared extern in arch/x86/include/asm/qspinlock.h
+ * (see there for the full comment on the four states). Default 0: OFF,
+ * safest, closest to pre-IVH behavior.
+ */
+unsigned long ivh_pv_wait_mechanism = 0UL;
+
+/*
+ * Forensic tracing for the mechanism==2 wait/kick path. Default OFF (0).
+ * Plain printk(KERN_EMERG ...), not trace_printk()/ftrace/pstore: this
+ * project had exactly one confirmed hard freeze (2026-07-24, an IF=0 HLT
+ * that no maskable IPI could ever un-halt -- see ivh_pv_wait()'s
+ * mechanism==2 comment for the full SDM/APM-sourced analysis), and once
+ * every CPU is IF=0-halted nothing that depends on *something running
+ * later* (a kthread, irq_work, a future reschedule) can ever produce
+ * output. printk()'s ring-buffer append is synchronous and needs nothing
+ * but the calling CPU, so it is the only instrumentation that survives
+ * this exact failure mode -- and it already has, in the one real incident.
+ * Left OFF by default: this path is hot, and tracing every call at
+ * contention rates can itself perturb timing. Turn on only when actively
+ * chasing a repeat of 2026-07-24.
+ */
+unsigned long ivh_pv_wait_trace = 0UL;
+
+#define ivh_pv_trace(fmt, ...)						\
+	do {								\
+		if (unlikely(READ_ONCE(ivh_pv_wait_trace)))		\
+			printk(KERN_EMERG "ivh_trace: cpu=%d mech=%lu irqs_disabled=%d " \
+			       fmt "\n", raw_smp_processor_id(),	\
+			       READ_ONCE(ivh_pv_wait_mechanism),	\
+			       irqs_disabled(), ##__VA_ARGS__);	\
+	} while (0)
+
+/*
+ * Make ivh_pv_kick()'s wake a *pure* IPI: skip the KVM_HC_KICK_CPU hypercall
+ * entirely for nonzero mechanisms and send only smp_send_reschedule().
+ * Default 0 (OFF). MUTUALLY EXCLUSIVE WITH ivh_pv_wait_mechanism == 0,
+ * enforced by the proc handlers below, not by documentation: mechanism 0 is
+ * the only path that still reaches a bare halt() with RFLAGS.IF=0, and only
+ * KVM_HC_KICK_CPU's pv_unhalted can wake that. Dropping the hypercall while
+ * any waiter can be parked there is the exact 2026-07-24 hard-freeze class.
+ */
+unsigned long ivh_pv_kick_pure_ipi = 0UL;
+
+/*
+ * IVH per-CPU TSC heartbeat -- storage, knobs and validation counters.
+ * Declared (with the full design comment) in <asm/ivh_tsc_beat.h>.
+ */
+DEFINE_PER_CPU_ALIGNED(struct ivh_tsc_beat, ivh_tsc_beat);
+EXPORT_PER_CPU_SYMBOL_GPL(ivh_tsc_beat);
+
+unsigned long ivh_pv_preempt_src = 0UL;		/* 0 = KVM bit (default) */
+/*
+ * 3,300,000 cycles = 1.5 ms at 2200 MHz -- is_cpu_preempted()'s existing
+ * 1,500,000 ns threshold (kernel/sched/cputime.c) expressed in cycles, so
+ * the shadow-comparator mode (src==1) is a controlled reproduction of the
+ * signal this tree already has. Recomputed from the live tsc_khz at
+ * late_initcall so the knob survives a different host.
+ */
+unsigned long ivh_pv_beat_threshold = 3300000UL;
+#define IVH_BEAT_THRESHOLD_US	1500ULL
+unsigned long ivh_pv_beat_publish_mask = 0xfffUL;
+
+DEFINE_PER_CPU(u64, ivh_beat_agree_true);
+DEFINE_PER_CPU(u64, ivh_beat_agree_false);
+DEFINE_PER_CPU(u64, ivh_beat_false_pos);
+DEFINE_PER_CPU(u64, ivh_beat_false_neg);
+DEFINE_PER_CPU(u64, ivh_beat_publishes);
+DEFINE_PER_CPU(s64, ivh_beat_min_age) = S64_MAX;
+DEFINE_PER_CPU(u64, ivh_beat_age_hist_running[IVH_BEAT_AGE_HIST_BUCKETS]);
+DEFINE_PER_CPU(u64, ivh_beat_age_hist_preempted[IVH_BEAT_AGE_HIST_BUCKETS]);
+
+/*
+ * HLT/poll cycle accounting for ivh_pv_wait()'s halt paths. Declared in
+ * <asm/ivh_tsc_beat.h>; production defines this in kernel/sched/core.c
+ * (shared with the Step 6/8 phantom-steal correction that reads it). That
+ * consumer is not ported here, so it is defined locally instead -- see the
+ * file-level comment above for why. Counters accumulate unread for now.
+ */
+DEFINE_PER_CPU_ALIGNED(struct ivh_lock_halt, ivh_lock_halt);
+EXPORT_PER_CPU_SYMBOL_GPL(ivh_lock_halt);
+
+static int __init ivh_pv_beat_calibrate(void)
+{
+	if (tsc_khz)
+		ivh_pv_beat_threshold = (unsigned long)((u64)tsc_khz *
+					IVH_BEAT_THRESHOLD_US / 1000ULL);
+
+	pr_info("IVH: TSC heartbeat threshold = %lu cycles (%llu us at tsc_khz=%u)\n",
+		ivh_pv_beat_threshold, IVH_BEAT_THRESHOLD_US, tsc_khz);
+
+	return 0;
+}
+late_initcall(ivh_pv_beat_calibrate);
+
+#ifdef CONFIG_SYSCTL
+/*
+ * Shared rejection notice for the {mechanism==0, pure_ipi==1} combination.
+ * pr_err (not pr_warn): a write that returns -EINVAL did nothing, and the
+ * caller deserves to see why in dmesg next to their failed sysctl.
+ */
+static void ivh_pv_reject_unsafe_combo(const char *what)
+{
+	pr_err("IVH: refusing %s: ivh_pv_wait_mechanism=0 halts with RFLAGS.IF=0 and can ONLY be woken by the KVM_HC_KICK_CPU hypercall, which ivh_pv_kick_pure_ipi=1 suppresses -- that combination strands halted waiters and freezes the VM. Change the other knob first.\n",
+	       what);
 }
 
-#include <asm/qspinlock.h>
-
-static void kvm_wait(u8 *ptr, u8 val)
+/*
+ * Both handlers parse into a local and only publish to the global once the
+ * combination has been validated, so the pair is never transiently in the
+ * unsafe {0,1} state that a concurrent ivh_pv_kick() could observe.
+ */
+static int ivh_pv_proc_wait_mechanism(const struct ctl_table *table, int write,
+				      void *buffer, size_t *lenp, loff_t *ppos)
 {
+	unsigned long val = READ_ONCE(ivh_pv_wait_mechanism);
+	struct ctl_table tmp = *table;
+	int ret;
+
+	tmp.data = &val;
+	ret = proc_doulongvec_minmax(&tmp, write, buffer, lenp, ppos);
+	if (ret || !write)
+		return ret;
+
+	if (val == 0 && READ_ONCE(ivh_pv_kick_pure_ipi)) {
+		ivh_pv_reject_unsafe_combo("ivh_pv_wait_mechanism=0 while ivh_pv_kick_pure_ipi=1");
+		return -EINVAL;
+	}
+
+	WRITE_ONCE(ivh_pv_wait_mechanism, val);
+	return 0;
+}
+
+static int ivh_pv_proc_kick_pure_ipi(const struct ctl_table *table, int write,
+				     void *buffer, size_t *lenp, loff_t *ppos)
+{
+	unsigned long val = READ_ONCE(ivh_pv_kick_pure_ipi);
+	struct ctl_table tmp = *table;
+	int ret;
+
+	tmp.data = &val;
+	ret = proc_doulongvec_minmax(&tmp, write, buffer, lenp, ppos);
+	if (ret || !write)
+		return ret;
+
+	if (val && !READ_ONCE(ivh_pv_wait_mechanism)) {
+		ivh_pv_reject_unsafe_combo("ivh_pv_kick_pure_ipi=1 while ivh_pv_wait_mechanism=0");
+		return -EINVAL;
+	}
+
+	WRITE_ONCE(ivh_pv_kick_pure_ipi, val);
+	return 0;
+}
+
+/*
+ * ivh_pv_preempt_src: reject anything above 2, and refuse to make the
+ * heartbeat AUTHORITATIVE (2) until every online CPU has actually published
+ * at least once -- an unseeded slot reads 0, so ivh_beat_age() returns a
+ * full rdtsc() and pv_wait_early() would report "preempted" forever, silently.
+ */
+static int ivh_pv_proc_preempt_src(const struct ctl_table *table, int write,
+				   void *buffer, size_t *lenp, loff_t *ppos)
+{
+	unsigned long val = READ_ONCE(ivh_pv_preempt_src);
+	struct ctl_table tmp = *table;
+	int ret, cpu;
+
+	tmp.data = &val;
+	ret = proc_doulongvec_minmax(&tmp, write, buffer, lenp, ppos);
+	if (ret || !write)
+		return ret;
+
+	if (val > 2) {
+		pr_err("IVH: refusing ivh_pv_preempt_src=%lu: valid values are 0 (KVM steal bit), 1 (shadow compare, still returns the KVM bit) and 2 (TSC heartbeat authoritative)\n",
+		       val);
+		return -EINVAL;
+	}
+
+	if (val == 2) {
+		for_each_online_cpu(cpu) {
+			if (!READ_ONCE(per_cpu(ivh_tsc_beat, cpu).stamp)) {
+				pr_err("IVH: refusing ivh_pv_preempt_src=2: CPU %d has never published a TSC heartbeat, so it would read as permanently preempted. Leave src at 0/1 and check that account_process_tick() is running there.\n",
+				       cpu);
+				return -EINVAL;
+			}
+		}
+	}
+
+	WRITE_ONCE(ivh_pv_preempt_src, val);
+	return 0;
+}
+
+/*
+ * The publish mask must stay coarser than or equal to PV_PREV_CHECK_MASK
+ * (0xff, kernel/locking/qspinlock_paravirt.h) and must be a (2^n - 1) form,
+ * because the spin loops test `(loop & mask) == 0`.
+ */
+static int ivh_pv_proc_beat_publish_mask(const struct ctl_table *table, int write,
+					 void *buffer, size_t *lenp, loff_t *ppos)
+{
+	unsigned long val = READ_ONCE(ivh_pv_beat_publish_mask);
+	struct ctl_table tmp = *table;
+	int ret;
+
+	tmp.data = &val;
+	ret = proc_doulongvec_minmax(&tmp, write, buffer, lenp, ppos);
+	if (ret || !write)
+		return ret;
+
+	if (val < 0xffUL || (val & (val + 1))) {
+		pr_err("IVH: refusing ivh_pv_beat_publish_mask=0x%lx: must be of the form 2^n-1 and >= PV_PREV_CHECK_MASK (0xff)\n",
+		       val);
+		return -EINVAL;
+	}
+
+	WRITE_ONCE(ivh_pv_beat_publish_mask, val);
+	return 0;
+}
+
+static const struct ctl_table ivh_pv_sysctls[] = {
+	{
+		.procname	= "ivh_pv_wait_mechanism",
+		.data		= &ivh_pv_wait_mechanism,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= ivh_pv_proc_wait_mechanism,
+	},
+	{
+		.procname	= "ivh_pv_wait_trace",
+		.data		= &ivh_pv_wait_trace,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_pv_kick_pure_ipi",
+		.data		= &ivh_pv_kick_pure_ipi,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= ivh_pv_proc_kick_pure_ipi,
+	},
+	{
+		.procname	= "ivh_pv_preempt_src",
+		.data		= &ivh_pv_preempt_src,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= ivh_pv_proc_preempt_src,
+	},
+	{
+		.procname	= "ivh_pv_beat_threshold",
+		.data		= &ivh_pv_beat_threshold,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_pv_beat_publish_mask",
+		.data		= &ivh_pv_beat_publish_mask,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= ivh_pv_proc_beat_publish_mask,
+	},
+};
+
+static int __init ivh_pv_sysctl_init(void)
+{
+	register_sysctl_init("kernel", ivh_pv_sysctls);
+	return 0;
+}
+late_initcall(ivh_pv_sysctl_init);
+#endif /* CONFIG_SYSCTL */
+
+/*
+ * Republish this vCPU's TSC heartbeat the instant it comes back from an
+ * EXPLICIT halt (mechanism 0's PV_UNHALT halt()/safe_halt(), mechanism 2's
+ * safe_halt()). A vCPU parked in HLT publishes nothing, so on wake its
+ * stamp is stale until the next tick -- up to 1ms at HZ=1000, during which
+ * every waiter queued behind it reads it as host-preempted when it just
+ * woke. Deliberately UNCONDITIONAL: one rdtsc plus one store on a path that
+ * already took a HLT vmexit, so the cost is unmeasurable there.
+ */
+static __always_inline void ivh_beat_halt_exit(void)
+{
+	ivh_tsc_beat_publish();
+	this_cpu_inc(ivh_beat_publishes);
+}
+
+static __always_inline void ivh_pv_backoff(void)
+{
+	/*
+	 * TPAUSE (WAITPKG) parks this logical CPU in a light C0.2 state until
+	 * the TSC deadline or an interrupt, WITHOUT a HLT vmexit -- so it never
+	 * deschedules the vCPU or opens a steal window. If the guest was not
+	 * offered WAITPKG, fall back to PAUSE (cpu_relax), which is always
+	 * valid and is exactly what the TAS/native spin paths already use.
+	 */
+	if (cpu_feature_enabled(X86_FEATURE_WAITPKG)) {
+		u64 until = rdtsc() + IVH_PV_TPAUSE_CYCLES;
+
+		__tpause(TPAUSE_C02_STATE, upper_32_bits(until),
+			 lower_32_bits(until));
+	} else {
+		cpu_relax();
+	}
+}
+
+/*
+ * Kick a cpu by its apicid -- the stock, host-cooperative wake, used only
+ * by the sysctl==0 fallback path below when the host actually advertises
+ * KVM_FEATURE_PV_UNHALT. Verbatim behavior of the pre-IVH kvm_kick_cpu().
+ */
+static void ivh_pv_hypercall_kick(int cpu)
+{
+	u32 apicid = per_cpu(x86_cpu_to_apicid, cpu);
+
+	kvm_hypercall2(KVM_HC_KICK_CPU, 0, apicid);
+}
+
+static void ivh_pv_wait(u8 *ptr, u8 val)
+{
+	u64 deadline;
+
 	if (in_nmi())
 		return;
 
-	/*
-	 * halt until it's our turn and kicked. Note that we do safe halt
-	 * for irq enabled case to avoid hang when lock info is overwritten
-	 * in irq spinlock slowpath and no spurious interrupt occur to save us.
-	 */
-	if (irqs_disabled()) {
-		if (READ_ONCE(*ptr) == val)
-			halt();
-	} else {
-		local_irq_disable();
+	this_cpu_inc(ivh_pv_wait_calls);
 
-		/* safe_halt() will enable IRQ */
-		if (READ_ONCE(*ptr) == val)
-			safe_halt();
-		else
-			local_irq_enable();
+	/*
+	 * sysctl OFF (default, ivh_pv_wait_mechanism == 0): behave as close to
+	 * "no IVH-specific mechanism" as this call site allows.
+	 *   - If the host advertises KVM_FEATURE_PV_UNHALT, this is byte-for-
+	 *     byte the pre-IVH kvm_wait() body: a real halt/safe_halt, woken by
+	 *     ivh_pv_kick()'s hypercall below.
+	 *   - If not, a plain cpu_relax() busy loop with no TPAUSE and no
+	 *     steal-bit logic.
+	 */
+	if (!READ_ONCE(ivh_pv_wait_mechanism)) {
+		/*
+		 * ivh_lock_halt_begin/end: this is a HLT taken OUTSIDE the idle
+		 * loop, so tick_nohz's idle accumulators never see it. Measure
+		 * it here or it becomes phantom steal -- see struct
+		 * ivh_lock_halt in <asm/ivh_tsc_beat.h>. Mechanism 0 is
+		 * instrumented alongside 1 and 2 on purpose: the defect is a
+		 * property of halting in the lock path, not of any one
+		 * mechanism.
+		 */
+		if (kvm_para_has_feature(KVM_FEATURE_PV_UNHALT)) {
+			if (irqs_disabled()) {
+				if (READ_ONCE(*ptr) == val) {
+					ivh_lock_halt_begin(false);
+					halt();
+					ivh_beat_halt_exit();
+					ivh_lock_halt_end();
+				}
+			} else {
+				local_irq_disable();
+				if (READ_ONCE(*ptr) == val) {
+					ivh_lock_halt_begin(false);
+					safe_halt();
+					ivh_beat_halt_exit();
+					ivh_lock_halt_end();
+				} else {
+					local_irq_enable();
+				}
+			}
+			return;
+		}
+
+		while (READ_ONCE(*ptr) == val)
+			cpu_relax();
+		return;
 	}
+
+	/*
+	 * ivh_pv_wait_mechanism == 3: pure busy-spin. Never halts, never naps,
+	 * never yields the pCPU -- the runtime-selectable stand-in for the
+	 * `nopvspin` boot parameter, which cannot be toggled live because
+	 * pv_ops.lock.* and virt_spin_lock_key are decided exactly once in
+	 * kvm_spinlock_init() below. The PV slowpath's own bookkeeping
+	 * (pn->state transitions, _Q_SLOW_VAL, pv_hash) still runs, because
+	 * that lives in the caller, not here.
+	 *
+	 * Forward progress here needs no kick at all, which is what lets
+	 * ivh_pv_kick() skip the IPI for this mechanism -- see its comment.
+	 */
+	if (READ_ONCE(ivh_pv_wait_mechanism) == 3) {
+		while (READ_ONCE(*ptr) == val)
+			cpu_relax();
+		return;
+	}
+
+	/*
+	 * ivh_pv_wait_mechanism == 2: a real halt/safe_halt (genuine vCPU
+	 * yield, a real HLT vmexit the host observes and can reschedule the
+	 * descheduled lock holder onto), woken by the real smp_send_reschedule()
+	 * IPI in ivh_pv_kick()/pv_kick_node() -- NOT by KVM_HC_KICK_CPU, and
+	 * therefore NOT gated on kvm_para_has_feature(KVM_FEATURE_PV_UNHALT).
+	 *
+	 * Why this is correct without PV_UNHALT: HLT in a guest always
+	 * vmexits (host-side HLT-passthrough is only enabled for dedicated
+	 * pCPUs / KVM_HINTS_REALTIME, and kvm_spinlock_init() below already
+	 * routes that case to native qspinlock so this path is never reached
+	 * then) -- the yield is real and host-visible regardless of
+	 * PV_UNHALT, which only ever optimized the *wake*. A HLT-exited
+	 * (host-blocked) vCPU is un-halted by ANY interrupt delivered to its
+	 * LAPIC, and smp_send_reschedule() sends a genuine RESCHEDULE_VECTOR
+	 * APIC IPI, which is baseline interrupt-driven wake, not a paravirt
+	 * feature.
+	 *
+	 * *** DO NOT halt() here when IRQs are ALREADY disabled. ***
+	 *
+	 * Per the Intel SDM Vol.2 and the AMD APM: with RFLAGS.IF=0 a
+	 * maskable interrupt is recognized and left pending in the IRR but
+	 * does NOT un-halt the core -- only NMI/SMI/INIT/RESET do. KVM
+	 * faithfully reproduces that (kvm_arch_vcpu_runnable()'s maskable-
+	 * interrupt term is gated on the guest's RFLAGS.IF); with IF=0 the
+	 * only unconditional wake left is vcpu->arch.pv.pv_unhalted, set by
+	 * exactly one thing: the KVM_HC_KICK_CPU hypercall. A RESCHEDULE_VECTOR
+	 * IPI is maskable and can never un-halt an IF=0 HLT. This is precisely
+	 * the 2026-07-24 hard-freeze root cause: a HLT taken with IF=0, woken
+	 * only by a vehicle (a maskable IPI) that provably cannot wake it,
+	 * producing a silent, unrecoverable whole-VM freeze with no oops. This
+	 * is exactly why upstream's kvm_wait() -- this sequence's origin -- is
+	 * only ever wired up when KVM_FEATURE_PV_UNHALT is present.
+	 *
+	 * So mechanism 2 halts ONLY on the path where it can guarantee IF=1 at
+	 * the HLT (local_irq_disable + safe_halt's atomic sti;hlt). When the
+	 * caller already had IRQs off, we must not block at all, and instead
+	 * fall through to the bounded non-halting poll below. TPAUSE *does*
+	 * wake on a masked pending interrupt (unlike HLT), and the deadline
+	 * bounds it even with zero interrupts, so that path is always
+	 * self-recovering.
+	 *
+	 * "Scoped halt": for a role-C queued MCS waiter
+	 * (kernel/locking/qspinlock_paravirt.h's pv_wait_node()), this branch
+	 * is reached only when pv_wait_early() actually fired for the
+	 * predecessor -- never merely because SPIN_THRESHOLD exhausted while
+	 * prev looked healthy (see the wait_early-gated `continue` there). A
+	 * role-A/B waiter (queue head, pv_wait_head_or_lock()) has no
+	 * predecessor to scope against and reaches this same branch
+	 * UNCONDITIONALLY after its own SPIN_THRESHOLD, exactly as mechanisms
+	 * 0/1 do -- intentional, not an oversight: there is no
+	 * vcpu_is_preempted() signal for "the current lock holder" from that
+	 * path, only for an MCS predecessor.
+	 */
+	if (READ_ONCE(ivh_pv_wait_mechanism) == 2 && !irqs_disabled()) {
+		local_irq_disable();
+		if (READ_ONCE(*ptr) == val) {
+			ivh_pv_trace("mech2 HALT enter (safe_halt, IF=1 at hlt)");
+			ivh_lock_halt_begin(false);
+			safe_halt();		/* sti;hlt -- HLT taken with IF=1 */
+			ivh_beat_halt_exit();
+			ivh_lock_halt_end();
+			ivh_pv_trace("mech2 HALT exit (woke)");
+		} else {
+			ivh_pv_trace("mech2 no-halt (condition cleared before halt)");
+			local_irq_enable();
+		}
+		return;
+	}
+	/*
+	 * mechanism==2 with IRQs already disabled by an outer context falls
+	 * through to the bounded poll below on purpose: see the IF=0 HLT
+	 * discussion above. Never halt() here.
+	 */
+	if (unlikely(READ_ONCE(ivh_pv_wait_mechanism) == 2))
+		ivh_pv_trace("mech2 FALLTHROUGH to bounded poll (irqs already disabled on entry)");
+
+	/*
+	 * sysctl ON: IVH's own non-hypervisor-cooperative substitute. Bounded,
+	 * non-halting poll. Return as soon as the condition clears, or
+	 * (possibly "spuriously") when the window elapses so the PV slowpath
+	 * loop re-checks lock/node state and retries. Never blocks, never
+	 * leaves TASK_RUNNING.
+	 *
+	 * Deadline is IVH_PV_ADAPTIVE_TSC (~1 ms): the real IPI wake wired
+	 * into pv_kick_node()/ivh_pv_kick() is the expected common wake, so
+	 * ivh_pv_backoff()'s naps are cut short by that IPI well before this
+	 * loop's own deadline check would fire; the deadline is only the
+	 * fallback for a lost/misdelivered IPI.
+	 */
+	ivh_lock_halt_begin(true);
+	deadline = rdtsc() + IVH_PV_ADAPTIVE_TSC;
+	do {
+		if (READ_ONCE(*ptr) != val)
+			break;
+		ivh_pv_backoff();
+	} while ((s64)(rdtsc() - deadline) < 0);
+	ivh_lock_halt_end();
+}
+
+static void ivh_pv_kick(int cpu)
+{
+	/*
+	 * mechanism==0: only the host-PV_UNHALT-supported fallback path above
+	 * ever actually halts, so only it needs a real wake; mirror its
+	 * condition exactly so wait/kick stay consistent with each other even
+	 * if the sysctl changes between one thread's wait and another's kick.
+	 * If the host doesn't offer PV_UNHALT, nobody is truly halted (the
+	 * cpu_relax() busy loop self-corrects), so this is a deliberate no-op.
+	 */
+	if (!READ_ONCE(ivh_pv_wait_mechanism)) {
+		if (kvm_para_has_feature(KVM_FEATURE_PV_UNHALT))
+			ivh_pv_hypercall_kick(cpu);
+		return;
+	}
+
+	/*
+	 * mechanism==3 (pure busy-spin): nothing this mechanism parks is ever
+	 * asleep, so there is nothing for a wake to do -- NO IPI is sent. The
+	 * KVM_HC_KICK_CPU hypercall IS still issued (unless
+	 * ivh_pv_kick_pure_ipi=1): the sysctl is live-toggleable, and a waiter
+	 * that entered ivh_pv_wait() a moment before a live write of 3 landed
+	 * is sitting in the mechanism==0 branch's bare halt() with
+	 * RFLAGS.IF=0, where only this hypercall can ever wake it -- see
+	 * ivh_pv_wait()'s mechanism==2 comment. Making this kick a bare no-op
+	 * would turn a live `ivh_pv_wait_mechanism=3` write on a contended
+	 * system into the exact stranded-waiter freeze that comment documents.
+	 */
+	if (READ_ONCE(ivh_pv_wait_mechanism) == 3) {
+		if (kvm_para_has_feature(KVM_FEATURE_PV_UNHALT) &&
+		    !READ_ONCE(ivh_pv_kick_pure_ipi))
+			ivh_pv_hypercall_kick(cpu);
+		return;
+	}
+
+	/*
+	 * mechanism==1 or ==2: __pv_queued_spin_unlock_slowpath()'s
+	 * pv_kick(node->cpu) for the queue-head waiter. By the time pv_kick()
+	 * runs there, lock->locked has already been smp_store_release()'d to
+	 * 0, so this call only needs to wake the waiter (cut mechanism 1's
+	 * TPAUSE nap short, or un-halt mechanism 2's real HLT).
+	 *
+	 * The SAME smp_send_reschedule() serves both mechanisms: a real,
+	 * targeted APIC IPI to `cpu`. For mechanism 2 that IPI is also what
+	 * un-halts a real HLT.
+	 *
+	 * A lost or spurious IPI is not a hang: pv_wait_head_or_lock()'s outer
+	 * for(;;) always re-attempts the trylock/hash dance on return from
+	 * pv_wait(). Mechanism 1's ivh_pv_wait() always returns by
+	 * IVH_PV_ADAPTIVE_TSC; mechanism 2's IF=1 safe_halt() un-halts on the
+	 * next timer tick at the latest.
+	 *
+	 * The hypercall kick is issued IN ADDITION to the IPI (never instead
+	 * of it) because the sysctl is live-toggleable: a waiter that went to
+	 * sleep while the mechanism was 0 is parked in a bare halt() with
+	 * RFLAGS.IF=0, and *only* KVM_HC_KICK_CPU's pv_unhalted can wake that.
+	 * Without this, merely writing a new value to ivh_pv_wait_mechanism on
+	 * a busy system strands every currently-halted waiter and freezes the
+	 * VM. Kicking an already-running vCPU is harmless.
+	 *
+	 * ivh_pv_kick_pure_ipi=1 opts out of that belt-and-braces hypercall
+	 * for a measurably 100%-IPI kick; only reachable when the mechanism is
+	 * already nonzero (the proc handlers refuse {mechanism==0, pure_ipi==1}
+	 * in either write order), so the stranding case above cannot arise
+	 * while it is suppressed.
+	 */
+	if (kvm_para_has_feature(KVM_FEATURE_PV_UNHALT) &&
+	    !READ_ONCE(ivh_pv_kick_pure_ipi)) {
+		ivh_pv_trace("KICK target_cpu=%d via hypercall (PV_UNHALT)", cpu);
+		ivh_pv_hypercall_kick(cpu);
+	} else if (READ_ONCE(ivh_pv_kick_pure_ipi)) {
+		ivh_pv_trace("KICK target_cpu=%d hypercall SKIPPED (ivh_pv_kick_pure_ipi=1)", cpu);
+	}
+
+	ivh_pv_trace("KICK target_cpu=%d via smp_send_reschedule (RESCHEDULE_VECTOR IPI)", cpu);
+	smp_send_reschedule(cpu);
 }
 
 /*
@@ -1073,47 +1665,51 @@ static void kvm_wait(u8 *ptr, u8 val)
 void __init kvm_spinlock_init(void)
 {
 	/*
-	 * In case host doesn't support KVM_FEATURE_PV_UNHALT there is still an
-	 * advantage of keeping virt_spin_lock_key enabled: virt_spin_lock() is
-	 * preferred over native qspinlock when vCPU is preempted.
-	 */
-	if (!kvm_para_has_feature(KVM_FEATURE_PV_UNHALT)) {
-		pr_info("PV spinlocks disabled, no host support\n");
-		return;
-	}
-
-	/*
-	 * Disable PV spinlocks and use native qspinlock when dedicated pCPUs
-	 * are available.
+	 * IVH: unlike stock KVM we deliberately do NOT bail when the host lacks
+	 * KVM_FEATURE_PV_UNHALT. ivh_pv_wait()/ivh_pv_kick() are always safe to
+	 * register here regardless of that feature bit: internally they check
+	 * it themselves to pick between the stock host-cooperative
+	 * halt/hypercall-kick behavior and IVH's own non-cooperative TPAUSE
+	 * substitute, live-toggleable at runtime via the ivh_pv_wait_mechanism
+	 * sysctl. What must NOT be host-feature- or sysctl-dependent is *this*
+	 * registration itself: pv_ops.lock.* and virt_spin_lock_key are set up
+	 * exactly once here, at boot, before any concurrent lock activity
+	 * exists on this CPU. queued_spin_lock_slowpath() re-checks
+	 * virt_spin_lock_key on every single contended acquisition of every
+	 * lock in the kernel, so flipping it under load could strand TAS-mode
+	 * and MCS-queued waiters on the same lock at once.
+	 *
+	 * When dedicated pCPUs are advertised there is no lock-holder
+	 * preemption to mitigate, so plain native fair qspinlock is best.
 	 */
 	if (kvm_para_has_hint(KVM_HINTS_REALTIME)) {
-		pr_info("PV spinlocks disabled with KVM_HINTS_REALTIME hints\n");
+		pr_info("IVH: dedicated pCPUs (KVM_HINTS_REALTIME), using native qspinlock\n");
 		goto out;
 	}
 
 	if (num_possible_cpus() == 1) {
-		pr_info("PV spinlocks disabled, single CPU\n");
+		pr_info("IVH: single CPU, using native qspinlock\n");
 		goto out;
 	}
 
 	if (nopvspin) {
-		pr_info("PV spinlocks disabled, forced by \"nopvspin\" parameter\n");
+		pr_info("IVH: PV spinlocks disabled by \"nopvspin\", using native qspinlock\n");
 		goto out;
 	}
 
-	pr_info("PV spinlocks enabled\n");
+	pr_info("IVH: PV spinlock substitute registered (TAS virt_spin_lock disabled, MCS queueing restored); ivh_pv_wait_mechanism=%lu selects host-cooperative halt/kick vs IVH's own TPAUSE substitute at runtime\n",
+		ivh_pv_wait_mechanism);
 
 	__pv_init_lock_hash();
 	pv_ops.lock.queued_spin_lock_slowpath = __pv_queued_spin_lock_slowpath;
 	pv_ops.lock.queued_spin_unlock =
 		PV_CALLEE_SAVE(__pv_queued_spin_unlock);
-	pv_ops.lock.wait = kvm_wait;
-	pv_ops.lock.kick = kvm_kick_cpu;
+	pv_ops.lock.wait = ivh_pv_wait;
+	pv_ops.lock.kick = ivh_pv_kick;
 
 	/*
-	 * When PV spinlock is enabled which is preferred over
-	 * virt_spin_lock(), virt_spin_lock_key's value is meaningless.
-	 * Just disable it anyway.
+	 * With PV ops registered (or in the native-qspinlock cases above),
+	 * virt_spin_lock()'s TAS hijack must be off so real MCS queueing runs.
 	 */
 out:
 	static_branch_disable(&virt_spin_lock_key);

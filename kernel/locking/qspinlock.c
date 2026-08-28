@@ -14,6 +14,7 @@
 #ifndef _GEN_PV_LOCK_SLOWPATH
 
 #include <linux/smp.h>
+#include <trace/events/ipi.h>
 #include <linux/bug.h>
 #include <linux/cpumask.h>
 #include <linux/percpu.h>
