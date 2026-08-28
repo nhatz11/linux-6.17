@@ -765,13 +765,40 @@ vanilla registers genuine PV spinlocks the same way, dmesg-verified) — mechani
 addition over vanilla's own PV path is the `ivh_pv_wait_calls` counter increment and the
 `ivh_lock_halt_begin`/`end()` cycle-accounting pair around each halt, both cheap. **Confirmed.**
 
-### Step 5 — rseq extensions — **STATUS: specified, not yet built**
+### Step 5 — rseq extensions — **STATUS: BUILT, committed + tagged `6.17-GLOCK-5`, 2026-08-28**
 
-Port §1.6's files. Needed for NHextend3 to exercise its real code path; irrelevant to
-hackbench/dbench/ebizzy. **Expected: no change on 3 of 4 benchmarks, NHextend3 numbers become
-meaningful (they aren't really valid on Steps 0-4 as a cross-kernel comparison, since
-NHextend3's rseq registration silently falls back to a cheaper code path without this — a real
-confound this session found and had to retract a finding over earlier tonight).**
+Ported §1.6's files: the `RSEQ_SCHED_STATE_FLAG_IVH_DANGER` advisory bit (published to userspace
+on every return-to-userspace via `rseq_update_cpu_node_id()`) plus its `struct rseq_sched_state`
+registration path (`kernel/rseq.c`, `include/uapi/linux/rseq.h`, `include/linux/rseq.h`,
+`include/linux/sched.h`), the `exit_to_user_mode_loop()` cooperative-yield hook
+(`kernel/entry/common.c`), and the `sched_yield()` fast-path (`kernel/sched/syscalls.c`). Also
+ported the `rseq_delay_resched*()` critical-section grace-period family that lives in the same
+file, since splitting it out of `kernel/rseq.c` would have been more invasive than including it —
+but **left it fully inert**: its only setter, `rseq_delay_resched_fini()`, is wired into
+`include/linux/irq-entry-common.h` in production, a file outside §1.6's listed scope, so it's
+compiled and declared here but never called. This matches the doc's own finding that this
+sub-feature is "never exercised by any of the 4 benchmarks" — now doubly true in this build.
+
+**Deliberately stubs `ivh_task_rq_in_danger()`** (declared in `include/linux/bpf_sched.h`, defined
+in `kernel/sched/fair.c`) to always return `false` rather than porting production's real Gate 1+2
+re-check, which depends entirely on the capacity/migration engine (`ivh_universal_eligible`,
+`ivh_cap_source`, `ivh_gate_capacity()`, `ivh_gate_time_left_reject()`) — Step 6/8 material. Since
+`ivh_universal_eligible` is always 0 until Step 8, production's own function would unconditionally
+return `false` at this point in the rebuild anyway; the stub reproduces that directly. Same posture
+as Step 4's `ivh_pv_wait_mechanism=0` default and Step 3's `ivh_cs_track_enabled`.
+
+**Build verification performed**: `make olddefconfig` → "No change to .config"; targeted build of
+all 5 touched `.c` files → clean on the first attempt, no warnings (confirmed via a forced rebuild
++ grep for warning/error); full `make -j16` → clean, `bzImage` produced, release
+`6.17.0-GLOCK-5+`; rerun confirmed idempotent both before and after the `-GLOCK-4`→`-GLOCK-5`
+version bump. Installed (`modules_install`/`make install`/grub regenerated) — a new
+`6.17.0-GLOCK-5+` grub entry exists, but no one-time `grub-reboot` has been set yet.
+**Boot-and-benchmark: pending.**
+
+**Expected: no change on 3 of 4 benchmarks, NHextend3 numbers become meaningful** (they aren't
+really valid on Steps 0-4 as a cross-kernel comparison, since NHextend3's rseq registration
+silently falls back to a cheaper code path without this — a real confound found and retracted a
+finding over earlier in this session).
 
 ### Step 6 — the migration engine (plumbing only, `ivh_universal_eligible=0`) — **STATUS: specified, not yet built**
 
