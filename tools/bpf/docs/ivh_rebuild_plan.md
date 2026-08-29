@@ -859,18 +859,99 @@ correctness check that the plumbing is actually live, not a perf check). Two lev
    is confirmed genuinely live on GLOCK-5, not a zero-init artifact. Keep `rseq_verify.c` as the
    reusable smoke test for this on any future kernel in the chain.
 
-### Step 6 — the migration engine (plumbing only, `ivh_universal_eligible=0`) — **STATUS: specified, not yet built**
+### Step 6 — the migration engine (plumbing only, `ivh_universal_eligible=0`) — **STATUS: BUILT,
+committed + tagged `6.17-GLOCK-6`, 2026-08-29**
 
-Port `kernel/sched/bpf_sched.c` (the whole sysctl table + `bpf_sched_pre_lock_migrate()`'s
-supporting code), the real call sites in `kernel/sched/{core,cputime,fair}.c` (§1.5 items 1-6),
-`kernel/sched/sched.h`'s `struct rq` additions, `tools/bpf/MY_ivh_atc.bpf.c` +
-`include/` (the actual BPF program, but **do not load/run it yet** — this step is about the
-kernel-side plumbing compiling and running inertly). Keep `ivh_universal_eligible=0` (its
-compiled default). **Expected: this is the step most likely to show a real, measurable cost even
-with migration off** — the tick-hook additions (`ivh_uc_tick`, `ivh_tick_steal_accumulate`) run
-unconditionally once this code exists, regardless of the eligibility gate. Watch this one
-closely; per-tick global-lock-shaped costs (like the already-found-and-fixed
-`ivh_scan_stuck_waiters`) are exactly the kind of thing to hunt for here if numbers regress.
+Ported the real capacity/migration decision chain: `kernel/sched/bpf_sched.c`'s knobs
+(`ivh_capacity_threshold`, `ivh_time_left_threshold_ns`, `ivh_migration_timeout_ns`,
+`ivh_max_concurrent`, `ivh_sched_timeout_ms`, `ivh_eval_cooldown_ns`, `ivh_time_left_source`,
+`ivh_selection_trylock`, `ivh_migrate_mechanism`, `ivh_universal_eligible`, `ivh_cap_source` +
+validator, the full `ivh_uc_*` block) plus the extended sysctl table and `SYSCALL_DEFINE0
+(ivh_cs_enter)`; `kernel/sched/core.c`'s `average_capacity_all`, `ivh_steal_source` (0/2 only),
+`ivh_tks_*` calibration knobs, `ivh_idle_ns()`, `ivh_uc_steal_ns()`, `ivh_uc_ema()`,
+`ivh_uc_close()`, `ivh_uc_maybe_close_window()`, `ivh_uc_tick()`, `ivh_tick_steal_accumulate()`;
+`kernel/sched/cputime.c`'s `account_idle_time()`/`steal_account_process_time()` extensions and new
+`is_cpu_preempted()`, plus the four Gate-2/heartbeat/uc/tks call sites in `account_process_tick()`;
+`kernel/sched/fair.c`'s `bpf_sched_pre_lock_migrate()` (the real decision+dispatch function),
+`ivh_steal_imminent()`, `ivh_gate_capacity()`, `ivh_gate_time_left_reject()`,
+`ivh_rq_capacity_and_timeleft_ok()`, `ivh_eval_cooldown_ok()`, the `ivh_wait_register`/
+`_unregister` registry, and `ivh_task_rq_in_danger()`'s real implementation (replacing Step 5's
+stub); `kernel/locking/spinlock.c`'s `ivh_pre_lock()` + its 3 call sites
+(`_raw_spin_lock`/`_irqsave`/`_irq`) — exactly the "later-step material" Step 3's own comment
+flagged as excluded. `kernel/sched/sched.h`'s `struct rq` gains `prmpt_flags`/`clock_preempt`/
+`last_idle_tp`/`last_preemption`/`ewma_act_ns`/`last_active_time`/`ivh_last_eval_ns`/
+`preemptions`/`max_latency` plus the full `ivh_uc_*`/`ivh_tks_*` blocks. `ivh_universal_eligible`
+stays at its compiled default of **0** throughout — nothing in this build migrates anything.
+
+**Deliberately excludes** (see §1.7): Hot Threads (already excluded everywhere); Part C /
+`ivh_vact_*` (`ivh_cap_source=2` folds into the default case in `ivh_gate_capacity()` rather than
+referencing a nonexistent field; the tsc_pe branch of Gate 2 is dropped entirely since production
+itself leaves `ivh_preempt_event_source=0`, so the real shipped kernel never takes that branch
+either — omitting it reproduces production's *actual* behavior, not a simplification of it);
+`ivh_uc_shadow`/`ivh_decision_shadow` (including the O(nr_cpus) destination-set comparator block
+inside `bpf_sched_pre_lock_migrate()`); `ivh_uc_avgcap_enabled`; `ivh_uc_used_source=1` (ACCT);
+the `ivh_ref_*` Plan-2 REF_TSC steal estimator and its dependent `ivh_ka_*` idle-keepalive
+machinery (not in §1.5's dependency chain, and §1.7 confirms `ivh_ref_method` as a dead end) —
+`ivh_steal_source`'s validator now only accepts 0 or 2; and the broadcast preempt-migrate
+mechanism (`preempt_migrate_func()`, `custom_idle_poll()`, the `cfs_spin_len` hook call site) —
+investigation showed this is a distinct, separately-dependent active-rescue mechanism entangled
+with idle-poll/`stop_one_cpu_nowait` machinery outside this step's scope, deferred rather than
+dragged in unscoped; `bpf_sched_cfs_spin_len()` stays Step 1's inert, uncalled stub.
+
+**IMPORTANT CAVEAT on Part C's exclusion**: `ivh_vact_tick()` runs **unconditionally every tick**
+in the real production kernel regardless of `ivh_cap_source`'s value (called from
+`account_process_tick()` with no gate) — meaning production pays this real cost even in its
+actual shipped configuration (`ivh_cap_source=3`, not 2). Since §1.5's dependency chain never
+mentions Part C, this rebuild is deliberately *not* paying that unconditional per-tick cost. If
+Step 6's eventual numbers land suspiciously cheap against §5's historical gap-hunt, this is a
+known, documented reason why — not a surprise to re-investigate from scratch.
+
+**Gaps found and not in this section's original file list** (same category every prior step has
+hit): `clock_preempt`/`is_cpu_preempted()` — a foundational tick heartbeat
+`bpf_sched_pre_lock_migrate()`'s target-health check depends on, not itself named in §1.5's list;
+ported to `kernel/sched/cputime.c`, matching production's exact location. `ivh_raw_tsc()`/
+`ivh_tsc_cycles_to_ns()`/`ivh_tsc_ns_to_cycles()` — originally left out of Step 4 under the Part-C
+exclusion umbrella, but turn out to be shared low-level primitives `ivh_tick_steal_accumulate()`
+also needs directly; added to `arch/x86/include/asm/ivh_tsc_beat.h`, Part C's own capacity
+field/tick function/sysctls remain fully excluded. Syscall 470 (`ivh_cs_enter`) itself was never
+registered in any prior step; NHextend3's rseq-fed userspace-CS path (Step 5) needs it to link —
+added to `arch/x86/entry/syscalls/syscall_64.tbl`, free and matching production's assignment
+exactly.
+
+**SAFETY NOTE for Step 7/8**: Step 1's inert hook-stub macro makes
+`bpf_sched_cfs_select_run_cpu_spin()` default to returning **0** (CPU 0), not -1 ("no target") —
+confirmed via `sched_hook_defs.h`'s own `BPF_SCHED_HOOK(int, 0, cfs_select_run_cpu_spin, ...)`
+declaration. Setting `ivh_universal_eligible=1` *before* Step 8 loads the real `MY_ivh_atc` BPF
+program would make every eligible migration target CPU 0 — a thundering-herd bug, not a graceful
+no-op. Harmless under this step's own posture (eligible stays 0); Step 8 must load the BPF
+program before flipping the sysctl, matching production's own launch-script ordering requirement
+(§1.5 item 8).
+
+**`ivh_task_rq_in_danger()` decision**: replaced Step 5's always-false stub with production's real
+Gate 1+2 re-check now that its dependencies exist. Verified this is behaviorally identical in
+practice: `ivh_universal_eligible=0` makes the real function's own first check return false
+unconditionally, same as the stub, but for the real reason now, not a placeholder one.
+
+`tools/bpf/MY_ivh_atc.bpf.c` + `vmlinux.h`/`bpf_helpers.h`/`bpf_helper_defs.h` copied best-effort
+into `tools/bpf/` per this section's own instruction — file presence only, **not loaded, not
+wired to any userspace loader**.
+
+**Build verification performed**: `make olddefconfig` → "No change to .config" (only
+`CONFIG_LOCALVERSION`, `-GLOCK-5` → `-GLOCK-6`); targeted build of all 5 touched `.c` files →
+clean on the first attempt, confirmed warning-free via a forced rebuild + grep; full `make -j16`
+→ clean (one pre-existing, unrelated `drivers/char/random.c` frame-size warning), `bzImage`
+produced, release `6.17.0-GLOCK-6+`, build #9; rerun confirmed idempotent (#9 both times, still
+clean). Installed (`modules_install`/`make install`/grub regenerated) — a new `6.17.0-GLOCK-6+`
+grub entry exists, but no one-time `grub-reboot` has been set.
+**Boot-and-benchmark: pending.**
+
+**Expected: this is the step most likely to show a real, measurable cost even with migration
+off** — the tick-hook additions (`ivh_uc_tick`, `ivh_tick_steal_accumulate`) run unconditionally
+once this code exists, regardless of the eligibility gate. Watch this one closely; per-tick
+global-lock-shaped costs (like the already-found-and-fixed `ivh_scan_stuck_waiters`) are exactly
+the kind of thing to hunt for here if numbers regress — though note the Part-C-tick-cost caveat
+above cuts the other way (missing cost, not added cost), so a *clean* result here doesn't fully
+resolve §5's gap-hunt either.
 
 ### Step 7 — enable full production PV (mechanism=2) — **STATUS: specified, sysctl-only, no rebuild needed**
 
