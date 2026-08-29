@@ -800,6 +800,65 @@ really valid on Steps 0-4 as a cross-kernel comparison, since NHextend3's rseq r
 silently falls back to a cheaper code path without this — a real confound found and retracted a
 finding over earlier in this session).
 
+**Post-break re-verification on GLOCK-4, 2026-08-29** (before proceeding to Step 5's own
+boot-and-benchmark): after a multi-day pause, user asked for a sanity check that the system was
+still behaving as expected. Ran `run_baseline.sh` four times across the session on
+`6.17.0-GLOCK-4+`, preempt=voluntary, `%steal` 0% throughout:
+
+| Run | NHextend3 | hackbench | dbench | ebizzy-4MB | Notes |
+|---|---|---|---|---|---|
+| §3.3 baseline | 2796.25 | 84.52s | 424.03 MB/s | 2330.25 | reference |
+| 1 (n=2) | 2925 | 72.2s | 430.7 | 3456 | landed in the "fast/quiet" regime |
+| 2 (n=2) | 2719.5 | 82.8s | 374.1 | 2089 | swung back to "slow" regime |
+| 3 (n=3) | 2818 | 90.7s | 385.6 | 2022 | still "slow" regime |
+| 4 (n=3, **after rebooting both the guest VM and the (host-external) sysbench corunner**) | 2810.7 | 88.3s | 387.2 | 2176 | matched runs 2/3 closely |
+
+Guest-side health checked and ruled out as a cause: uptime was only ~22h (not "days" as first
+worried), `/proc/buddyinfo` showed no fragmentation, `pgscan_kswapd`/`pgscan_direct` were 0 since
+boot (never once under memory pressure), dirty pages ~0, no D-state/leftover processes, `%steal`
+0% on all 16 vCPUs individually via `mpstat -P ALL`.
+
+**Key finding**: rebooting both endpoints (run 4) did **not** move dbench/ebizzy back toward the
+§3.3 baseline — they landed at essentially the same level as the pre-reboot runs 2/3 (dbench
+~385-387, ebizzy ~2020-2176, both ~9-13% below §3.3). This argues *against* progressive
+degradation (a true decay signal should partially reset after a full reboot of both sides) and
+*for* a settled, reproducible new contention level — most likely the corunner's current
+workload/intensity differing from whatever was running when §3.3 was recorded, given dbench/ebizzy
+are the two memory-bandwidth/cache-sensitive benchmarks and NHextend3/hackbench (lock/scheduling-
+bound) tracked baseline closely across all 4 runs. Same asymmetric-benchmark signature as the
+GLOCK-2 §3.2.1 "boot-to-boot host drift" entry above.
+
+**Resolved, 2026-08-29**: did a full vanilla→GLOCK-1→GLOCK-2→GLOCK-3→GLOCK-4→GLOCK-5
+bisection, 2 reps each (3rd rep only for any benchmark whose first two didn't agree, and only
+that benchmark re-run, not the whole suite). Every kernel landed in the same population — no step
+showed a benchmark cleanly and consistently separating from the pack (NHextend3 stayed in
+2770-2920, hackbench bounced 63-90s with no trend, dbench stayed remarkably flat at 397-413 across
+all six kernels, ebizzy stayed in 2160-2580). **Conclusion: the dbench/ebizzy dip from earlier is
+confirmed host/corunner-side, not introduced by any rebuild step 0-5.** No GLOCK-N.M micro-bisection
+needed.
+
+**Functional verification of the rseq extension itself, 2026-08-29** (the performance numbers
+above don't move much yet since nothing reads the danger bit until Step 6/8 — this is a
+correctness check that the plumbing is actually live, not a perf check). Two levels of evidence:
+
+1. `NHextend3 -l` (its built-in `IVH_DANGER local pre-check` report):
+   `ivh_sched_state_active` was true and it reported `Attempts: 2976 (skipped 2976, syscall made
+   0) — Syscalls avoided: 100.00%`. On its own this is ambiguous — the danger bit is stubbed to
+   always-false, so a dead/no-op write path would produce the exact same 100%-skipped reading,
+   since NHextend3's thread-local `ivh_sched_state` starts zero-initialized.
+2. **Decisive test, `cvm_setup/rseq_verify.c`** (new minimal standalone program, not tied to
+   NHextend3's other logic): explicitly zeros its own `ivh_sched_state.state` in userspace, then
+   registers the extended 72-byte rseq (confirming `AT_RSEQ_FEATURE_SIZE = 72` — the kernel is
+   advertising the new struct size via the ELF auxv), then reads the field back with zero other
+   code able to touch it. Result: `state=0x1` (`RSEQ_SCHED_STATE_FLAG_ON_CPU`) appears
+   **immediately after the registering `rseq()` syscall returns** — the only possible source of
+   that bit flip is the kernel's `rseq_update_cpu_node_id()` writing through the registered
+   `sched_state_ptr` on that very return-to-userspace. `IVH_DANGER` correctly stayed clear (as
+   expected — `ivh_task_rq_in_danger()` is still stubbed false). This closes the ambiguity from
+   (1): the full round-trip (extended struct → registration → kernel write-back → userspace read)
+   is confirmed genuinely live on GLOCK-5, not a zero-init artifact. Keep `rseq_verify.c` as the
+   reusable smoke test for this on any future kernel in the chain.
+
 ### Step 6 — the migration engine (plumbing only, `ivh_universal_eligible=0`) — **STATUS: specified, not yet built**
 
 Port `kernel/sched/bpf_sched.c` (the whole sysctl table + `bpf_sched_pre_lock_migrate()`'s
