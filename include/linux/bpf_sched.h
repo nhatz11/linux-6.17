@@ -72,6 +72,27 @@ static __always_inline u64 ivh_cs_clock(void)
 	return sched_clock();
 }
 
+/*
+ * IVH rebuild Step 6: the migration engine's sole eligibility gate and its
+ * synchronous self-migration entry point. ivh_universal_eligible is defined
+ * in kernel/sched/bpf_sched.c; bpf_sched_pre_lock_migrate() and
+ * ivh_eval_cooldown_ok() are defined in kernel/sched/fair.c. Declared here
+ * (rather than kernel/sched/sched.h, which is private to kernel/sched/ C
+ * files) because kernel/locking/spinlock.c's ivh_pre_lock() -- outside kernel/sched
+ * -- needs all three. Guarded the same as ivh_cs_track_enabled above: these
+ * symbols only exist when bpf_sched.o is built (CONFIG_BPF_SYSCALL), which
+ * this rebuild's .config always has set, same pre-existing scope limitation
+ * as Step 3's cs_enter()/cs_exit().
+ *
+ * Left at its compiled default of 0: no sysctl launch script exists in this
+ * rebuild to turn it on, and doing so before Step 8 loads the real BPF
+ * selection program would be a silent no-op regardless
+ * (bpf_sched_cfs_select_run_cpu_spin() is still Step 1's inert stub).
+ */
+extern unsigned long ivh_universal_eligible;
+bool ivh_eval_cooldown_ok(void);
+void bpf_sched_pre_lock_migrate(void);
+
 #else /* CONFIG_BPF_SYSCALL */
 
 #define BPF_SCHED_HOOK(RET, DEFAULT, NAME, ...)	\
@@ -95,15 +116,14 @@ static inline bool bpf_sched_enabled(void)
  * RSEQ_SCHED_STATE_FLAG_IVH_DANGER (include/uapi/linux/rseq.h) on every
  * return-to-userspace. Defined in kernel/sched/fair.c.
  *
- * IVH rebuild Step 5 (tools/bpf/docs/ivh_rebuild_plan.md sec 4): production's
- * real implementation depends entirely on the capacity/migration engine
- * (ivh_universal_eligible, ivh_cap_source, ivh_gate_capacity(),
- * ivh_gate_time_left_reject()) -- Step 6/8 material not yet ported. Since
- * ivh_universal_eligible is always 0 until Step 8 turns it on, production's
- * own function would always return false anyway at this point in the
- * rebuild; kernel/sched/fair.c defines a minimal stub that does the same
- * thing directly, without pulling in Step 6's plumbing early. Same posture
- * as Step 3's ivh_cs_track_enabled and Step 4's out-of-scope exclusions.
+ * IVH rebuild Step 6 (tools/bpf/docs/ivh_rebuild_plan.md sec 4): this is now
+ * production's real implementation (Gate 1+2 re-check against the
+ * ivh_uc_capacity/ivh_gate_capacity()/ivh_gate_time_left_reject() machinery
+ * kernel/sched/fair.c and kernel/sched/core.c now carry), replacing Step 5's
+ * always-false stub. Since ivh_universal_eligible defaults to 0 and nothing
+ * in this rebuild sets it, the function's own first check still makes it
+ * behave identically to the old stub in practice -- see kernel/sched/fair.c
+ * for the full implementation and the exact behavioral-equivalence argument.
  */
 struct task_struct;
 bool ivh_task_rq_in_danger(struct task_struct *t);

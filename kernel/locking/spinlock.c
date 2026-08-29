@@ -91,6 +91,44 @@ static __always_inline void cs_exit(raw_spinlock_t *lock)
 	}
 }
 
+/*
+ * ivh_pre_lock - IVH gate + synchronous self-migration, called BEFORE
+ * __raw_spin_lock*() so that no MCS node has been allocated yet and
+ * preemption is still enabled. A no-op when IVH is not loaded (static key).
+ * Must not be called from trylock paths (they don't block) or when already
+ * holding a spinlock (lock_depth > 0 means preemption is already off).
+ *
+ * IVH rebuild Step 6 (tools/bpf/docs/ivh_rebuild_plan.md sec 4): ported
+ * verbatim from production except the Hot Threads selectivity gate
+ * (ivh_hot_threads_enabled and everything it guards), which sec 1.7
+ * confirms dead (live-tested regression, 2%->12%+ host-preempted-CS) and
+ * which every earlier step in this rebuild has likewise excluded.
+ */
+static __always_inline void ivh_pre_lock(raw_spinlock_t *lock)
+{
+	if (!bpf_sched_enabled())
+		return;
+	if (!READ_ONCE(ivh_universal_eligible) || current->ivh_exclude)
+		return;
+	if (!in_task() || !preemptible() || current->lock_depth > 0)
+		return;
+	/*
+	 * Only migrate a genuinely runnable task. A caller may already have
+	 * done set_current_state(TASK_INTERRUPTIBLE|...) as part of an outer
+	 * prepare-to-wait sequence and merely be taking this spinlock as
+	 * bookkeeping before its own schedule(). Injecting
+	 * set_cpus_allowed_ptr() + schedule() here would consume that sleep
+	 * state and dequeue the task on a wakeup nobody will ever send IVH's
+	 * way -- a lost wakeup. Skipping is always safe: IVH is best-effort
+	 * and retries on the task's next lock acquisition while it's running.
+	 */
+	if (READ_ONCE(current->__state) != TASK_RUNNING)
+		return;
+	if (!ivh_eval_cooldown_ok())
+		return;
+	bpf_sched_pre_lock_migrate();
+}
+
 #ifdef CONFIG_MMIOWB
 #ifndef arch_mmiowb_state
 DEFINE_PER_CPU(struct mmiowb_state, __mmiowb_state);
@@ -231,6 +269,7 @@ EXPORT_SYMBOL(_raw_spin_trylock_bh);
 #ifndef CONFIG_INLINE_SPIN_LOCK
 noinline void __lockfunc _raw_spin_lock(raw_spinlock_t *lock)
 {
+	ivh_pre_lock(lock);
 	__raw_spin_lock(lock);
 	if (!in_interrupt()) {
 		current->lock_depth++;
@@ -245,6 +284,7 @@ noinline unsigned long __lockfunc _raw_spin_lock_irqsave(raw_spinlock_t *lock)
 {
 	unsigned long flags;
 
+	ivh_pre_lock(lock);
 	flags = __raw_spin_lock_irqsave(lock);
 	if (!in_interrupt()) {
 		current->lock_depth++;
@@ -258,6 +298,7 @@ EXPORT_SYMBOL(_raw_spin_lock_irqsave);
 #ifndef CONFIG_INLINE_SPIN_LOCK_IRQ
 noinline void __lockfunc _raw_spin_lock_irq(raw_spinlock_t *lock)
 {
+	ivh_pre_lock(lock);
 	__raw_spin_lock_irq(lock);
 	if (!in_interrupt()) {
 		current->lock_depth++;

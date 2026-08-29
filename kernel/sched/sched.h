@@ -111,6 +111,73 @@ extern int sysctl_sched_rt_runtime;
 extern int sched_rr_timeslice;
 
 /*
+ * IVH rebuild Step 6 (tools/bpf/docs/ivh_rebuild_plan.md sec 4): the
+ * capacity + migration decision engine, plumbing only (ivh_universal_
+ * eligible stays at its compiled default of 0 -- see include/linux/
+ * bpf_sched.h). All defined in kernel/sched/bpf_sched.c unless noted.
+ */
+extern int  average_capacity_all;		/* kernel/sched/core.c */
+extern unsigned long ivh_capacity_threshold;
+extern unsigned long ivh_time_left_threshold_ns;
+extern unsigned long ivh_migration_timeout_ns;
+extern unsigned long ivh_max_concurrent;
+extern unsigned long ivh_sched_timeout_ms;
+extern unsigned long ivh_eval_cooldown_ns;
+extern unsigned long ivh_time_left_source;
+extern unsigned long ivh_selection_trylock;
+extern unsigned long ivh_migrate_mechanism;
+extern unsigned long ivh_cap_source;
+extern unsigned long ivh_uc_enabled;
+extern unsigned long ivh_uc_window_ns;
+extern unsigned long ivh_uc_duty_ns;
+extern unsigned long ivh_uc_ema_alpha_q16;
+extern unsigned long ivh_uc_used_source;
+extern unsigned long ivh_uc_min_steal_ns;
+extern unsigned long ivh_uc_min_avail_pct;
+extern void ivh_uc_tick(void);			/* kernel/sched/core.c */
+
+/* ivh_steal_source: 0 (default) = paravirt_steal_clock() host truth;
+ * 2 = ivh_tick_steal_accumulate()'s tick-gap estimator, the one production
+ * actually runs. Value 1 (REF_TSC-inferred, Plan 2) is a documented dead
+ * end (tools/bpf/docs/ivh_rebuild_plan.md sec 1.7, "corrects
+ * ivh_steal_source=1 only, which production doesn't use") and is not
+ * ported -- its validating handler refuses it outright, same posture as
+ * every other rebuild step's simplified knob range. */
+extern unsigned long ivh_steal_source;		/* kernel/sched/core.c */
+extern unsigned long ivh_tks_deadband_ns;	/* kernel/sched/core.c */
+extern unsigned long ivh_tks_phase_pct;	/* kernel/sched/core.c */
+extern unsigned long ivh_tks_carry_ticks;	/* kernel/sched/core.c */
+extern unsigned long ivh_tks_idle_sub;		/* kernel/sched/core.c */
+extern void ivh_tick_steal_accumulate(void);	/* kernel/sched/core.c */
+extern int  is_cpu_preempted(int cpunum);	/* kernel/sched/cputime.c */
+
+/*
+ * IVH per-CPU TSC heartbeat and raw-TSC<->ns helpers (Step 4/6). The real
+ * implementation is x86-only; everything else gets the no-op fallbacks
+ * below so the generic tick path in kernel/sched/{core,cputime}.c stays
+ * buildable. Standard "arch may override" idiom: the arch header #defines
+ * its own function name.
+ */
+#ifdef CONFIG_X86
+#include <asm/ivh_tsc_beat.h>
+#endif
+#ifndef ivh_tsc_beat_publish
+static inline void ivh_tsc_beat_publish(void) { }
+#endif
+#ifndef ivh_raw_tsc
+static inline u64 ivh_raw_tsc(void) { return 0; }
+#endif
+#ifndef ivh_tsc_cycles_to_ns
+static inline u64 ivh_tsc_cycles_to_ns(u64 cycles) { return 0; }
+#endif
+#ifndef ivh_tsc_ns_to_cycles
+static inline u64 ivh_tsc_ns_to_cycles(u64 ns) { return 0; }
+#endif
+
+#define prmpt_flags(cpu) (&cpu_rq(cpu)->prmpt_flags)
+#define PRMPT_HELD_MASK   BIT(2)
+
+/*
  * Asymmetric CPU capacity bits
  */
 struct asym_cap_data {
@@ -1315,6 +1382,75 @@ struct rq {
 	call_single_data_t	cfsb_csd;
 	struct list_head	cfsb_csd_list;
 #endif
+
+	/*
+	 * IVH rebuild Step 6 (tools/bpf/docs/ivh_rebuild_plan.md sec 4): the
+	 * migration engine's per-rq state. Ported subset only -- see the
+	 * step's commit message for the full exclusion list (Hot Threads,
+	 * Part C/ivh_vact_*, ivh_uc_shadow/ivh_decision_shadow,
+	 * ivh_uc_avgcap_enabled, the ivh_ref_* Plan-2 estimator, ivh_ka_*
+	 * idle keepalive, the broadcast preempt-migrate mechanism).
+	 */
+	atomic_t		prmpt_flags;
+
+	/* Gate 2 "time left" inputs, written unconditionally by
+	 * steal_account_process_time()/account_idle_time() (cputime.c) and
+	 * is_cpu_preempted()'s heartbeat (clock_preempt, tick-written in
+	 * account_process_tick()) -- all real, host-truth-derived, no
+	 * dependency on Part C. ewma_act_ns stays permanently 0 in this
+	 * rebuild (production's only writer is an out-of-tree module); its
+	 * consumer already treats ewma==0 as "not rejected", so this is a
+	 * safe, documented no-op rather than a missing feature. */
+	u64			clock_preempt;
+	unsigned long		last_idle_tp;
+	u64			last_preemption;
+	u64			ewma_act_ns;
+	u64			last_active_time;
+	u64			ivh_last_eval_ns;
+	u64			preemptions;
+	u64			max_latency;
+
+	/*
+	 * IVH "uc" (used-capacity): in-kernel replica of vcap's
+	 * used/(used+stolen) EMA -- the ivh_cap_source=3 input, the one
+	 * production actually runs (sec 1.5 item 2/3). ivh_uc_vcap_at_close
+	 * and its ivh_uc_shadow-gated comparator are dropped: both exist
+	 * solely to validate against rq->cpu_capacity_custom (the retired
+	 * vcap daemon's field), which this rebuild does not port.
+	 */
+	u64			ivh_uc_prev_tsc;
+	u64			ivh_uc_prev_steal_ns;
+	u64			ivh_uc_prev_idle_ns;
+	u64			ivh_uc_prev_used_ns;
+	u64			ivh_uc_win_start_tsc;
+	u64			ivh_uc_win_avail_c;
+	u64			ivh_uc_win_stolen_c;
+	u64			ivh_uc_win_used_c;
+	u64			ivh_uc_win_acct_c;
+	u64			ivh_uc_ema_wall_q;
+	u64			ivh_uc_ema_acct_q;
+	unsigned long		ivh_uc_capacity;
+	unsigned long		ivh_uc_capacity_wall;
+	unsigned long		ivh_uc_capacity_acct;
+	u64			ivh_uc_windows;
+	u64			ivh_uc_skipped;
+	u64			ivh_uc_extended;
+	u64			ivh_uc_raw_wall;
+	u64			ivh_uc_raw_acct;
+
+	/*
+	 * IVH "tks" (tick steal): CVM-safe tick-gap steal inference, the
+	 * ivh_steal_source=2 estimator production actually runs (sec 1.5
+	 * item 5). Raw TSC cycles; see <asm/ivh_tsc_beat.h>'s
+	 * ivh_raw_tsc()/ivh_tsc_cycles_to_ns()/ivh_tsc_ns_to_cycles().
+	 */
+	u64			ivh_tks_prev_tsc;
+	u64			ivh_tks_prev_idle_ns;
+	s64			ivh_tks_carry_c;
+	u64			ivh_tks_steal_ns;
+	u64			ivh_tks_samples;
+	u64			ivh_tks_events;
+	u64			ivh_tks_skipped;
 };
 
 #ifdef CONFIG_FAIR_GROUP_SCHED

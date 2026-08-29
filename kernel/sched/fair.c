@@ -13628,22 +13628,412 @@ __init void init_sched_fair_class(void)
 }
 
 /*
- * ivh_task_rq_in_danger - IVH rebuild Step 5 stub.
+ * =============================================================================
+ * IVH rebuild Step 6 (tools/bpf/docs/ivh_rebuild_plan.md sec 4): the
+ * migration engine, plumbing only. ivh_universal_eligible (include/linux/
+ * bpf_sched.h) stays at its compiled default of 0 for the whole of this
+ * step, so nothing below ever actually migrates anything -- see each
+ * function's comment for what stays inert and why.
  *
- * See the doc comment on the declaration in <linux/bpf_sched.h>. Production's
- * real implementation is a Gate 1+2 (capacity/time-left) re-check that
- * depends on the capacity/migration engine ported in Step 6/8. That engine
- * doesn't exist yet in this tree, and its sole real gate
- * (ivh_universal_eligible) is always 0 until Step 8 -- at which point
- * production's own function would unconditionally return false here anyway.
- * This stub reproduces exactly that behavior directly, so
- * RSEQ_SCHED_STATE_FLAG_IVH_DANGER is never set (correct: no migration
- * mechanism exists yet to be in danger of triggering) without pulling in
- * Step 6's plumbing early. Replace with the real Gate 1+2 body when Step 6
- * lands.
+ * SAFETY NOTE, worth stating plainly rather than discovering live: Step 1's
+ * inert hook-stub macro (kernel/sched/bpf_sched.c) makes
+ * bpf_sched_cfs_select_run_cpu_spin() default to returning 0 (CPU 0), not
+ * -1 ("no target") -- confirmed via include/linux/sched_hook_defs.h's own
+ * BPF_SCHED_HOOK(int, 0, cfs_select_run_cpu_spin, ...) declaration. That
+ * means if ivh_universal_eligible were ever set to 1 BEFORE Step 8 loads
+ * the real MY_ivh_atc BPF program, every eligible task's migration
+ * evaluation would target CPU 0 -- a thundering-herd bug, not a graceful
+ * no-op. Harmless as long as this step's own posture (eligible stays 0)
+ * holds; the real launch sequence's requirement to load the BPF program
+ * before flipping the eligibility sysctl (sec 1.5 item 8) is precisely
+ * what avoids this in production, and Step 8 here must do the same.
+ * =============================================================================
+ */
+
+/* vSched / IVH migration-engine lock and debug counters -- readable during
+ * a hang via `cat /proc/ivh_debug` in production; this rebuild does not
+ * port that /proc file, but keeps the counters themselves since
+ * bpf_sched_pre_lock_migrate() updates them regardless of any reader. */
+static DEFINE_RAW_SPINLOCK(my_spinlock);
+atomic_t ivh_in_schedule    = ATOMIC_INIT(0);
+atomic_t ivh_trylock_misses  = ATOMIC_INIT(0);
+atomic_t ivh_migrations_done = ATOMIC_INIT(0);
+atomic_t ivh_timeout_count   = ATOMIC_INIT(0);
+EXPORT_SYMBOL_GPL(ivh_in_schedule);
+EXPORT_SYMBOL_GPL(ivh_trylock_misses);
+EXPORT_SYMBOL_GPL(ivh_migrations_done);
+
+static DEFINE_PER_CPU(u64, ivh_prelock_calls);
+static DEFINE_PER_CPU(u64, ivh_prelock_cooldown_skipped);
+static DEFINE_PER_CPU(u64, ivh_steal_imminent_capacity_reject);
+static DEFINE_PER_CPU(u64, ivh_steal_imminent_time_left_reject);
+
+/*
+ * ivh_wait diagnostic registry -- EXPERIMENT ONLY (bare-schedule() hang
+ * investigation, production 2026-06-30). Records every in-flight
+ * self-migration attempt in bpf_sched_pre_lock_migrate() below. Ported:
+ * the register/unregister calls are cheap, unconditional writes
+ * bpf_sched_pre_lock_migrate() makes regardless of any reader. NOT
+ * ported: ivh_scan_stuck_waiters(), the periodic tick-driven scanner that
+ * reads this table -- confirmed dead in production itself (sec 1.3,
+ * "ungated diagnostic tracer that hammered a single globally-shared raw
+ * spinlock 32x/tick/CPU ... call site commented out"), so this table now
+ * has no reader in this rebuild either, same as production today.
+ */
+#define IVH_WAIT_SLOTS 32
+struct ivh_wait_slot {
+	struct task_struct *task;
+	u64  start_ns;
+	int  src_cpu;
+	int  target_cpu;
+	int  phase;  /* 1 = inside first set_cpus_allowed_ptr(); 2 = inside post-migration schedule() */
+};
+static struct ivh_wait_slot ivh_wait_slots[IVH_WAIT_SLOTS];
+static DEFINE_RAW_SPINLOCK(ivh_wait_lock);
+
+static int ivh_wait_register(struct task_struct *task, int src_cpu, int target_cpu, int phase)
+{
+	unsigned long flags;
+	int i, slot = -1;
+
+	raw_spin_lock_irqsave(&ivh_wait_lock, flags);
+	for (i = 0; i < IVH_WAIT_SLOTS; i++) {
+		if (!ivh_wait_slots[i].task) {
+			ivh_wait_slots[i].task = task;
+			ivh_wait_slots[i].start_ns = sched_clock();
+			ivh_wait_slots[i].src_cpu = src_cpu;
+			ivh_wait_slots[i].target_cpu = target_cpu;
+			ivh_wait_slots[i].phase = phase;
+			slot = i;
+			break;
+		}
+	}
+	raw_spin_unlock_irqrestore(&ivh_wait_lock, flags);
+	return slot;
+}
+
+static void ivh_wait_unregister(int slot)
+{
+	unsigned long flags;
+
+	if (slot < 0)
+		return;
+	raw_spin_lock_irqsave(&ivh_wait_lock, flags);
+	ivh_wait_slots[slot].task = NULL;
+	raw_spin_unlock_irqrestore(&ivh_wait_lock, flags);
+}
+
+/*
+ * ivh_eval_cooldown_ok - per-vCPU rate limiter on full IVH pre-lock
+ * evaluation. See kernel/locking/spinlock.c's ivh_pre_lock() for the
+ * caller and production's full rationale (the condition being gated is a
+ * property of the vCPU, changing on hypervisor-steal timescales, far
+ * slower than lock-heavy workloads re-enter this path).
+ */
+bool ivh_eval_cooldown_ok(void)
+{
+	struct rq *rq = this_rq();
+	u64 now = sched_clock();
+
+	this_cpu_inc(ivh_prelock_calls);
+
+	if (ivh_eval_cooldown_ns &&
+	    now - rq->ivh_last_eval_ns < ivh_eval_cooldown_ns) {
+		this_cpu_inc(ivh_prelock_cooldown_skipped);
+		return false;
+	}
+
+	rq->ivh_last_eval_ns = now;
+	return true;
+}
+EXPORT_SYMBOL_GPL(ivh_eval_cooldown_ok);
+
+/*
+ * ivh_gate_capacity - Gate 1's capacity input.
+ *
+ * cap_src 0 (default) = rq->cpu_capacity, the vcap-shaped fallback.
+ * cap_src 3 = rq->ivh_uc_capacity, the one production actually runs.
+ * cap_src 2 (Part C) is not implemented in this rebuild and folds into the
+ * default case rather than referencing a field this tree does not have --
+ * see ivh_cap_source's comment in kernel/sched/bpf_sched.c, whose
+ * validating handler already refuses to let this value be selected live.
+ */
+static __always_inline unsigned long ivh_gate_capacity(struct rq *rq, unsigned long cap_src)
+{
+	if (cap_src == 3)
+		return rq->ivh_uc_capacity;
+	return rq->cpu_capacity;
+}
+
+/*
+ * ivh_gate_time_left_reject - Gate 2's "time left" verdict. Returns true to
+ * REJECT (enough runway remains, so no migration is warranted).
+ *
+ * Production also has a TSC-native branch (ivh_preempt_event_source==2)
+ * feeding this from Part C's rq->ivh_vact_* fields. Not ported: production
+ * itself leaves ivh_preempt_event_source at its compiled default of 0 (sec
+ * 1.4 item 6, a documented script-drift gap, not the intended
+ * configuration), so the real shipped kernel never actually takes that
+ * branch either -- omitting it here reproduces production's ACTUAL
+ * behavior, not a simplification of it.
+ */
+static __always_inline bool ivh_gate_time_left_reject(struct rq *rq, u64 last_cs_ns)
+{
+	if (!READ_ONCE(ivh_time_left_source)) {
+		/* Original formula. ewma_act_ns has no in-tree writer in this
+		 * rebuild (see the struct rq comment, kernel/sched/sched.h),
+		 * so this branch always sees ewma==0 and returns false --
+		 * safe by construction, not a missing feature: production's
+		 * shipped ivh_time_left_source is 1, not 0. */
+		u64 ewma = rq->ewma_act_ns;
+		u64 act_sofar;
+
+		if (ewma == 0)
+			return false;
+
+		act_sofar = sched_clock() - rq->last_preemption;
+
+		return ewma > act_sofar &&
+		       (ewma - act_sofar) >= ivh_time_left_threshold_ns;
+	}
+
+	{
+		/* Later tree's formula -- the one production actually runs. */
+		u64 last_active = rq->last_active_time;
+		u64 elapsed_since_active = sched_clock() -
+			max(rq->last_preemption, (u64)rq->last_idle_tp);
+		s64 runway = (s64)last_active - (s64)elapsed_since_active;
+		s64 time_left = runway - (s64)last_cs_ns;
+
+		return last_active != 0 &&
+		       time_left > (s64)ivh_time_left_threshold_ns;
+	}
+}
+
+/*
+ * ivh_steal_imminent - Gate 1+2, "is this vCPU in the IVH danger zone".
+ * Production's ivh_decision_shadow comparator block is not ported (sec
+ * 1.7: "diagnostic only; shadow comparator now compares against a
+ * constant... since vcap retirement") -- everything else verbatim.
+ */
+static __always_inline bool ivh_steal_imminent(struct rq *rq)
+{
+	unsigned long cap_src = READ_ONCE(ivh_cap_source);
+
+	if (ivh_gate_capacity(rq, cap_src) > ivh_capacity_threshold) {
+		this_cpu_inc(ivh_steal_imminent_capacity_reject);
+		return false;
+	}
+
+	if (ivh_gate_time_left_reject(rq, current->last_cs_ns)) {
+		this_cpu_inc(ivh_steal_imminent_time_left_reject);
+		return false;
+	}
+
+	return true;
+}
+
+/*
+ * ivh_rq_capacity_and_timeleft_ok - Gate 1+2 verdict, WITHOUT the
+ * ivh_steal_imminent_*_reject stat side effects. Deliberate duplication of
+ * ivh_steal_imminent()'s two gates, not a shared call -- see
+ * ivh_task_rq_in_danger()'s comment for why (this path runs on every
+ * return-to-userspace for every eligible thread, far more often than real
+ * lock attempts, and would otherwise swamp those counters with advisory
+ * evaluations that never correspond to an actual migration decision).
+ */
+static __always_inline bool ivh_rq_capacity_and_timeleft_ok(struct rq *rq,
+							     struct task_struct *t)
+{
+	unsigned long cap_src = READ_ONCE(ivh_cap_source);
+
+	if (ivh_gate_capacity(rq, cap_src) > ivh_capacity_threshold)
+		return false;
+
+	return !ivh_gate_time_left_reject(rq, t->last_cs_ns);
+}
+
+/**
+ * ivh_task_rq_in_danger - cheap, advisory-only re-evaluation of Gate 1+2
+ * for the CPU @t is currently on, called from kernel/rseq.c's
+ * rseq_update_cpu_node_id() so RSEQ_SCHED_STATE_FLAG_IVH_DANGER can be
+ * published to userspace via the already-scheduled rseq_sched_state write.
+ *
+ * IVH rebuild Step 6: this is now production's real implementation,
+ * replacing Step 5's always-false stub. Since ivh_universal_eligible
+ * defaults to 0 and nothing in this rebuild sets it, this function's own
+ * first check still makes it return false unconditionally in practice --
+ * behaviorally identical to the Step 5 stub, but for the real reason now,
+ * not a placeholder reason.
  */
 bool ivh_task_rq_in_danger(struct task_struct *t)
 {
-	return false;
+	if (!READ_ONCE(ivh_universal_eligible) || t->ivh_exclude)
+		return false;
+
+	return ivh_rq_capacity_and_timeleft_ok(task_rq(t), t);
 }
 EXPORT_SYMBOL_GPL(ivh_task_rq_in_danger);
+
+/**
+ * bpf_sched_pre_lock_migrate - synchronous self-migration before spinlock
+ * acquire. Called from ivh_pre_lock() in spinlock.c, BEFORE
+ * __raw_spin_lock*() disables preemption and before any qspinlock MCS node
+ * is allocated. Must only be called with lock_depth == 0 and
+ * preemptible() == true.
+ *
+ * Production's ivh_decision_shadow destination-set comparator block (an
+ * O(nr_cpus) walk feeding ivh_cap_pass_/ivh_uc_pass_/ivh_destset_empty_
+ * diagnostic counters, all Part-C-entangled) is not ported -- default off in
+ * production, and this rebuild does not port ivh_decision_shadow itself
+ * (sec 1.7). Everything else is verbatim from production.
+ */
+void bpf_sched_pre_lock_migrate(void)
+{
+	struct rq *rq;
+	int target_cpu;
+	int src_cpu;
+	cpumask_var_t saved_mask;
+	unsigned long flags;
+
+	/* Defense-in-depth: never inject a migration/schedule() into a task
+	 * that isn't TASK_RUNNING -- see the matching, primary gate in
+	 * ivh_pre_lock(), kernel/locking/spinlock.c. */
+	if (READ_ONCE(current->__state) != TASK_RUNNING)
+		return;
+
+	rq = this_rq();
+	src_cpu = rq->cpu;
+
+	/* Gate 1+2: vCPU not throttled, enough burst time remains. */
+	if (!ivh_steal_imminent(rq))
+		return;
+
+	/* Gate 3: task must be movable (more than one allowed CPU) */
+	if (cpumask_weight(current->cpus_ptr) <= 1)
+		return;
+
+	/* Gate 4: concurrency cap -- don't pile threads into schedule() */
+	if ((unsigned long)atomic_read(&ivh_in_schedule) >= ivh_max_concurrent)
+		return;
+
+	/*
+	 * Block recursive IVH calls from any spinlock acquired inside this
+	 * function. my_spinlock, the slab allocator (alloc_cpumask_var),
+	 * set_cpus_allowed_ptr, and schedule() all take raw spinlocks
+	 * internally. Without this guard each of those calls would reach
+	 * ivh_pre_lock() with lock_depth still 0 and re-enter this function.
+	 * Decrement on every exit path so the actual lock acquisition after
+	 * we return still sees lock_depth == 0 and cs_enter() fires correctly.
+	 */
+	current->lock_depth++;
+
+	if (READ_ONCE(ivh_selection_trylock)) {
+		if (!raw_spin_trylock_irqsave(&my_spinlock, flags)) {
+			atomic_inc(&ivh_trylock_misses);
+			current->lock_depth--;
+			return;
+		}
+	} else {
+		raw_spin_lock_irqsave(&my_spinlock, flags);
+	}
+	target_cpu = bpf_sched_cfs_select_run_cpu_spin(
+			rq, current, sched_clock(),
+			average_capacity_all, num_online_cpus());
+	if (target_cpu != -1)
+		atomic_fetch_or(PRMPT_HELD_MASK, prmpt_flags(target_cpu));
+	raw_spin_unlock_irqrestore(&my_spinlock, flags);
+
+	if (target_cpu < 0 || target_cpu == smp_processor_id()) {
+		if (target_cpu >= 0)
+			atomic_fetch_andnot(PRMPT_HELD_MASK, prmpt_flags(target_cpu));
+		current->lock_depth--;
+		return;
+	}
+
+	/*
+	 * ivh_migrate_mechanism == 1: dispatch via migrate_task_to() instead
+	 * of the mechanism-0 path below.
+	 */
+	if (READ_ONCE(ivh_migrate_mechanism)) {
+		u64 wait_start_ns, wait_elapsed_ns;
+		int wait_slot, mt_ret;
+
+		if (is_cpu_preempted(target_cpu)) {
+			atomic_fetch_andnot(PRMPT_HELD_MASK, prmpt_flags(target_cpu));
+			current->lock_depth--;
+			return;
+		}
+
+		atomic_inc(&ivh_in_schedule);
+
+		wait_start_ns = sched_clock();
+		wait_slot = ivh_wait_register(current, src_cpu, target_cpu, 3);
+		mt_ret = migrate_task_to(current, target_cpu);
+		ivh_wait_unregister(wait_slot);
+		wait_elapsed_ns = sched_clock() - wait_start_ns;
+
+		atomic_dec(&ivh_in_schedule);
+
+		if (wait_elapsed_ns > 1000000ULL)
+			atomic_inc(&ivh_timeout_count);
+
+		if (mt_ret == 0)
+			atomic_inc(&ivh_migrations_done);
+		atomic_fetch_andnot(PRMPT_HELD_MASK, prmpt_flags(target_cpu));
+		current->lock_depth--;
+		return;
+	}
+
+	/*
+	 * Synchronous self-migration (mechanism 0, default): temporarily
+	 * restrict cpus_mask to {target_cpu} and call set_cpus_allowed_ptr(),
+	 * which blocks (via affine_move_task()'s wait_for_completion()) until
+	 * the migration has actually completed. Restore original mask so the
+	 * task's permanent affinity is unchanged.
+	 */
+	if (!alloc_cpumask_var(&saved_mask, GFP_KERNEL)) {
+		atomic_fetch_andnot(PRMPT_HELD_MASK, prmpt_flags(target_cpu));
+		current->lock_depth--;
+		return;
+	}
+	cpumask_copy(saved_mask, &current->cpus_mask);
+
+	/*
+	 * Layer 1: check target health immediately before committing.
+	 * is_cpu_preempted() returns non-zero if target's clock_preempt
+	 * heartbeat is >1.5ms stale.
+	 */
+	if (is_cpu_preempted(target_cpu)) {
+		atomic_fetch_andnot(PRMPT_HELD_MASK, prmpt_flags(target_cpu));
+		current->lock_depth--;
+		free_cpumask_var(saved_mask);
+		return;
+	}
+
+	atomic_inc(&ivh_in_schedule);
+
+	{
+		u64 wait_start_ns = sched_clock();
+		int wait_slot_p1 = ivh_wait_register(current, src_cpu, target_cpu, 1);
+		int sca_ret = set_cpus_allowed_ptr(current, cpumask_of(target_cpu));
+		u64 wait_elapsed_ns;
+
+		ivh_wait_unregister(wait_slot_p1);
+		wait_elapsed_ns = sched_clock() - wait_start_ns;
+		(void)sca_ret;
+
+		atomic_dec(&ivh_in_schedule);
+
+		if (wait_elapsed_ns > 1000000ULL)
+			atomic_inc(&ivh_timeout_count);
+	}
+
+	set_cpus_allowed_ptr(current, saved_mask);
+	free_cpumask_var(saved_mask);
+
+	atomic_inc(&ivh_migrations_done);
+	atomic_fetch_andnot(PRMPT_HELD_MASK, prmpt_flags(target_cpu));
+	current->lock_depth--;
+}
+EXPORT_SYMBOL_GPL(bpf_sched_pre_lock_migrate);

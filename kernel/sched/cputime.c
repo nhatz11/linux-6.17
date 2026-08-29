@@ -2,6 +2,7 @@
 /*
  * Simple CPU accounting cgroup controller
  */
+#include <linux/sched/clock.h>
 #include <linux/sched/cputime.h>
 #include <linux/tsacct_kern.h>
 #include "sched.h"
@@ -229,6 +230,13 @@ void account_idle_time(u64 cputime)
 		cpustat[CPUTIME_IOWAIT] += cputime;
 	else
 		cpustat[CPUTIME_IDLE] += cputime;
+	/*
+	 * IVH rebuild Step 6: Gate 2's "time left" formula (kernel/sched/
+	 * fair.c's ivh_gate_time_left_reject()) needs a timestamp for when
+	 * idle exited, the same way it needs last_preemption for when a
+	 * steal event ended -- see steal_account_process_time() below.
+	 */
+	rq->last_idle_tp = sched_clock();
 }
 
 
@@ -256,18 +264,54 @@ static __always_inline u64 steal_account_process_time(u64 maxtime)
 #ifdef CONFIG_PARAVIRT
 	if (static_key_false(&paravirt_steal_enabled)) {
 		u64 steal;
+		struct rq *rq = this_rq();
 
 		steal = paravirt_steal_clock(smp_processor_id());
-		steal -= this_rq()->prev_steal_time;
+		steal -= rq->prev_steal_time;
 		steal = min(steal, maxtime);
 		account_steal_time(steal);
-		this_rq()->prev_steal_time += steal;
+		rq->prev_steal_time += steal;
+		/*
+		 * IVH rebuild Step 6: Gate 2's "time left" formula (fair.c's
+		 * ivh_gate_time_left_reject(), ivh_time_left_source=1 branch)
+		 * reads last_active_time/last_preemption, both real
+		 * paravirt_steal_clock()-derived host truth, unconditional on
+		 * any IVH sysctl -- ported verbatim from production.
+		 */
+		if (steal > 0) {
+			u64 now = sched_clock();
+
+			if (steal > 1000000) {
+				if (rq->last_preemption > rq->last_idle_tp)
+					rq->last_active_time = now - rq->last_preemption - steal;
+				else
+					rq->last_active_time = now - rq->last_idle_tp - steal;
+				rq->last_preemption = now;
+			}
+			rq->preemptions += 1;
+			if (rq->max_latency < steal)
+				rq->max_latency = steal;
+		}
 
 		return steal;
 	}
 #endif /* CONFIG_PARAVIRT */
 	return 0;
 }
+
+/*
+ * IVH rebuild Step 6: is @cpunum's tick heartbeat (clock_preempt, written
+ * unconditionally in account_process_tick() below) stale by more than
+ * 1.5ms -- the same threshold ivh_pv_beat_threshold uses (Step 4). Used by
+ * bpf_sched_pre_lock_migrate()'s target-health check (kernel/sched/fair.c).
+ */
+int is_cpu_preempted(int cpunum)
+{
+	s64 time_diff = sched_clock() - cpu_rq(cpunum)->clock_preempt;
+
+	return time_diff > 1500000;
+}
+EXPORT_SYMBOL(is_cpu_preempted);
 
 /*
  * Account how much elapsed time was spent in steal, IRQ, or softirq time.
@@ -475,6 +519,26 @@ void thread_group_cputime_adjusted(struct task_struct *p, u64 *ut, u64 *st)
 void account_process_tick(struct task_struct *p, int user_tick)
 {
 	u64 cputime, steal;
+
+	/*
+	 * IVH rebuild Step 6: these four must run before the
+	 * vtime_accounting_enabled_this_cpu() early return below, on every
+	 * tick on every CPU regardless of accounting flavour -- each is a
+	 * tick-driven signal producer whose consumer treats a skipped tick as
+	 * a gap indistinguishable from real host preemption. Order matters:
+	 * ivh_tick_steal_accumulate() before ivh_uc_tick() so that at
+	 * ivh_steal_source=2 the "uc" estimator reads this tick's steal, not
+	 * last tick's (see ivh_uc_steal_ns()'s comment, kernel/sched/core.c).
+	 *
+	 * ivh_tsc_beat_publish() resolves the gap Step 4 disclosed: that
+	 * step's heartbeat had only contention-triggered publish sites, no
+	 * periodic one, because the periodic site lives exactly here,
+	 * entangled with this step's steal-accumulation code.
+	 */
+	this_rq()->clock_preempt = sched_clock();
+	ivh_tsc_beat_publish();
+	ivh_tick_steal_accumulate();
+	ivh_uc_tick();
 
 	if (vtime_accounting_enabled_this_cpu())
 		return;

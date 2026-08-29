@@ -1447,6 +1447,22 @@ struct task_struct {
 	u64				cs_wall_start_ts;
 	u64				last_cs_ns;
 
+	/*
+	 * ivh_exclude: sticky per-task "opt out" bit (0/1). Checked as
+	 * `READ_ONCE(ivh_universal_eligible) && !current->ivh_exclude`
+	 * everywhere the migration engine's eligibility gate is consulted
+	 * (kernel/locking/spinlock.c's ivh_pre_lock(), kernel/sched/fair.c's
+	 * ivh_task_rq_in_danger(), kernel/sched/bpf_sched.c's sys_ivh_cs_enter()).
+	 * IVH rebuild Step 6: field ported since both real gate functions read
+	 * it, but production's prctl(PR_SET_IVH_ELIGIBLE, 3, ...) setter
+	 * (kernel/sys.c) is out of scope -- nothing in this rebuild can set it
+	 * yet, so it stays at its compiled default of 0 (never excluded),
+	 * which is a harmless simplification since ivh_universal_eligible=0
+	 * already makes every one of these gates take the same branch
+	 * regardless of this field's value.
+	 */
+	u8				ivh_exclude;
+
 #ifdef CONFIG_SCHED_MM_CID
 	int				mm_cid;		/* Current cid in mm */
 	int				last_mm_cid;	/* Most recent cid in mm */

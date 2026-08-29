@@ -48,6 +48,9 @@
 #include <linux/ioprio.h>
 #include <linux/kallsyms.h>
 #include <linux/kcov.h>
+#include <linux/kernel_stat.h>
+#include <linux/math64.h>
+#include <linux/tick.h>
 #include <linux/kprobes.h>
 #include <linux/llist_api.h>
 #include <linux/mmu_context.h>
@@ -179,6 +182,317 @@ __read_mostly int sysctl_resched_latency_warn_once = 1;
  * Limited because this is done with IRQs disabled.
  */
 __read_mostly unsigned int sysctl_sched_nr_migrate = SCHED_NR_MIGRATE_BREAK;
+
+/*
+ * IVH rebuild Step 6 (tools/bpf/docs/ivh_rebuild_plan.md sec 4): the "uc"
+ * (used-capacity) and "tks" (tick steal) tick-driven signal producers,
+ * ivh_idle_ns()'s kcpustat fallback, and is_cpu_preempted()'s tick
+ * heartbeat. Ported subset of sec 1.5's dependency chain only -- see this
+ * step's commit message for the full exclusion list.
+ */
+
+/* Consumed directly by bpf_sched_pre_lock_migrate() (kernel/sched/fair.c).
+ * Fed only by the retired vcap daemon's ivh_uc_avgcap_enabled worker, which
+ * this rebuild does not port (sec 1.7), so this stays 0 forever here --
+ * matching production's own real behavior, since that worker is also
+ * default-off in production. */
+int average_capacity_all = 0;
+
+/*
+ * ivh_steal_source -- which number ivh_uc_steal_ns() (below) folds into the
+ * "uc" capacity estimator.
+ *   0 (default) = paravirt_steal_clock(), host ground truth.
+ *   2           = ivh_tick_steal_accumulate()'s tick-gap estimator, the
+ *                 CVM-safe one production actually runs (sec 1.5 item 5).
+ * Value 1 (REF_TSC-inferred "Plan 2") is intentionally not implemented --
+ * sec 1.7 lists it as a dead end production doesn't use, and porting its
+ * producer (ivh_ref_accumulate()) would drag in the idle-keepalive and
+ * exit-overhead-deadband machinery built only to support it. The validating
+ * handler below refuses 1 outright rather than silently reading zero.
+ */
+unsigned long ivh_steal_source = 0UL;
+
+/*
+ * IVH "tks" (tick steal) calibration. Compiled defaults match production's
+ * own compiled defaults, not the launch-script-applied operating values --
+ * same posture as every other knob in this rebuild (e.g. Step 4's
+ * ivh_pv_wait_mechanism=0). Per sec 1.5 item 6, production's actual runtime
+ * values are ivh_tks_idle_sub=0 and ivh_tks_phase_pct=100; getting there
+ * needs a sysctl flip beyond what this step sets, exactly like
+ * ivh_universal_eligible itself.
+ */
+unsigned long ivh_tks_deadband_ns = 50000UL;
+unsigned long ivh_tks_phase_pct = 0UL;
+unsigned long ivh_tks_carry_ticks = 8UL;
+unsigned long ivh_tks_idle_sub = 1UL;
+
+/*
+ * ivh_idle_ns - idle+iowait time for @cpu, NOHZ-aware with a kcpustat
+ * fallback. Shared by ivh_tick_steal_accumulate() and ivh_uc_tick() below.
+ */
+static u64 ivh_idle_ns(int cpu)
+{
+	u64 idle_us, iowait_us;
+
+	idle_us   = get_cpu_idle_time_us(cpu, NULL);
+	iowait_us = get_cpu_iowait_time_us(cpu, NULL);
+	if (likely(idle_us != (u64)-1 && iowait_us != (u64)-1))
+		return (idle_us + iowait_us) * NSEC_PER_USEC;
+
+	return kcpustat_cpu(cpu).cpustat[CPUTIME_IDLE]
+	     + kcpustat_cpu(cpu).cpustat[CPUTIME_IOWAIT];
+}
+
+/*
+ * ivh_tick_steal_accumulate - fold one tick's worth of tick-gap steal into
+ * rq->ivh_tks_steal_ns. ivh_steal_source=2, the CVM-safe estimator.
+ *
+ * Called from account_process_tick() (kernel/sched/cputime.c) on the owning
+ * CPU with IRQs already disabled. See tools/bpf/docs/
+ * ivh_cvm_steal_detector_2026-08-08.md for the full derivation: a tick fires
+ * only once the vCPU is actually running, so the raw-TSC gap between
+ * consecutive tick deliveries, less idle, less one nominal tick, is time the
+ * vCPU wanted the CPU and did not have it. Ported verbatim from production.
+ */
+void ivh_tick_steal_accumulate(void)
+{
+	struct rq *rq = this_rq();
+	int cpu = smp_processor_id();
+	u64 now, idle_ns, d_idle_c, avail_c, tick_c;
+	s64 excess_c, carry, floor_c;
+
+	if (unlikely(!tsc_khz)) {
+		rq->ivh_tks_skipped++;
+		return;
+	}
+
+	now = ivh_raw_tsc();
+	idle_ns = ivh_idle_ns(cpu);
+
+	if (unlikely(!rq->ivh_tks_prev_tsc)) {
+		rq->ivh_tks_skipped++;
+		goto seed;			/* first tick: no delta yet */
+	}
+
+	/* Sanity floor: a tick period under 1000 cycles implies a sub-1 MHz
+	 * TSC, which does not exist -- guards against a miscompiled
+	 * ns<->cycles conversion silently inverting the signal. */
+	tick_c = ivh_tsc_ns_to_cycles(TICK_NSEC);
+	if (unlikely(tick_c < 1000)) {
+		rq->ivh_tks_skipped++;
+		goto seed;
+	}
+
+	d_idle_c = ivh_tsc_ns_to_cycles(idle_ns > rq->ivh_tks_prev_idle_ns
+					? idle_ns - rq->ivh_tks_prev_idle_ns : 0);
+	if (!READ_ONCE(ivh_tks_idle_sub))
+		d_idle_c = 0;
+
+	avail_c  = now - rq->ivh_tks_prev_tsc;
+	avail_c  = (avail_c > d_idle_c) ? avail_c - d_idle_c : 0;
+
+	excess_c = (s64)avail_c - (s64)tick_c;
+	if (excess_c > (s64)ivh_tsc_ns_to_cycles(READ_ONCE(ivh_tks_deadband_ns))) {
+		unsigned long pct = READ_ONCE(ivh_tks_phase_pct);
+
+		if (pct)
+			excess_c += (s64)div64_u64(tick_c * pct, 100);
+	}
+
+	carry = rq->ivh_tks_carry_c + excess_c;
+	if (carry > 0) {
+		rq->ivh_tks_steal_ns += ivh_tsc_cycles_to_ns((u64)carry);
+		carry = 0;
+	} else {
+		/* clamp_val() before the multiply, not after: a plain sysctl
+		 * with no range of its own times ULONG_MAX would wrap into a
+		 * positive s64, turning the debt floor into a debt ceiling. */
+		floor_c = -(s64)(tick_c * clamp_val(READ_ONCE(ivh_tks_carry_ticks),
+						    1UL, 10000UL));
+		if (carry < floor_c)
+			carry = floor_c;
+	}
+	rq->ivh_tks_carry_c = carry;
+	rq->ivh_tks_samples++;
+
+seed:
+	rq->ivh_tks_prev_tsc     = now;
+	rq->ivh_tks_prev_idle_ns = idle_ns;
+}
+
+/*
+ * ivh_uc_steal_ns - the steal number ivh_uc_tick() folds into "used"
+ * capacity. Honours ivh_steal_source so both estimators are fed the same
+ * steal series; case 1 (REF_TSC) is deliberately absent, see
+ * ivh_steal_source's comment above.
+ */
+static __always_inline u64 ivh_uc_steal_ns(int cpu)
+{
+	if (READ_ONCE(ivh_steal_source) == 2)
+		return READ_ONCE(cpu_rq(cpu)->ivh_tks_steal_ns);
+#ifdef CONFIG_PARAVIRT
+	return paravirt_steal_clock(cpu);
+#else
+	return 0;
+#endif
+}
+
+/*
+ * Q16 fixed-point EMA update on the 1024 scale. |cur| <= 1024<<16 = 2^26,
+ * |diff| <= 2^26, |diff * alpha_q16| <= 2^42: safe in s64 with margin.
+ */
+static __always_inline void ivh_uc_ema(u64 *ema_q, u64 x, u32 alpha_q16)
+{
+	s64 cur  = (s64)*ema_q;
+	s64 diff = ((s64)x << 16) - cur;
+
+	*ema_q = (u64)(cur + ((diff * (s64)alpha_q16) >> 16));
+}
+
+/*
+ * ivh_uc_close - window close: ratio, EMA, publish. vcap's own guard,
+ * reproduced verbatim: a window with negligible steal publishes a perfect
+ * 1.0 rather than a ratio computed from a near-zero denominator's noise.
+ * ivh_uc_vcap_at_close and its ivh_uc_shadow-gated comparator are dropped
+ * (see the struct rq comment) -- everything else is verbatim from
+ * production.
+ */
+static void ivh_uc_close(struct rq *rq, u64 now)
+{
+	u64 avail = rq->ivh_uc_win_avail_c;
+	u64 min_steal_c = ivh_tsc_ns_to_cycles(READ_ONCE(ivh_uc_min_steal_ns));
+	u32 alpha = (u32)READ_ONCE(ivh_uc_ema_alpha_q16);
+	u64 x_wall, x_acct;
+
+	if (!avail || rq->ivh_uc_win_stolen_c < min_steal_c) {
+		x_wall = SCHED_CAPACITY_SCALE;
+		x_acct = SCHED_CAPACITY_SCALE;
+	} else {
+		x_wall = div64_u64(rq->ivh_uc_win_used_c * SCHED_CAPACITY_SCALE, avail);
+		{
+			u64 den = rq->ivh_uc_win_acct_c + rq->ivh_uc_win_stolen_c;
+
+			x_acct = den ? div64_u64(rq->ivh_uc_win_acct_c *
+						 SCHED_CAPACITY_SCALE, den)
+				     : SCHED_CAPACITY_SCALE;
+		}
+	}
+	x_wall = clamp_val(x_wall, 1ULL, (u64)SCHED_CAPACITY_SCALE);
+	x_acct = clamp_val(x_acct, 1ULL, (u64)SCHED_CAPACITY_SCALE);
+
+	if (unlikely(!rq->ivh_uc_windows)) {
+		/* First window: ASSIGN rather than blend -- removes the
+		 * multi-half-life cold-start transient a zero-seeded blend
+		 * would otherwise cost. */
+		rq->ivh_uc_ema_wall_q = x_wall << 16;
+		rq->ivh_uc_ema_acct_q = x_acct << 16;
+	} else {
+		ivh_uc_ema(&rq->ivh_uc_ema_wall_q, x_wall, alpha);
+		ivh_uc_ema(&rq->ivh_uc_ema_acct_q, x_acct, alpha);
+	}
+
+	rq->ivh_uc_capacity_wall = (unsigned long)(rq->ivh_uc_ema_wall_q >> 16);
+	rq->ivh_uc_capacity_acct = (unsigned long)(rq->ivh_uc_ema_acct_q >> 16);
+	WRITE_ONCE(rq->ivh_uc_capacity,
+		   READ_ONCE(ivh_uc_used_source) ? rq->ivh_uc_capacity_acct
+						  : rq->ivh_uc_capacity_wall);
+
+	rq->ivh_uc_raw_wall = x_wall;
+	rq->ivh_uc_raw_acct = x_acct;
+	rq->ivh_uc_windows++;
+
+	rq->ivh_uc_win_start_tsc = now;
+	rq->ivh_uc_win_avail_c = rq->ivh_uc_win_stolen_c = 0;
+	rq->ivh_uc_win_used_c  = rq->ivh_uc_win_acct_c   = 0;
+}
+
+/*
+ * ivh_uc_maybe_close_window - window cadence and the min-avail guard: a
+ * window that was almost entirely idle carries a near-zero denominator and
+ * is extended rather than closed, so it never publishes a ratio derived
+ * from a millisecond of data. ivh_uc_duty_ns is not a production knob
+ * (compiled default 0 = continuous, no skip).
+ */
+static void ivh_uc_maybe_close_window(struct rq *rq, u64 now)
+{
+	u64 win_c  = ivh_tsc_ns_to_cycles(READ_ONCE(ivh_uc_window_ns));
+	u64 duty_c = ivh_tsc_ns_to_cycles(READ_ONCE(ivh_uc_duty_ns));
+
+	if (unlikely(win_c < 1000))
+		return;
+	if ((s64)(now - rq->ivh_uc_win_start_tsc) < (s64)win_c)
+		return;
+	if (rq->ivh_uc_win_avail_c <
+	    div64_u64(win_c * READ_ONCE(ivh_uc_min_avail_pct), 100)) {
+		rq->ivh_uc_extended++;
+		return;
+	}
+	ivh_uc_close(rq, now);
+	if (duty_c)			/* 0 (default) = continuous, no skip */
+		rq->ivh_uc_win_start_tsc = now + duty_c;
+}
+
+/*
+ * ivh_uc_tick - one tick's worth of the "uc" (used-capacity) signal, the
+ * ivh_cap_source=3 input production actually runs (sec 1.5 item 2).
+ * Called from account_process_tick() (kernel/sched/cputime.c). One-tick lag
+ * vs steal_account_process_time()/account_user_time() by design -- see
+ * production's comment; do not "fix" by moving the call site.
+ */
+void ivh_uc_tick(void)
+{
+	struct rq *rq = this_rq();
+	int cpu = smp_processor_id();
+	u64 now, idle_ns, steal_ns, used_ns;
+	u64 d_elapsed_c, d_idle_c, d_steal_c, d_used_c, avail_c, used_c;
+
+	if (unlikely(!READ_ONCE(ivh_uc_enabled)))
+		return;
+	if (unlikely(!tsc_khz)) {
+		rq->ivh_uc_skipped++;
+		return;
+	}
+
+	now = ivh_raw_tsc();
+	idle_ns  = ivh_idle_ns(cpu);
+	steal_ns = ivh_uc_steal_ns(cpu);
+	used_ns  = kcpustat_this_cpu->cpustat[CPUTIME_USER]
+		 + kcpustat_this_cpu->cpustat[CPUTIME_NICE]
+		 + kcpustat_this_cpu->cpustat[CPUTIME_SYSTEM];
+
+	if (unlikely(!rq->ivh_uc_prev_tsc)) {
+		rq->ivh_uc_skipped++;
+		rq->ivh_uc_win_start_tsc = now;
+		goto seed;			/* first tick: no delta yet */
+	}
+
+	d_elapsed_c = now - rq->ivh_uc_prev_tsc;
+
+	d_idle_c  = ivh_tsc_ns_to_cycles(idle_ns  > rq->ivh_uc_prev_idle_ns
+					 ? idle_ns  - rq->ivh_uc_prev_idle_ns : 0);
+	d_steal_c = ivh_tsc_ns_to_cycles(steal_ns > rq->ivh_uc_prev_steal_ns
+					 ? steal_ns - rq->ivh_uc_prev_steal_ns : 0);
+	d_used_c  = ivh_tsc_ns_to_cycles(used_ns  > rq->ivh_uc_prev_used_ns
+					 ? used_ns  - rq->ivh_uc_prev_used_ns : 0);
+
+	avail_c = (d_elapsed_c > d_idle_c) ? d_elapsed_c - d_idle_c : 0;
+	d_steal_c = min(d_steal_c, avail_c);
+	used_c  = avail_c - d_steal_c;
+
+	if ((s64)(now - rq->ivh_uc_win_start_tsc) >= 0) {
+		rq->ivh_uc_win_avail_c  += avail_c;
+		rq->ivh_uc_win_stolen_c += d_steal_c;
+		rq->ivh_uc_win_used_c   += used_c;
+		rq->ivh_uc_win_acct_c   += min(d_used_c, avail_c);
+	}
+
+	ivh_uc_maybe_close_window(rq, now);
+seed:
+	rq->ivh_uc_prev_tsc      = now;
+	rq->ivh_uc_prev_idle_ns  = idle_ns;
+	rq->ivh_uc_prev_steal_ns = steal_ns;
+	rq->ivh_uc_prev_used_ns  = used_ns;
+}
 
 __read_mostly int scheduler_running;
 
