@@ -1219,13 +1219,75 @@ on the same lock at once in these benchmarks) means `pv_wait_node()`'s logic is 
 reached either.
 
 **Not "something wrong with the kernel build"** — every code path behaves exactly as documented.
-**Next step, in progress**: build a purpose-built deep-queue stress test (multiple threads
-genuinely queued simultaneously, long enough hold time to force real `SPIN_THRESHOLD` exhaustion)
-to actually exercise `pv_wait_node()`'s adaptive logic and determine whether it correctly detects a
-stalled predecessor when the conditions for it to matter are actually present. Separately open: a
-decision on whether the `pv_wait_head_or_lock()` holder-preemption gap is worth closing in a future
-step, since no stress test targeting holder-preemption specifically can show a mechanism
-difference while that path stays as currently designed.
+
+**MAJOR CORRECTION, 2026-08-30: the "`ivh_pv_wait()` is never called" finding above was wrong —
+a bug in this session's own tracing, not the kernel.** Built `/root/lhp_stress` (out-of-tree kernel
+module, `misc_register`d `/dev/lhp_stress`, `raw_spin_lock` + `udelay(hold_us)` + unlock per write)
+plus a pthreaded userspace client to force real, deep, sustained queue depth on a single lock. Even
+at a 20ms hold (vastly exceeding any plausible `SPIN_THRESHOLD` cost), `ivh_pv_wait_calls` and
+`ivh_lock_halt` still read pure `0xCCCCCCCCCCCCCCCC` poison on every CPU. Root cause found by
+cross-checking against a variable with an independently-known-correct value: `ivh_pv_wait_calls`
+and `ivh_lock_halt` are `DEFINE_PER_CPU`, and this session's `bpftrace` usage read them via
+`(TYPE *)kaddr("name")` cast directly — which returns the **poisoned per-cpu template address**,
+not the real per-CPU copy. Proved this with `((struct rq *)kaddr("runqueues"))->cpu`, which read a
+constant garbage value on every CPU regardless of which one actually fired the probe, while the
+`cpu` builtin correctly varied — confirming `kaddr()` does not auto-apply per-cpu offset for this
+access pattern. Fix: manually index `__per_cpu_offset[cpu]` (itself a real, non-percpu array) and
+add it to the base address. Earlier struct-typed percpu reads (`kvm_steal_time`, capacity/`rq`
+fields reached via `curtask->se.cfs_rq->rq`) were unaffected — those went through a genuine pointer
+chase through live kernel data, not a `kaddr()`-based percpu symbol lookup, so they were correct.
+The `has_steal_clock`-based steal-time conclusion is also unaffected (a plain non-percpu global,
+read correctly) — re-checked `steal_time` with the fix and it now reads clean, genuine zeros
+(consistent with "never written by the host," just not a poison pattern).
+
+With the fix, `ivh_pv_wait_calls` reads 578K-2.2M across the 16 CPUs — `ivh_pv_wait()` has been
+called constantly the entire time. A controlled, mechanism-paired before/after delta using the
+stress module (identical 10s run, same acquisition count, mechanism=2 then mechanism=0) showed
+`hlt_cycles`/`hlt_events` deltas within ~1% of each other and `poll_cycles`/`poll_events` at zero
+for both — genuinely indistinguishable, but now for an *understood* reason rather than "nothing
+runs": `pv_wait_head_or_lock()` (holder-wait) has no adaptive branch in either mechanism (confirmed
+earlier by direct code reading, unaffected by the tracing bug), so of course it behaves identically;
+this synthetic single-lock workload apparently drives sleep transitions almost entirely through that
+path plus `pv_wait_node()`'s **stock** `prev->state != VCPU_RUNNING` check (tier 1 — a predecessor
+self-reporting it already gave up, requiring zero host cooperation), not through IVH's
+heartbeat-based tier 2.
+
+**Verified upstream comparison, 2026-08-30**: fetched current `torvalds/linux` master directly —
+mainline's `pv_wait_early()` is `return prev->state != VCPU_RUNNING;` only. No `vcpu_is_preempted()`
+call at this site in current mainline. This means IVH's mechanism=0 (which also skips the
+`is_wait_preempted()` call entirely) genuinely does reproduce current stock behavior exactly, and
+the steal-bit/heartbeat check (`is_wait_preempted()`) is a real, distinctive IVH addition on top of
+stock at this call site, not something stock already does. (Whether an older kernel version once had
+`vcpu_is_preempted()` here was not conclusively established; not needed for this rebuild's purposes.)
+
+**Confirmed tier 2 (`is_wait_preempted()`/heartbeat) is genuinely firing** using a stock, already-
+built diagnostic this rebuild had not yet turned on: `ivh_pv_preempt_src=1` ("shadow mode") computes
+both the heartbeat's verdict and the real KVM bit on every check, records a 2x2 agreement matrix
+(`ivh_beat_agree_true/false`, `ivh_beat_false_pos/neg`), and still returns the KVM bit — safe to run
+live, zero behavior change. (`ivh_pv_preempt_src=2`, used for all benchmarking above, explicitly
+skips this bookkeeping — `if (src == 2) return beat;` — by design, to keep the authoritative path
+free of unconditional paravirt touches.) In this CVM, `vcpu_is_preempted()` is always false
+(confirmed steal-time gap), so `agree_true` and `false_neg` are structurally always 0; the
+meaningful signal is `false_pos` — the heartbeat saying "preempted" when the (broken) KVM bit says
+no, i.e. a real detection the KVM path structurally cannot make. Result: **501 real detections** in
+ambient system activity. Pinning the stress module's threads directly to the confirmed-contended
+cpu0-7 added zero further detections over another 10s run — consistent with, not contradicting, the
+mechanism: this synthetic lock's predecessors reliably self-halt (tier 1) before tier 2 gets a
+chance to check them, on any CPU, so the 501 real detections almost certainly came from other,
+differently-shaped locks elsewhere in the system, not this stress module.
+
+**Bottom line, addressing the explicit goal of this investigation ("confirm adaptive spinning works
+or find a real kernel defect")**: adaptive spinning (tier 2) is confirmed genuinely working — no
+kernel defect found anywhere in this chain. It is rare in absolute terms because the window it needs
+is narrow (a predecessor still actively spinning, not yet self-halted, at the exact instant the host
+steals its CPU), and a deterministic single-lock synthetic stress test cannot force that window on
+demand regardless of which CPUs it runs on. Resolving the remaining quantitative question (how often
+this window occurs under real production load) needs either a much longer observation window under
+organic system activity, or a differently-shaped stress test with a long *active-spin* phase rather
+than a fully deterministic serialized hold — not attempted further this session.
+
+Separately still open: whether the `pv_wait_head_or_lock()` holder-preemption gap (confirmed via
+code reading, unaffected by any of the above) is worth closing in a future step.
 
 ### Step 8 — enable migration (full production IVH) — **STATUS: specified, sysctl + daemon**
 
