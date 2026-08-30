@@ -977,6 +977,53 @@ GLOCK-2/post-break/day-old-GLOCK-5 entries above: nothing on the guest side chan
 two runs, so a same-kernel, same-config, 30-minutes-apart swing this large has to be external.
 Logged as confirming evidence, not a new open question.
 
+**Functional verification of Step 6's plumbing, 2026-08-30** (same standard as the Step 5 rseq
+proof: don't infer "probably fine" from benchmark numbers holding steady, force each mechanism to
+prove itself). All done live against the running `6.17.0-GLOCK-6+`, no new kernel build required —
+`CONFIG_DEBUG_INFO_BTF=y` is on and `bpftrace`/BTF made every check below possible with zero source
+changes.
+
+1. **Sysctl surface**: all of Step 6's new knobs are registered and readable under
+   `/proc/sys/kernel/`, compiled defaults intact (`ivh_universal_eligible=0`, `ivh_uc_enabled=1`,
+   `ivh_cap_source=0` — this last one is the *compiled* default, not production's tuned `3`; nothing
+   has run `IVH_start.sh` against this kernel yet, so 0 is expected here, not a bug). One knob,
+   `ivh_preempt_event_source`, is genuinely absent — checked the code, this is intentional: the
+   comment at `kernel/sched/fair.c:13772` explains its only other value (2, the Part-C TSC branch)
+   was never actually reachable in production either due to a documented script-drift gap (sec 1.4
+   item 6), so Step 6 correctly reproduces production's *actual* behavior rather than exposing a
+   knob with one dead setting. (Side note: the docs repo's own uncommitted `IVH_start.sh` diff
+   re-adds `ivh_preempt_event_source 2` to fix that drift going forward — unrelated to this rebuild
+   chain, just flagging the overlap since it's sitting in the working tree.)
+
+2. **Proof the tick hooks are live, not dead code**: `ivh_uc_tick()`'s window accumulators
+   (`rq->ivh_uc_win_avail_c`, `_win_used_c`) aren't exposed anywhere in userspace yet, so read them
+   directly via a `bpftrace` kprobe (`curtask->se.cfs_rq->rq->ivh_uc_capacity` etc. — resolved
+   cleanly via BTF, no kernel changes). Pinned a busy loop to CPU 3 and sampled every tick: both
+   accumulators climbed in lockstep, ~2.2M cycles per ~1ms tick, exactly tracking real TSC deltas,
+   with `win_stolen_c` staying 0 and `capacity` correctly pegged at 1024 (full, no steal) the whole
+   time. This is the same category of proof as `rseq_verify.c` — a monotonically progressing,
+   load-correlated value can only come from the real per-tick arithmetic actually executing, not a
+   stub or a hardcoded constant.
+
+3. **Proof the migration gate cannot fire yet, and specifically cannot hit the flagged CPU-0-stub
+   risk**: `ivh_pre_lock()`'s very first check is `if (!bpf_sched_enabled()) return;`, which reads
+   the `bpf_sched_enabled_key` jump label. Read that key directly from kernel memory —
+   `*(int32*)kaddr("bpf_sched_enabled_key") == 0` — confirming the branch is globally disabled right
+   now. That means every one of the 3 call sites wired into `spinlock.c`'s fast path bails on line 1,
+   before even checking `ivh_universal_eligible`, for literally every lock acquisition in the
+   system. Confirmed empirically too: a kprobe on `bpf_sched_pre_lock_migrate()` recorded exactly 0
+   hits across a full lock-heavy `hackbench` run. This is stronger than just observing
+   `ivh_universal_eligible=0` holds it off — it shows the whole insertion is structurally a no-op
+   until Step 8 calls `bpf_sched_inc()` to attach a real program, which is the only thing that moves
+   this key. The CPU-0-default stub risk flagged above literally cannot be reached in this build.
+
+**On the WARN_ON_ONCE trip-wire idea (considered, deferred)**: a safety check that fires if the
+inert BPF hook's CPU-0 default ever gets consumed once the key *is* on but the real program doesn't
+override that specific hook. Decided not to add it to Step 6: the condition it guards against
+doesn't exist yet (the key is off), so there's no way to test that it fires correctly or stays quiet
+without artificially faking Step 8's state — better to add it alongside the real attach path in
+Step 8 itself, where it can be verified against real conditions instead of a simulated one.
+
 Rebuild repo: committed `80b92bf1a832`, tagged `6.17-GLOCK-6`, pushed to
 `nhatz11/linux-6.17:ivh-rebuild-main` + tag pushed. Docs repo: this entry + the Step 5/rseq
 functional-proof entries above pushed to `kernel-43-clean`.
