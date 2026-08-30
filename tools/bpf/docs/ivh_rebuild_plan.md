@@ -1028,6 +1028,58 @@ Rebuild repo: committed `80b92bf1a832`, tagged `6.17-GLOCK-6`, pushed to
 `nhatz11/linux-6.17:ivh-rebuild-main` + tag pushed. Docs repo: this entry + the Step 5/rseq
 functional-proof entries above pushed to `kernel-43-clean`.
 
+**Follow-up, 2026-08-30: closing the capacity-dip gap with `vcap_probe`.** The live checks above
+(capacity pegged at 1024 on an idle CPU even with the correct `ivh_steal_source=2` /
+`ivh_tks_idle_sub=0` / `ivh_tks_phase_pct=100` config) turned out to be checking the wrong
+precondition, not a broken mechanism. §1.5 item 7 already documents why: `vcap_probe -p 200 -s 200`
+computes/publishes nothing itself — its entire purpose is to keep every vCPU minimally active
+(`SCHED_IDLE` worker threads, 50% duty) so it never issues `HLT` and the host never reclaims the
+physical core. An idle vCPU has voluntarily given its core back; there's nothing there for a
+corunner to contest, so of course the tick-gap estimator saw nothing.
+
+Started `vcap_probe` (with `ivh_steal_source=2`/`ivh_tks_idle_sub=0`/`ivh_tks_phase_pct=100` set),
+waited past the documented ~130s EMA convergence, then sampled `rq->ivh_uc_capacity` across all 16
+vCPUs twice, a few seconds apart:
+
+| | cpu0-7 | cpu8-15 |
+|---|---|---|
+| Sample 1 | 457-659 | 1018-1022 |
+| Sample 2 | 592-645 | all 1023 |
+
+Consistent both times: cpu0-7 sit meaningfully degraded, cpu8-15 sit at essentially full capacity —
+matching the exact cpu0-7-vs-cpu8-15 split this session already knew about from production. Also
+visible at the raw `mpstat` level before even looking at the internal signal: cpu0-7 got only
+~38-40% of `vcap_probe`'s requested 50% duty cycle, cpu8-15 got the full ~49%. **This is the
+decisive proof the earlier tick-hook test couldn't provide**: capacity doesn't just compute live
+arithmetic, it tracks real, independently-known contention correctly, on the correct vCPUs, once its
+actual operating precondition (a core being held open) is met.
+
+`vcap_probe` stopped afterward; `ivh_steal_source`/`ivh_tks_idle_sub`/`ivh_tks_phase_pct` reverted
+to Step 6's compiled defaults (0/1/0) to leave the running kernel matching what Step 6 actually
+ships — the production-real values above were a deliberate temporary override for this test only,
+not a standing config change.
+
+**Methodological caution for Step 8, raised during this check and worth treating as a hard
+requirement, not a nice-to-have**: `vcap_probe`'s cost is documented (§1.5 item 7) as 41-60%
+throughput *with IVH fully off* — and the mechanism for that cost has nothing to do with IVH's
+actual contribution. `vcap_probe`'s worker threads run `SCHED_IDLE`, the lowest schedulable class,
+so they never preempt or delay real workload threads within the guest — a real thread always wins
+the guest's own scheduler instantly. The cost is a **host-level** effect: `SCHED_IDLE` still beats
+issuing `HLT`, so during gaps where the guest would otherwise voluntarily relinquish a core,
+`vcap_probe` keeps it looking busy instead, denying the host the chance to hand that time to the
+corunner. That's resource-holding, not scheduling intelligence, and it is entirely orthogonal to
+IVH's real algorithmic contribution (migrating work off a lock-holder that's about to be preempted).
+**Implication**: any Step 8 before/after comparison must hold `vcap_probe` constant across both
+arms (`vcap_probe` on + `ivh_universal_eligible=0` vs. `vcap_probe` on + `=1`) — comparing a
+vanilla/no-`vcap_probe` baseline against a full-IVH-with-`vcap_probe` arm would attribute most of
+the headline gain to core-holding rather than migration, badly overstating IVH's real contribution.
+
+**Follow-on idea for post-Step-8 (recorded, not built)**: once migration is confirmed to actually
+move work off degraded vCPUs, `vcap_probe`'s duty cycle could plausibly be made adaptive — lighter
+probing on vCPUs IVH has already identified as bad and is steering work away from, since holding
+those specific cores open matters less once nothing important runs there. Worth revisiting once
+Step 8's migration path is validated, not before.
+
 ### Step 7 — enable full production PV (mechanism=2) — **STATUS: specified, sysctl-only, no rebuild needed**
 
 Pure sysctl flip on top of Step 6's build: `ivh_pv_wait_mechanism=2`, `ivh_pv_kick_pure_ipi=1`,
