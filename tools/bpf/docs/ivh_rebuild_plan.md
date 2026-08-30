@@ -1098,6 +1098,56 @@ Pure sysctl flip on top of Step 6's build: `ivh_pv_wait_mechanism=2`, `ivh_pv_ki
 migration entirely. **This is the step this session's origin investigation (hours ago) already
 showed a real win on** — expect hackbench/dbench/ebizzy to genuinely improve here.
 
+**Boot-and-test, 2026-08-30.** Sysctls flipped on the running `6.17.0-GLOCK-6+`, no rebuild. First
+A/B pair (mechanism=0 control, then mechanism=2) showed a striking result: NHextend3 flat, hackbench
+slightly worse (+2.8%, within its own noise), dbench +3.0%, **ebizzy +37.1%**. Ran the pair again
+with the order swapped (mechanism=2 first, mechanism=0 second) as a control, per this session's
+established host-drift discipline — and the result reversed: ebizzy came back **-4.5%** for
+mechanism=2 this time, dbench's edge shrank to +1.8%, NHextend3 stayed flat both times regardless of
+order. Whichever config happened to run *second* in each pair looked better on the two
+host-sensitive benchmarks — the classic host-drift signature already documented multiple times in
+this doc, not a real mechanism effect. **Conclusion: no order-independent benefit from mechanism=2
+detected in this test.**
+
+(Aside, process note: hit `ivh_pv_reject_unsafe_combo()` — a genuine, well-designed cross-knob
+safety validator in `arch/x86/kernel/kvm.c` that refused `ivh_pv_wait_mechanism=0` while
+`ivh_pv_kick_pure_ipi` was still 1, since that combination halts a waiter with `RFLAGS.IF=0` and no
+way to wake it, freezing the VM. Fixed by setting `kick_pure_ipi=0` before `wait_mechanism=0`. Not a
+bug — confirms Step 4's "cross-knob safety validators" are real and working.)
+
+**Before accepting the null result, checked whether real contention existed during the test at
+all** — confirmed via `ivh_tks_steal_ns`'s cumulative counter: cpu0-7 showed 554-774s of steal,
+cpu8-15 showed 186-298s, over ~2h17m uptime, consistent all session. Real, substantial, persistent
+contention was present throughout — the null result isn't "nothing to detect."
+
+**Bigger finding: stock's own preemption signal doesn't exist in this environment, structurally,
+for any kernel tested.** `vcpu_is_preempted()` (`ivh_pv_preempt_src=0`) reads `kvm_steal_time`'s
+`preempted` field — checked the live per-cpu memory directly and every field (`steal`, `preempted`,
+`version`) reads exactly `0xCC` repeating, identical bit-for-bit across all 16 CPUs. That's the
+kernel's own poison pattern: this memory was never written by anything. Traced it to
+`has_steal_clock` (`arch/x86/kernel/kvm.c`), which reads `0` live — `kvm_para_has_feature
+(KVM_FEATURE_STEAL_TIME)` is false, so `pv_ops.lock.vcpu_is_preempted` was never reassigned away
+from its native no-op default (`return false`, unconditionally). Confirmed via Intel's own TDX
+Linux Guest Kernel Security Specification this is architectural, not a config gap: `KVM_FEATURE_
+STEAL_TIME` (along with `ASYNC_PF` and `PV_EOI`) is "already indirectly disabled" for any TDX guest
+"because the required memory structures are not shared between the host and the guest" — TDX's
+threat model doesn't allow the host to write live scheduling data into guest-visible memory at all.
+Searched the TDX Guest-Hypervisor Communication Interface spec and "Intel TDX Demystified: A
+Top-Down Approach" (arXiv 2303.15540) for a TDX-native replacement (a `TDVMCALL` subfunction for
+scheduling/steal telemetry) — none exists; the available `TDVMCALL`s cover I/O/HLT/CPUID/MMIO
+emulation, not scheduling state. This lines up with published attack research on confidential VMs
+(e.g. "Heckler: Breaking Confidential VMs with Malicious Interrupts," arXiv 2404.03387) — giving the
+host any channel to signal interrupt/scheduling timing into the guest is a live attack surface, so
+TDX keeps that door closed generally, not just for steal-time specifically.
+
+**What this means**: every benchmark run in this entire rebuild (Steps 0-7, vanilla included) has
+been comparing against a "stock PV" whose preemption signal is not degraded but entirely absent —
+hardcoded false, always, on every kernel. IVH's TSC-heartbeat approach isn't one signal source among
+several here; it's the only mechanism in this environment that can detect preemption at all, because
+it's self-measured from the guest's own TSC rather than host-reported, so it doesn't need the
+channel TDX's threat model closes. That makes the null A/B result more worth resolving, not less —
+see the decision tree and next steps discussed with the user, 2026-08-30.
+
 ### Step 8 — enable migration (full production IVH) — **STATUS: specified, sysctl + daemon**
 
 `ivh_universal_eligible=1` + load `MY_ivh_atc` (built with `IVH_CAP_HARDFLOOR=700`, resolved
