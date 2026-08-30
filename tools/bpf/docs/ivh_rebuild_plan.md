@@ -1184,6 +1184,49 @@ deliberately long critical section (holding the lock long enough that other wait
 genuinely runs out) is the prerequisite — building finer instrumentation before that exists would
 measure nothing, same failure mode as the tracing attempts today.
 
+**Follow-up, 2026-08-30: full root-cause read of `kernel/locking/qspinlock_paravirt.h`, per user
+directive to not stop until adaptive spinning is confirmed working or a real defect is found.**
+Two compounding findings, neither a code bug — both are the code behaving exactly as documented:
+
+1. **`SPIN_THRESHOLD = 1 << 15 = 32768`** (`arch/x86/include/asm/spinlock.h`). At this CPU's
+   ~2.2GHz, with `cpu_relax()`/`PAUSE` costing roughly 100-140 cycles, that's ~1.5-2ms of a waiter's
+   own actually-*scheduled* spin time before any fallback logic even applies — a substantial bar
+   for a microbenchmark's typically short critical sections to cross, independent of how much real
+   host steal is happening elsewhere. Iteration count only advances while the waiter is actually
+   running, so a waiter that itself gets preempted mid-spin simply resumes where it left off and
+   continues counting — consistent with zero exhaustion events across NHextend3 and 89s of
+   hackbench even with confirmed heavy steal.
+
+2. **Structural: adaptive intelligence only exists in `pv_wait_node()`, not `pv_wait_head_or_lock()`.**
+   `pv_wait_node()` governs a *queued* waiter checking whether the node ahead of it *in the MCS
+   queue* (not the lock holder) looks stalled — this is the only place `pv_wait_early()`/
+   `is_wait_preempted()` (the TSC-heartbeat check) is consulted, and per mechanism 2's "scoped
+   halt" design, its `true` return is literally the *sole* gate for ever sleeping on this path.
+   `pv_wait_head_or_lock()` — the function governing a waiter's direct wait for the **actual current
+   lock holder**, i.e. the classic LHP scenario — has **no adaptive check at all**, in either
+   mechanism: it falls through to `pv_wait()` purely on `SPIN_THRESHOLD` exhaustion, byte-identical
+   for mechanism=0 and mechanism=2. This is confirmed intentional in the code's own comment, not a
+   rebuild-introduced gap: "there is no `vcpu_is_preempted()` signal for 'the current lock holder'
+   from that path, only for an MCS predecessor." Ported verbatim from production's real design.
+
+**What this means for the user's expectation that adaptive spinning should catch preemption of
+either a holder or a waiter**: as actually implemented, it doesn't — it only ever helps the
+narrower case of a queued waiter stuck behind a *different, non-holder* waiter that's stalled, which
+requires genuine queue depth ≥2 to even be reachable. Combined with finding 1, this fully explains
+zero `ivh_pv_wait_calls` across every benchmark run today: short critical sections never exhaust
+32768 iterations even amid real steal, and shallow queue depth (rarely 2+ threads genuinely queued
+on the same lock at once in these benchmarks) means `pv_wait_node()`'s logic is barely if ever
+reached either.
+
+**Not "something wrong with the kernel build"** — every code path behaves exactly as documented.
+**Next step, in progress**: build a purpose-built deep-queue stress test (multiple threads
+genuinely queued simultaneously, long enough hold time to force real `SPIN_THRESHOLD` exhaustion)
+to actually exercise `pv_wait_node()`'s adaptive logic and determine whether it correctly detects a
+stalled predecessor when the conditions for it to matter are actually present. Separately open: a
+decision on whether the `pv_wait_head_or_lock()` holder-preemption gap is worth closing in a future
+step, since no stress test targeting holder-preemption specifically can show a mechanism
+difference while that path stays as currently designed.
+
 ### Step 8 — enable migration (full production IVH) — **STATUS: specified, sysctl + daemon**
 
 `ivh_universal_eligible=1` + load `MY_ivh_atc` (built with `IVH_CAP_HARDFLOOR=700`, resolved
