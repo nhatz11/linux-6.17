@@ -953,6 +953,34 @@ the kind of thing to hunt for here if numbers regress — though note the Part-C
 above cuts the other way (missing cost, not added cost), so a *clean* result here doesn't fully
 resolve §5's gap-hunt either.
 
+**Boot-and-benchmark, 2026-08-30**: booted `6.17.0-GLOCK-6+` fresh, ran the baseline suite twice
+(4 reps each, ~30 min apart):
+
+| Benchmark | Population range (vanilla-GLOCK5, §3.3.1 bisection) | GLOCK-6 run 1 | GLOCK-6 run 2 |
+|---|---|---|---|
+| NHextend3 -n16 | 2770-2920 | 2747-2917 (mean 2839) | 2759-2857 (mean 2802) |
+| hackbench -T -g1 -f8 -l400000 | 63-90s | 72-93.6s | 54.6-70.7s |
+| dbench -t 12 16 | 397-413 MB/s | 390-412 (mean 396.5) | 434-526 (mean 464.4) |
+| ebizzy mmap 4MB | 2160-2580 | 2124-2423 (mean 2254) | 3546-3981 (mean 3787.5) |
+
+**No regression.** NHextend3 (lock/scheduling-bound, exercises the new tick hooks directly since
+`ivh_uc_tick`/`ivh_tick_steal_accumulate` run every tick regardless of the eligibility gate) stayed
+tightly inside the population range across both runs — the unconditional tick-hook cost predicted
+above is not measurable at this resolution. hackbench stayed within its usual high-noise ceiling
+both times.
+
+dbench and ebizzy swung enormously between the two runs — run 2 landed 15-40% *above* run 1 and
+well outside the entire six-kernel population band from last night, on the identical kernel with
+zero code or config change in between, ~30 minutes apart. This is the cleanest evidence yet for
+the standing "dbench/ebizzy track host/corunner state, not the kernel" hypothesis from the
+GLOCK-2/post-break/day-old-GLOCK-5 entries above: nothing on the guest side changed between these
+two runs, so a same-kernel, same-config, 30-minutes-apart swing this large has to be external.
+Logged as confirming evidence, not a new open question.
+
+Rebuild repo: committed `80b92bf1a832`, tagged `6.17-GLOCK-6`, pushed to
+`nhatz11/linux-6.17:ivh-rebuild-main` + tag pushed. Docs repo: this entry + the Step 5/rseq
+functional-proof entries above pushed to `kernel-43-clean`.
+
 ### Step 7 — enable full production PV (mechanism=2) — **STATUS: specified, sysctl-only, no rebuild needed**
 
 Pure sysctl flip on top of Step 6's build: `ivh_pv_wait_mechanism=2`, `ivh_pv_kick_pure_ipi=1`,
