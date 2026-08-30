@@ -1148,6 +1148,42 @@ it's self-measured from the guest's own TSC rather than host-reported, so it doe
 channel TDX's threat model closes. That makes the null A/B result more worth resolving, not less —
 see the decision tree and next steps discussed with the user, 2026-08-30.
 
+**Root cause of the null result found, 2026-08-30: `ivh_pv_wait()` is never called at all, by
+either mechanism, under any benchmark in this suite.** User asked for a cycle-usage measurement of
+adaptive spinning (spin cycles vs halt cycles) as a cleaner signal than benchmark throughput, and
+specifically asked whether it needed a kernel build. It didn't — before building anything, checked
+whether the data already existed live: Step 4 already ported `struct ivh_lock_halt`
+(`arch/x86/include/asm/ivh_tsc_beat.h`), a per-cpu poll-cycles/halt-cycles/events counter populated
+unconditionally by `ivh_pv_wait()` (`arch/x86/kernel/kvm.c`). Read it live via `bpftrace` during
+both NHextend3 and hackbench, under mechanism=2 with confirmed real contention happening — every
+field, every CPU, read exactly `0xCCCCCCCCCCCCCCCC`/`0xCC`/`0xCCCCCCCC`: the poison pattern, never
+written.
+
+Traced this to its root: `ivh_pv_wait_calls`, a counter incremented unconditionally on the very
+first line of `ivh_pv_wait()` — before any mechanism branch at all — is *also* pure poison, on every
+CPU, under both NHextend3 (a few seconds) and hackbench (89s). **`ivh_pv_wait()` has never been
+entered once**, regardless of `ivh_pv_wait_mechanism`'s value. `__pv_queued_spin_lock_slowpath`
+itself is genuinely active (confirmed real, contention-dependent timing data earlier), so waiters
+are queuing and spinning — they're just resolving within their bounded spin budget every single
+time, for every benchmark in this suite, without ever exhausting it and falling through to a real
+`pv_wait()`/halt call. Since that's the one function mechanism=0 and mechanism=2 actually differ
+inside, **the two configurations have been functionally byte-identical in every test run today** —
+not because the mechanisms perform equally, but because the differing code was never reached by
+either one. This fully explains the earlier order-dependent swap result (§ above): there was no
+real effect to detect, because the toggle didn't change anything this benchmark suite exercises.
+
+The two extreme 4-8ms tail-latency outliers from the earlier slowpath-duration measurement are
+almost certainly the *waiting* thread itself getting preempted by the host mid-spin (real, confirmed
+contention exists) — not a real halt/wake event, since we now know that path was never taken.
+
+**Implication for what's actually needed next**: neither more tracing nor a kernel build (GLOCK-7,
+proposed and correctly not yet built) will show anything about mechanism=0 vs mechanism=2's real
+behavior until a workload exists that actually forces a waiter to exhaust its spin budget and call
+`pv_wait()`. None of the 4 standard benchmarks do this. A purpose-built stress test with a
+deliberately long critical section (holding the lock long enough that other waiters' bounded spin
+genuinely runs out) is the prerequisite — building finer instrumentation before that exists would
+measure nothing, same failure mode as the tracing attempts today.
+
 ### Step 8 — enable migration (full production IVH) — **STATUS: specified, sysctl + daemon**
 
 `ivh_universal_eligible=1` + load `MY_ivh_atc` (built with `IVH_CAP_HARDFLOOR=700`, resolved
