@@ -1059,20 +1059,31 @@ to Step 6's compiled defaults (0/1/0) to leave the running kernel matching what 
 ships — the production-real values above were a deliberate temporary override for this test only,
 not a standing config change.
 
-**Methodological caution for Step 8, raised during this check and worth treating as a hard
-requirement, not a nice-to-have**: `vcap_probe`'s cost is documented (§1.5 item 7) as 41-60%
-throughput *with IVH fully off* — and the mechanism for that cost has nothing to do with IVH's
-actual contribution. `vcap_probe`'s worker threads run `SCHED_IDLE`, the lowest schedulable class,
-so they never preempt or delay real workload threads within the guest — a real thread always wins
-the guest's own scheduler instantly. The cost is a **host-level** effect: `SCHED_IDLE` still beats
-issuing `HLT`, so during gaps where the guest would otherwise voluntarily relinquish a core,
-`vcap_probe` keeps it looking busy instead, denying the host the chance to hand that time to the
-corunner. That's resource-holding, not scheduling intelligence, and it is entirely orthogonal to
-IVH's real algorithmic contribution (migrating work off a lock-holder that's about to be preempted).
-**Implication**: any Step 8 before/after comparison must hold `vcap_probe` constant across both
-arms (`vcap_probe` on + `ivh_universal_eligible=0` vs. `vcap_probe` on + `=1`) — comparing a
-vanilla/no-`vcap_probe` baseline against a full-IVH-with-`vcap_probe` arm would attribute most of
-the headline gain to core-holding rather than migration, badly overstating IVH's real contribution.
+**Methodological note for Step 8, corrected after discussion 2026-08-30**: `vcap_probe`'s worker
+threads run `SCHED_IDLE`, the lowest schedulable class, so they never preempt or delay real
+workload threads within the guest — a real thread always wins the guest's own scheduler instantly.
+The cost documented in §1.5 item 7 (41-60% throughput with IVH fully off) is a **host-level**
+effect instead: `SCHED_IDLE` still beats issuing `HLT`, so during gaps where the guest would
+otherwise voluntarily relinquish a core, `vcap_probe` keeps it looking busy, denying the host the
+chance to hand that time to the corunner.
+
+This session's first pass argued that fact meant Step 8's comparison *must* hold `vcap_probe`
+constant across both arms (on+`ivh_universal_eligible=0` vs. on+`=1`), calling anything else a
+methodology error. **That was too strong, corrected by the user**: `vcap_probe` only exists to feed
+migration — with migration off it's pure cost with no offsetting benefit, so an arm pairing it with
+`ivh_universal_eligible=0` doesn't correspond to any real, shippable configuration. It's not "the
+correct baseline," it's a synthetic one. The right **primary** comparison is the same Step-N-vs-
+Step-(N-1) pattern this whole rebuild already uses: **Step 8 (full IVH: `vcap_probe` + capacity +
+migration) vs. Step 7 (real PV alone, mechanism=2, no `vcap_probe`, no migration)** — Step 7 is the
+best realistic alternative to actually deploying IVH, so that diff is the honest "is this worth it"
+number, `vcap_probe`'s cost included as a real, unavoidable part of what shipping IVH costs.
+
+The `vcap_probe`-held-constant comparison (on+off vs. on+on for `ivh_universal_eligible`) still has
+a role, but a narrower one: it's a **diagnostic decomposition**, not the headline number. Reach for
+it specifically if Step 8 vs. Step 7 comes back underwhelming and the question becomes *why* —
+whether migration's own contribution is small, or `vcap_probe`'s overhead is large enough to be
+masking a genuinely good migration gain. That decomposition is what would tell you whether reducing
+`vcap_probe`'s overhead (see the follow-on idea below) is worth pursuing at all.
 
 **Follow-on idea for post-Step-8 (recorded, not built)**: once migration is confirmed to actually
 move work off degraded vCPUs, `vcap_probe`'s duty cycle could plausibly be made adaptive — lighter
