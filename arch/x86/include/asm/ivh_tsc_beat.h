@@ -100,6 +100,7 @@ DECLARE_PER_CPU(u64, ivh_beat_agree_false);
 DECLARE_PER_CPU(u64, ivh_beat_false_pos);
 DECLARE_PER_CPU(u64, ivh_beat_false_neg);
 DECLARE_PER_CPU(u64, ivh_beat_publishes);
+DECLARE_PER_CPU(u64, ivh_beat_tier1_fired);
 DECLARE_PER_CPU(s64, ivh_beat_min_age);
 DECLARE_PER_CPU(u64, ivh_beat_age_hist_running[IVH_BEAT_AGE_HIST_BUCKETS]);
 DECLARE_PER_CPU(u64, ivh_beat_age_hist_preempted[IVH_BEAT_AGE_HIST_BUCKETS]);

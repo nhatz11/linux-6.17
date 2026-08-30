@@ -1158,6 +1158,16 @@ DEFINE_PER_CPU(u64, ivh_beat_agree_false);
 DEFINE_PER_CPU(u64, ivh_beat_false_pos);
 DEFINE_PER_CPU(u64, ivh_beat_false_neg);
 DEFINE_PER_CPU(u64, ivh_beat_publishes);
+/*
+ * IVH rebuild diagnostic, 2026-08-30: tier-1 (prev->state != VCPU_RUNNING,
+ * stock upstream's own check) fire count, mechanism-independent -- this
+ * branch in pv_wait_early() is reached and evaluated for every mechanism,
+ * including mechanism=0, unlike the tier-2 counters above which only ever
+ * increment once is_wait_preempted() is reached (mechanism != 0). Exists
+ * to let the tier-1-vs-tier-2 resolution ratio be measured directly,
+ * instead of inferred from tier-2's counts alone.
+ */
+DEFINE_PER_CPU(u64, ivh_beat_tier1_fired);
 DEFINE_PER_CPU(s64, ivh_beat_min_age) = S64_MAX;
 DEFINE_PER_CPU(u64, ivh_beat_age_hist_running[IVH_BEAT_AGE_HIST_BUCKETS]);
 DEFINE_PER_CPU(u64, ivh_beat_age_hist_preempted[IVH_BEAT_AGE_HIST_BUCKETS]);

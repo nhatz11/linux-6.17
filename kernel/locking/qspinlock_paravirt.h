@@ -402,8 +402,10 @@ pv_wait_early(struct pv_node *prev, int loop)
 	if ((loop & PV_PREV_CHECK_MASK) != 0)
 		return false;
 
-	if (READ_ONCE(prev->state) != VCPU_RUNNING)
+	if (READ_ONCE(prev->state) != VCPU_RUNNING) {
+		this_cpu_inc(ivh_beat_tier1_fired);
 		return true;
+	}
 
 	/*
 	 * IVH (default OFF, sysctl ivh_pv_wait_mechanism != 0): bail out of the
