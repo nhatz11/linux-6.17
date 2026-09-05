@@ -522,9 +522,7 @@ static void pv_wait_node(struct mcs_spinlock *node, struct mcs_spinlock *prev)
 		 * gave up on lock-free acquisition -- SPIN_THRESHOLD - loop.
 		 * `loop` still holds the pre-decrement value whether we got here
 		 * via the wait_early break above or via natural exhaustion
-		 * (loop == 0). Placed before the mechanism-2 continue below so
-		 * "spun the full budget and looped back to re-arm" attempts are
-		 * counted too -- that is real spin cost either way.
+		 * (loop == 0).
 		 */
 		this_cpu_add(ivh_node_spin_iters_sum, SPIN_THRESHOLD - loop);
 		this_cpu_inc(ivh_node_spin_attempts);

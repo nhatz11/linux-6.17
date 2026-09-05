@@ -27,6 +27,7 @@
 #include <linux/slab.h>
 #include <linux/kprobes.h>
 #include <linux/nmi.h>
+#include <linux/delay.h>
 #include <linux/swait.h>
 #include <linux/syscore_ops.h>
 #include <linux/cc_platform.h>
@@ -1133,12 +1134,12 @@ DEFINE_PER_CPU(u64, ivh_beat_false_neg);
 DEFINE_PER_CPU(u64, ivh_beat_publishes);
 /*
  * IVH rebuild diagnostic, 2026-08-30: tier-1 (prev->state != VCPU_RUNNING,
- * stock upstream's own check) fire count, mechanism-independent -- this
- * branch in pv_wait_early() is reached and evaluated for every mechanism,
- * including mechanism=0, unlike the tier-2 counters above which only ever
- * increment once is_wait_preempted() is reached (mechanism != 0). Exists
- * to let the tier-1-vs-tier-2 resolution ratio be measured directly,
- * instead of inferred from tier-2's counts alone.
+ * stock upstream's own check) fire count, mode-independent -- this branch
+ * in pv_wait_early() is reached and evaluated in every ivh_adaptive_mode
+ * value, including VANILLA, unlike the tier-2 counters above which only
+ * ever increment once is_wait_preempted() is reached (mode == ADAPTIVE
+ * only). Exists to let the tier-1-vs-tier-2 resolution ratio be measured
+ * directly, instead of inferred from tier-2's counts alone.
  */
 DEFINE_PER_CPU(u64, ivh_beat_tier1_fired);
 DEFINE_PER_CPU(u64, ivh_halt_from_node);
@@ -1157,6 +1158,7 @@ DEFINE_PER_CPU(u64, ivh_beat_age_hist_preempted[IVH_BEAT_AGE_HIST_BUCKETS]);
 DEFINE_PER_CPU(u64, ivh_wake_hypercall);
 DEFINE_PER_CPU(u64, ivh_wake_ipi);
 DEFINE_PER_CPU(u64, ivh_wait_irqoff_nohalt);
+DEFINE_PER_CPU(u32, ivh_vanilla_inflight);
 
 /*
  * HLT/poll cycle accounting for ivh_pv_wait()'s halt paths. Declared in
@@ -1183,11 +1185,60 @@ late_initcall(ivh_pv_beat_calibrate);
 
 #ifdef CONFIG_SYSCTL
 /*
- * ivh_adaptive_mode: reject anything above 2 (IVH_MODE_ADAPTIVE). Unlike the
- * pre-rebuild mechanism/kick-knob pile, there is no unsafe combination to
- * guard here: mode 0 always wakes via the hypercall (safe with an IF=0
- * halt), modes 1/2 never reach that halt shape at all (see ivh_pv_wait()),
- * so every value of this one knob is self-consistent by construction.
+ * Drain every CPU that might already be committed to ivh_pv_wait()'s
+ * VANILLA branch (read ivh_adaptive_mode==0 before this write landed) before
+ * a live 0->nonzero transition completes. Found by independent review:
+ * modes 1/2 never send KVM_HC_KICK_CPU, so a CPU already past that READ_ONCE
+ * and headed for the bare, RFLAGS.IF=0 halt() would otherwise permanently
+ * lose its only wake vehicle the instant the mode flips -- the exact
+ * 2026-07-24 hard-freeze class, just reached via a sysctl write instead of a
+ * wait/kick race.
+ *
+ * Correctness relies on KVM_HC_KICK_CPU's pv_unhalted being a LATCHING flag
+ * (arch/x86/kvm/lapic.c, kvm_pv_kick_cpu_op()): a kick delivered at any point
+ * during a CPU's in-flight window -- including before it has disabled IRQs
+ * or reached halt() at all -- makes that CPU's next halt() (if it takes one
+ * at all before exiting the branch) return immediately. So this does not
+ * need to catch anyone precisely "at" halt(); it only needs to keep kicking
+ * every online CPU on every pass until none of them still report being in
+ * the branch, which bounds the set of CPUs that could still reach a
+ * not-yet-latched halt() to CPUs this loop has not yet observed as
+ * in-flight -- and it re-kicks all of them every single pass regardless.
+ * Kicking an already-running (or already-woken) vCPU is harmless.
+ *
+ * Bounded, not indefinite: a real stuck CPU (NMI storm, host-side stall)
+ * should surface as a warning, not hang this sysctl write forever.
+ */
+#define IVH_MODE_TRANSITION_MAX_PASSES 200
+
+static void ivh_pv_hypercall_kick(int cpu);
+
+static void ivh_pv_drain_vanilla_halts(void)
+{
+	int pass, cpu;
+	bool any_inflight;
+
+	if (!kvm_para_has_feature(KVM_FEATURE_PV_UNHALT))
+		return;		/* mode 0 never reached the IF=0 halt() either */
+
+	for (pass = 0; pass < IVH_MODE_TRANSITION_MAX_PASSES; pass++) {
+		any_inflight = false;
+		for_each_online_cpu(cpu) {
+			ivh_pv_hypercall_kick(cpu);
+			if (READ_ONCE(per_cpu(ivh_vanilla_inflight, cpu)))
+				any_inflight = true;
+		}
+		if (!any_inflight)
+			return;
+		msleep(1);
+	}
+
+	pr_warn("IVH: ivh_adaptive_mode transition drain did not converge after %d passes -- some CPU may still be relying on the hypercall wake this write just took away. Check ivh_vanilla_inflight per-CPU.\n",
+		IVH_MODE_TRANSITION_MAX_PASSES);
+}
+
+/*
+ * ivh_adaptive_mode: reject anything above 2 (IVH_MODE_ADAPTIVE).
  *
  * Still worth a warning, not a rejection: mode 2's tier-2 early bail is a
  * dead branch whenever ivh_pv_preempt_src==0 on a host without
@@ -1199,7 +1250,8 @@ late_initcall(ivh_pv_beat_calibrate);
 static int ivh_pv_proc_adaptive_mode(const struct ctl_table *table, int write,
 				     void *buffer, size_t *lenp, loff_t *ppos)
 {
-	unsigned long val = READ_ONCE(ivh_adaptive_mode);
+	unsigned long old = READ_ONCE(ivh_adaptive_mode);
+	unsigned long val = old;
 	struct ctl_table tmp = *table;
 	int ret;
 
@@ -1219,6 +1271,10 @@ static int ivh_pv_proc_adaptive_mode(const struct ctl_table *table, int write,
 		pr_warn("IVH: ivh_adaptive_mode=2 with ivh_pv_preempt_src=0 on a host with no KVM_FEATURE_STEAL_TIME: vcpu_is_preempted() is hardwired false here, so tier 2 can never fire. Set ivh_pv_preempt_src=2 (TSC heartbeat) for mode 2 to do anything.\n");
 
 	WRITE_ONCE(ivh_adaptive_mode, val);
+
+	if (old == IVH_MODE_VANILLA && val != IVH_MODE_VANILLA)
+		ivh_pv_drain_vanilla_halts();
+
 	return 0;
 }
 
@@ -1255,6 +1311,11 @@ static int ivh_pv_proc_preempt_src(const struct ctl_table *table, int write,
 			}
 		}
 	}
+
+	if (val != 2 && READ_ONCE(ivh_adaptive_mode) == IVH_MODE_ADAPTIVE &&
+	    !kvm_para_has_feature(KVM_FEATURE_STEAL_TIME))
+		pr_warn("IVH: ivh_pv_preempt_src=%lu while ivh_adaptive_mode=2 on a host with no KVM_FEATURE_STEAL_TIME: vcpu_is_preempted() is hardwired false here, so tier 2 can no longer fire. Set src back to 2 (TSC heartbeat) for mode 2 to do anything.\n",
+			val);
 
 	WRITE_ONCE(ivh_pv_preempt_src, val);
 	return 0;
@@ -1335,9 +1396,10 @@ late_initcall(ivh_pv_sysctl_init);
 
 /*
  * Republish this vCPU's TSC heartbeat the instant it comes back from an
- * EXPLICIT halt (mechanism 0's PV_UNHALT halt()/safe_halt(), mechanism 2's
- * safe_halt()). A vCPU parked in HLT publishes nothing, so on wake its
- * stamp is stale until the next tick -- up to 1ms at HZ=1000, during which
+ * EXPLICIT halt (mode VANILLA's PV_UNHALT halt()/safe_halt(), modes
+ * PURE_IPI/ADAPTIVE's safe_halt()). A vCPU parked in HLT publishes nothing,
+ * so on wake its stamp is stale until the next tick -- up to 1ms at
+ * HZ=1000, during which
  * every waiter queued behind it reads it as host-preempted when it just
  * woke. Deliberately UNCONDITIONAL: one rdtsc plus one store on a path that
  * already took a HLT vmexit, so the cost is unmeasurable there.
@@ -1377,6 +1439,27 @@ static void ivh_pv_wait(u8 *ptr, u8 val)
 	 */
 	if (READ_ONCE(ivh_adaptive_mode) == IVH_MODE_VANILLA) {
 		/*
+		 * Mark this CPU in-flight for the whole VANILLA branch, not just
+		 * the halt() itself: ivh_pv_proc_adaptive_mode()'s drain (below)
+		 * needs to catch a CPU that has already committed to this branch
+		 * (read mode==VANILLA above) but hasn't reached halt() yet, not
+		 * just one already inside it. Cleared before every return.
+		 *
+		 * The race this closes: a live 0->nonzero sysctl write races a
+		 * CPU already past the READ_ONCE above. Once mode flips, that
+		 * CPU still runs the bare halt() at RFLAGS.IF=0 below, which per
+		 * the 2026-07-24 incident can ONLY be woken by KVM_HC_KICK_CPU's
+		 * latching pv_unhalted -- and modes 1/2 never send that hypercall
+		 * in steady state. this_cpu_inc() (not a bool store) so a
+		 * concurrent drain reading a stale post-decrement 0 mid-window
+		 * cannot be misread as "never entered": the writer's own
+		 * WRITE_ONCE + at least one full drain pass after every online
+		 * CPU reports 0 is what provides the guarantee, not this flag in
+		 * isolation.
+		 */
+		this_cpu_inc(ivh_vanilla_inflight);
+
+		/*
 		 * ivh_lock_halt_begin/end: this is a HLT taken OUTSIDE the idle
 		 * loop, so tick_nohz's idle accumulators never see it. Measure
 		 * it here or it becomes phantom steal -- see struct
@@ -1401,11 +1484,13 @@ static void ivh_pv_wait(u8 *ptr, u8 val)
 					local_irq_enable();
 				}
 			}
+			this_cpu_dec(ivh_vanilla_inflight);
 			return;
 		}
 
 		while (READ_ONCE(*ptr) == val)
 			cpu_relax();
+		this_cpu_dec(ivh_vanilla_inflight);
 		return;
 	}
 
@@ -1501,9 +1586,10 @@ static void ivh_pv_wait(u8 *ptr, u8 val)
 static void ivh_wake(int cpu)
 {
 	if (READ_ONCE(ivh_adaptive_mode) == IVH_MODE_VANILLA) {
-		this_cpu_inc(ivh_wake_hypercall);
-		if (kvm_para_has_feature(KVM_FEATURE_PV_UNHALT))
+		if (kvm_para_has_feature(KVM_FEATURE_PV_UNHALT)) {
+			this_cpu_inc(ivh_wake_hypercall);
 			ivh_pv_hypercall_kick(cpu);
+		}
 		return;
 	}
 

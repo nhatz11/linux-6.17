@@ -107,7 +107,8 @@ DECLARE_PER_CPU(u64, ivh_beat_tier1_fired);
  * invoked pv_wait(), so its aggregate hlt_cycles/hlt_events cannot tell
  * apart two structurally different sources:
  *   - pv_wait_node(): waiting on an MCS queue PREDECESSOR. Threshold-
- *     sensitive at mechanism==2 (only halts if pv_wait_early() fired).
+ *     sensitive at ivh_adaptive_mode==ADAPTIVE (only halts if pv_wait_early()
+ *     fired).
  *   - pv_wait_head_or_lock(): waiting for the actual lock HOLDER. Always
  *     spins exactly SPIN_THRESHOLD then halts, unconditionally, in every
  *     mechanism -- this path has NO adaptive logic at all.
@@ -141,9 +142,9 @@ DECLARE_PER_CPU(u64, ivh_beat_tier2_fired);
  * point each inner spin loop gives up on lock-free acquisition, for both
  * call sites:
  *   - ivh_node_spin_*: pv_wait_node() (queue-predecessor wait). Threshold-
- *     sensitive at mechanism==2 -- an early bail (tier1 or tier2) should
- *     show a LOWER average than tier1-only (src=0), if early bail is doing
- *     its job.
+ *     sensitive at ivh_adaptive_mode==ADAPTIVE -- an early bail (tier1 or
+ *     tier2) should show a LOWER average than tier1-only, if early bail is
+ *     doing its job.
  *   - ivh_head_spin_*: pv_wait_head_or_lock() (lock-holder wait). Has no
  *     early-bail logic in any mechanism -- expected to average almost
  *     exactly SPIN_THRESHOLD always, as a sanity-check control on the
@@ -184,6 +185,15 @@ DECLARE_PER_CPU(u64, ivh_beat_age_hist_preempted[IVH_BEAT_AGE_HIST_BUCKETS]);
  */
 DECLARE_PER_CPU(u64, ivh_wake_hypercall);
 DECLARE_PER_CPU(u64, ivh_wake_ipi);
+/*
+ * Set for the whole duration of ivh_pv_wait()'s VANILLA branch (not just the
+ * halt() call), cleared before every return from it. A live 0->nonzero
+ * ivh_adaptive_mode write drains against this: modes 1/2 never send the
+ * KVM_HC_KICK_CPU hypercall, so a CPU already committed to a bare, RFLAGS.IF=0
+ * halt() when the mode flips would otherwise have no wake vehicle left at
+ * all -- the 2026-07-24 hard-freeze class. See ivh_pv_proc_adaptive_mode().
+ */
+DECLARE_PER_CPU(u32, ivh_vanilla_inflight);
 /*
  * Counts the one irreducible gap between "vanilla" and modes 1/2: a waiter
  * that reaches ivh_pv_wait() with IRQs already disabled cannot halt in modes
@@ -236,17 +246,16 @@ static __always_inline bool ivh_beat_stale(int cpu)
  * ivh_lock_halt -- HLT-taken-outside-the-idle-loop accounting.
  * ---------------------------------------------------------------------------
  *
- * A HLT taken from ivh_pv_wait() (mechanism 0's PV_UNHALT path, mechanism
- * 2's scoped halt) or a bounded TPAUSE/PAUSE poll (the non-halting
- * mechanisms) is invisible to tick_nohz's idle accumulators, because it is
- * not the idle loop's own HLT. Left unmeasured, that time would be
- * misbooked as phantom steal by anything that infers steal from
- * elapsed-minus-accounted-busy. This struct measures it at the source so a
- * later step's steal correction has the number to subtract; nothing in
- * this step reads these counters yet.
+ * A HLT taken from ivh_pv_wait() (mode VANILLA's PV_UNHALT path, modes
+ * PURE_IPI/ADAPTIVE's safe_halt()) is invisible to tick_nohz's idle
+ * accumulators, because it is not the idle loop's own HLT. Left unmeasured,
+ * that time would be misbooked as phantom steal by anything that infers
+ * steal from elapsed-minus-accounted-busy. This struct measures it at the
+ * source so a later step's steal correction has the number to subtract;
+ * nothing in this step reads these counters yet.
  *
- * `depth` makes begin/end nest-safe: a hardirq taken during mechanism 2's
- * IF=1 safe_halt() can itself reach a contended spinlock and re-enter
+ * `depth` makes begin/end nest-safe: a hardirq taken during an IF=1
+ * safe_halt() can itself reach a contended spinlock and re-enter
  * ivh_pv_wait(). The outer interval wins; the nested one adds nothing and
  * subtracts nothing.
  */
