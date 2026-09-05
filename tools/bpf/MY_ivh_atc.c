@@ -299,13 +299,16 @@ int main(int argc, char **argv)
 		bpf_program__type(p),
 		bpf_program__expected_attach_type(p));
 
-	/* test32 */
+	/* test32 (cfs_latency_select / Hot Threads): this GLOCK rebuild's struct rq
+	 * has no avg_latency field (Hot Threads was never built into this
+	 * incremental kernel), so this program's CO-RE relocation cannot resolve
+	 * and load fails with -EINVAL. ivh_hot_threads_enabled=0 is already the
+	 * intended state here (the sysctl itself doesn't exist on this kernel) --
+	 * skip loading this program entirely rather than failing the whole
+	 * object, consistent with that feature being off.
+	 */
 	p = skel->progs.test32;
-	bpf_program__set_type(p, BPF_PROG_TYPE_SCHED);
-	bpf_program__set_expected_attach_type(p, BPF_SCHED);
-	fprintf(stderr, "test32: type=%d attach=%d\n",
-		bpf_program__type(p),
-		bpf_program__expected_attach_type(p));
+	bpf_program__set_autoload(p, false);
 
 	fprintf(stderr,
 		"PRE-LOAD CHECK: skel=%p prog=%p type=%d attach=%d\n",

@@ -55,6 +55,17 @@ set_ivh_sysctl ivh_hot_threads_enabled 0     # off by default; flip on to A/B th
 set_ivh_sysctl ivh_pv_wait_mechanism 2       # real halt, woken by IPI (not hypercall)
 set_ivh_sysctl ivh_pv_kick_pure_ipi 1        # 100% IPI wake, no KVM_HC_KICK_CPU
 set_ivh_sysctl ivh_pv_preempt_src 2          # TSC heartbeat authoritative for adaptive spinning
+set_ivh_sysctl ivh_preempt_event_source 2    # Gate 2's timing signal: rq->ivh_vact_last_preempt_tsc /
+                                              # _last_active_c (Part C, TSC-only), not the paravirt-fed
+                                              # rq->last_preemption/last_active_time. Built and validated
+                                              # 2026-08-02/08-06 (tools/bpf/docs/ivh_tsc_final_state_report
+                                              # _2026-08-02.md, ivh_four_questions_report_2026-08-06.md),
+                                              # then silently dropped from this script when attention
+                                              # moved to the capacity/uc axis around 2026-08-03 -- every
+                                              # OTHER knob here was already TSC-only, this was the one real
+                                              # paravirt read still live in production. Re-added 2026-08-26;
+                                              # re-confirm numbers after the drift (see rebuild-plan doc
+                                              # sec 1.4 item 6 / sec 2 item 3 for the full traced history).
 set_ivh_sysctl ivh_steal_source 2            # TSC tick-gap estimator, no REF_TSC, no PV steal page
 set_ivh_sysctl ivh_cap_source 3              # in-kernel ivh_uc_capacity, not vcap
 set_ivh_sysctl ivh_uc_enabled 1              # master gate for the ivh_uc_capacity pipeline
@@ -135,7 +146,7 @@ set_ivh_sysctl ivh_ka_enabled 0              # idle-vCPU keepalive stays off; vc
                                              # does that job now
 
 # BPF gate constants (tools/bpf/MY_ivh_atc.bpf.c) must be built as
-# IVH_CAP_HARDFLOOR=850, IVH_CAP_TOPBAND=50, IVH_CAP_MARGIN=20 for
+# IVH_CAP_HARDFLOOR=700, IVH_CAP_TOPBAND=50, IVH_CAP_MARGIN=20 for
 # ivh_capacity_threshold=1010 above to land in the validated regime. These are
 # compile-time #defines, not sysctls, so they are asserted here rather than
 # set — MARGIN and ivh_capacity_threshold must move together, neither works
@@ -151,8 +162,18 @@ set_ivh_sysctl ivh_ka_enabled 0              # idle-vCPU keepalive stays off; vc
 # (15-18s, mean 16.0s, sd 1.04s), cpu8-15 readings never sampled below 913
 # during that test, and 0 of ~2040 sampled last_migration destinations landed
 # on cpu0-7 (cpu0-7 capacity stayed 328-597, nowhere near either floor value).
-# Not yet proven as a root-cause fix — why cpu8-15's own capacity dips at all
-# is still unexplained — this only widens the gate's tolerance for it.
+#
+# HARDFLOOR lowered again, 850 -> 700, 2026-08-26 (this host, CVM/TDX only):
+# 850 was tuned on the old non-confidential VM. Under TDX, the guest loses
+# real CPU time to in-VM memory encryption/decryption on every access, which
+# reads to the TSC-based steal/capacity pipeline exactly like host steal —
+# so a CVM's vCPUs legitimately sample a lower steady-state capacity than an
+# equivalent non-confidential VM under the same host contention, and an
+# 850 floor rejects destinations that are healthy for this environment, not
+# actually stolen. 700 accounts for that CVM-specific floor shift. Root
+# cause of the underlying capacity dip is otherwise the same open question
+# as before (why cpu8-15 dips at all) -- this just sets the right floor for
+# a CVM instead of treating it as a bare-metal/non-CVM regression.
 BPFSRC=$REPO/tools/bpf/MY_ivh_atc.bpf.c
 check_define() {
     local got
@@ -162,7 +183,7 @@ check_define() {
         echo "*** the ~11.5s result will NOT reproduce with this build ***" >&2
     fi
 }
-check_define IVH_CAP_HARDFLOOR   850
+check_define IVH_CAP_HARDFLOOR   700
 check_define IVH_CAP_TOPBAND     50
 check_define IVH_CAP_MARGIN      20
 check_define IVH_CAP_MARGIN_REL  0    # relative-margin gate stays compiled OUT

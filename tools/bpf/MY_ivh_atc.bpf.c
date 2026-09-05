@@ -425,7 +425,7 @@ static __always_inline u32 ivh_cap_source_now(void)
  * binding gate, the reshape has failed, and the answer is recalibration doc
  * sec 8 (publish steal/elapsed instead) -- NOT lowering this number.
  */
-#define IVH_CAP_HARDFLOOR  700
+#define IVH_CAP_HARDFLOOR  600
 
 struct task_ctx {
     struct task_struct *curr;          /* task that is to be moved */

@@ -518,6 +518,40 @@ no-corunner vanilla617 number (2796.25, 2716-2878) was captured post-restart, an
 same higher family with overlapping ranges, this is read as further confirmation that 2041.5 was
 always the wrong field — not as evidence about corunner state one way or the other.
 
+### 3.4 Steal-time signals are not trustworthy in this CVM — stop checking them, 2026-08-31
+
+Confirmed directly by the user, who has independent host-side visibility this session did not
+previously have: this is a TDX confidential VM, and **every steal-time signal available from
+inside the guest reads 0 (or near-0) regardless of actual host contention.** This applies to:
+
+- `vmstat`/`mpstat` `%steal` — architecturally impossible here. `KVM_FEATURE_STEAL_TIME` is not
+  offered to TD guests at all (confirmed earlier this session by reading raw per-cpu memory: the
+  steal-time page is never written, reads the kernel's `0xCC` poison pattern on every field).
+- `vcpu_is_preempted()` / IVH's `src=0` and `src=1` KVM-steal-bit paths — same root cause, same
+  permanent 0/false.
+- This session's own `rq->ivh_tks_steal_ns` (tick-gap-based estimator, added Step 6, read via
+  `ivh_uc_steal_ns()`) — also confirmed reading exactly 0.0ms even during an active, CPU-saturated
+  12s workload window, immediately after the user arranged for a corunner VM to contend across
+  ALL 16 vCPUs (previously it read 997-1806ms/12s-window when contention was on 8 of 16 vCPUs, so
+  this is a real change in behavior, not a tool that was always silent). The likely explanation:
+  this estimator only detects contention that produces actual tick-delivery gaps (the vCPU being
+  fully off the pCPU for a stretch), and whatever this host's contention shape is now (possibly
+  SMT-sibling or cache/memory-bandwidth sharing rather than outright descheduling) may not produce
+  that signature at all -- unconfirmed, not chased further this session.
+
+**Do not use any in-guest steal-time reading as evidence of host contention level in this
+environment, for any future session.** If you need ground truth, it has to come from the host
+side (the user has confirmed access to check vCPU-thread placement/scheduling there), not from
+anything inside this guest.
+
+**Sanity-check result, same session:** with the corunner arranged to run across all 16 vCPUs (up
+from 8), a single-rep run of the accepted 4-benchmark suite (`run_baseline.sh 1`) did NOT show
+uniformly worse results as expected -- NHextend3 was ~7% below baseline, but hackbench
+(47.671s vs baseline 84.52s/58.8-107.3s) and ebizzy-mmap-4MB (4180 vs baseline 2330.25/2183-2541)
+were both dramatically BETTER than the accepted baseline, dbench unchanged. n=1 per benchmark
+against benchmarks with documented spreads up to 57.4% (hackbench) means this is not a resolved
+result either way -- re-run with n>=4 before drawing any conclusion from it.
+
 ---
 
 ## 4. The incremental step plan

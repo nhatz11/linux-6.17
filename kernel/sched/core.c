@@ -8743,8 +8743,14 @@ void sched_tick(void)
 
 	/* EXPERIMENT: bare-schedule() hang diagnosis, 2026-06-30. Cheap
 	 * 32-slot scan; only ever produces output when an IVH self-migration
-	 * is actually stuck past a threshold. */
-	ivh_scan_stuck_waiters();
+	 * is actually stuck past a threshold.
+	 * Disabled 2026-08-25: unconditionally hammered a single globally-
+	 * shared raw spinlock (ivh_wait_lock, kernel/sched/fair.c) 32x per
+	 * tick per CPU -- ~512,000 acquisitions/sec of one tick-synchronized
+	 * cache line across all 16 vCPUs, for zero information whenever no
+	 * migration is in flight (the whole time with ivh_universal_eligible
+	 * =0). Not used recently; removing the call rather than gating it. */
+	/* ivh_scan_stuck_waiters(); */
 
 	if (sched_feat(LATENCY_WARN) && resched_latency)
 		resched_latency_warn(cpu, resched_latency);
