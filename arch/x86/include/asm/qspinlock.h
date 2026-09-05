@@ -136,35 +136,30 @@ static inline bool vcpu_is_preempted(long cpu)
 }
 
 /*
- * IVH pv_wait/pv_kick mechanism toggle, default 0 (OFF/safe).
+ * IVH adaptive-spinning mode, default 0 (vanilla). Selects which of three
+ * modes ivh_pv_wait()/ivh_pv_kick() (arch/x86/kernel/kvm.c) and
+ * pv_wait_early() (kernel/locking/qspinlock_paravirt.h) run:
  *
- *   0 - "as-close-to-stock-as-possible" fallback: real host-cooperative
- *       halt + KVM_HC_KICK_CPU hypercall wake if the host advertises
- *       KVM_FEATURE_PV_UNHALT (byte-for-byte the pre-IVH kvm_wait()/
- *       kvm_kick_cpu() behavior), else a plain bounded cpu_relax() busy
- *       loop with no TPAUSE and no steal-bit logic — the least-surprising,
+ *   0 - VANILLA: byte-for-byte the pre-IVH kvm_wait()/kvm_kick_cpu()
+ *       behavior when the host advertises KVM_FEATURE_PV_UNHALT (real
+ *       host-cooperative halt + KVM_HC_KICK_CPU hypercall wake), else a
+ *       plain bounded cpu_relax() busy loop — the least-surprising,
  *       lowest-risk degenerate case when the host offers nothing to
  *       cooperate with.
- *   1 - IVH's own non-hypervisor-cooperative substitute: TPAUSE-based
- *       backoff (never halts, never issues a wake hypercall) plus the
- *       steal-bit-gated early bailout in pv_wait_early().
- *   2 - "scoped halt + IPI wake": a real, host-visible HLT yield woken by
- *       smp_send_reschedule(), entered only when pv_wait_early() says the
- *       thing we are queued behind is genuinely not running.  NOTE: a
- *       maskable IPI cannot un-halt a HLT taken with RFLAGS.IF=0, so this
- *       mode halts ONLY via safe_halt() on the IRQs-were-enabled path; a
- *       waiter that arrives with IRQs already off degrades to mechanism 1's
- *       bounded poll instead.  See ivh_pv_wait() in arch/x86/kernel/kvm.c —
- *       do not "restore symmetry" with mechanism 0's bare halt() there.
- *   3 - pure busy-spin: a plain cpu_relax() loop, no halt, no TPAUSE, no
- *       deadline, and no IPI wake — the runtime-selectable stand-in for the
- *       `nopvspin` boot parameter (which is boot-time-only, see below), so
- *       that "no adaptive spinning" can be A/B'd without a reboot.  It is an
- *       approximation, not an identity: the PV slowpath's own bookkeeping
- *       (VCPU_HALTED/_Q_SLOW_VAL/pv_hash) still runs.  ivh_pv_kick() still
- *       issues the KVM_HC_KICK_CPU hypercall — purely to wake a straggler
- *       parked in mechanism 0's IF=0 halt() by a live toggle, never for
- *       anything mechanism 3 itself parked; see its comment.
+ *   1 - PURE_IPI: identical control flow to mode 0, except the one wake
+ *       (at unlock time, __pv_queued_spin_unlock_slowpath()'s pv_kick())
+ *       is smp_send_reschedule() instead of the hypercall. No hypercall is
+ *       ever sent in this mode.
+ *   2 - ADAPTIVE: mode 1 plus pv_wait_early()'s TSC-heartbeat early bail
+ *       (is_wait_preempted(), gated on ivh_pv_preempt_src — see
+ *       <asm/ivh_tsc_beat.h>). Still no hypercall.
+ *
+ * NOTE: a maskable IPI cannot un-halt a HLT taken with RFLAGS.IF=0, so
+ * modes 1/2 halt ONLY via safe_halt() on the IRQs-were-enabled path; a
+ * waiter that arrives with IRQs already off degrades to an uninstrumented
+ * cpu_relax() loop instead (counted in ivh_wait_irqoff_nohalt) — this is
+ * an irreducible consequence of never sending the hypercall in these
+ * modes, not a bug. See ivh_pv_wait()'s comment.
  *
  * This only ever branches inside the already-registered, permanently
  * installed ivh_pv_wait()/ivh_pv_kick() callbacks (arch/x86/kernel/kvm.c)
@@ -173,9 +168,14 @@ static inline bool vcpu_is_preempted(long cpu)
  * are decided exactly once at boot in kvm_spinlock_init(), same as
  * upstream. See kvm_spinlock_init()'s comment for why that boot-time
  * decision is deliberately NOT made runtime-toggleable.
- *   echo 1 > /proc/sys/kernel/ivh_pv_wait_mechanism
+ *   echo 1 > /proc/sys/kernel/ivh_adaptive_mode
  */
-extern unsigned long ivh_pv_wait_mechanism;
+enum {
+	IVH_MODE_VANILLA	= 0,
+	IVH_MODE_PURE_IPI	= 1,
+	IVH_MODE_ADAPTIVE	= 2,
+};
+extern unsigned long ivh_adaptive_mode;
 
 /*
  * The IVH per-CPU TSC heartbeat -- the candidate replacement for

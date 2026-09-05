@@ -216,7 +216,7 @@ unsigned long ivh_steal_source = 0UL;
  * IVH "tks" (tick steal) calibration. Compiled defaults match production's
  * own compiled defaults, not the launch-script-applied operating values --
  * same posture as every other knob in this rebuild (e.g. Step 4's
- * ivh_pv_wait_mechanism=0). Per sec 1.5 item 6, production's actual runtime
+ * ivh_adaptive_mode=0). Per sec 1.5 item 6, production's actual runtime
  * values are ivh_tks_idle_sub=0 and ivh_tks_phase_pct=100; getting there
  * needs a sysctl flip beyond what this step sets, exactly like
  * ivh_universal_eligible itself.

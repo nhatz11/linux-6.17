@@ -81,19 +81,6 @@ DECLARE_PER_CPU_ALIGNED(struct ivh_tsc_beat, ivh_tsc_beat);
 extern unsigned long ivh_pv_preempt_src;
 extern unsigned long ivh_pv_beat_threshold;
 extern unsigned long ivh_pv_beat_publish_mask;
-/*
- * GLOCK-12: independent review found mechanism 2 sends ~1.5 rescheduling
- * IPIs per lock acquisition that stock never sends, via two call sites in
- * qspinlock_paravirt.h -- pv_kick_node()'s smp_send_reschedule() (on the
- * ACQUIRER's critical path) and pv_wait_node()'s unbounded re-arm loop
- * (pays a full fresh SPIN_THRESHOLD lap on every miss, where stock just
- * halts). Both are now gated by these knobs so tier-2's isolated
- * contribution -- with neither of these two incidental costs riding along
- * on the same ivh_pv_wait_mechanism=2 switch -- can finally be measured
- * directly. See arch/x86/kernel/kvm.c for each knob's full rationale.
- */
-extern unsigned long ivh_pv_kick_node_ipi;
-extern unsigned long ivh_pv_rearm_max;
 
 /*
  * Shadow-comparator validation counters and the threshold-tuning histograms,
@@ -180,20 +167,33 @@ DECLARE_PER_CPU(u64, ivh_head_spin_attempts);
  */
 DECLARE_PER_CPU(u64, ivh_node_spin_success_iters_sum);
 DECLARE_PER_CPU(u64, ivh_node_spin_success_attempts);
-/*
- * GLOCK-12: histogram of observed re-arm depth (how many extra full
- * SPIN_THRESHOLD laps a pv_wait_node() call took before finally halting),
- * indexed by min(rearm_count, IVH_REARM_HIST_BUCKETS - 1). Exists so
- * ivh_pv_rearm_max can be chosen from data instead of guessed -- per
- * independent review, 711 total re-arms per window could be 711 waiters
- * re-arming once or 20 waiters re-arming 35 times, and those imply
- * completely different caps.
- */
-#define IVH_REARM_HIST_BUCKETS 16
-DECLARE_PER_CPU(u64, ivh_node_rearm_hist[IVH_REARM_HIST_BUCKETS]);
 DECLARE_PER_CPU(s64, ivh_beat_min_age);
 DECLARE_PER_CPU(u64, ivh_beat_age_hist_running[IVH_BEAT_AGE_HIST_BUCKETS]);
 DECLARE_PER_CPU(u64, ivh_beat_age_hist_preempted[IVH_BEAT_AGE_HIST_BUCKETS]);
+
+/*
+ * Mode-collapse canaries (2026-09-05 rebuild): the wake-vehicle contract for
+ * ivh_adaptive_mode is machine-checkable, not just documented. Exactly one of
+ * these increments per __pv_queued_spin_unlock_slowpath() wake:
+ *   mode 0 (VANILLA)   -> ivh_wake_hypercall only, ivh_wake_ipi == 0
+ *   mode 1/2 (non-zero) -> ivh_wake_ipi only, ivh_wake_hypercall == 0
+ * A nonzero ivh_wake_hypercall while ivh_adaptive_mode != 0 (or vice versa)
+ * means the single shared wake helper in arch/x86/kernel/kvm.c has a bug --
+ * this replaces the two independently-evolved, silently-diverging kick knobs
+ * the pre-rebuild code had.
+ */
+DECLARE_PER_CPU(u64, ivh_wake_hypercall);
+DECLARE_PER_CPU(u64, ivh_wake_ipi);
+/*
+ * Counts the one irreducible gap between "vanilla" and modes 1/2: a waiter
+ * that reaches ivh_pv_wait() with IRQs already disabled cannot halt in modes
+ * 1/2 (no hypercall means no pv_unhalted latch, and a maskable IPI cannot
+ * wake an IF=0 HLT) and instead falls through to an uninstrumented
+ * cpu_relax() loop. Large values mean a given workload's irqsave-held-lock
+ * population is making modes 1/2 materially less halt-y than mode 0, which
+ * matters for interpreting any comparison against it.
+ */
+DECLARE_PER_CPU(u64, ivh_wait_irqoff_nohalt);
 
 /*
  * Publish this CPU's heartbeat. rdtsc(), NOT rdtsc_ordered() -- this is a
