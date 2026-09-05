@@ -304,6 +304,17 @@ static inline bool is_wait_preempted(int cpu)
 	beat = age > (s64)READ_ONCE(ivh_pv_beat_threshold);
 
 	/*
+	 * Tier-2 observability, unconditional for every src!=0 call (src==1
+	 * AND src==2) -- placed before the src==2 early-exit below so a
+	 * threshold's real fire rate is measurable in the one configuration
+	 * (src==2) that actually acts on it. See ivh_tsc_beat.h for why this
+	 * was missing.
+	 */
+	this_cpu_inc(ivh_beat_tier2_checked);
+	if (beat)
+		this_cpu_inc(ivh_beat_tier2_fired);
+
+	/*
 	 * Cross-vCPU TSC drift guard (build plan sec 2.8).  Track the minimum
 	 * age this reader has ever seen.  Costs one compare, and the store is
 	 * taken only when a new minimum is found.  TSC-only, no PV read --
@@ -496,6 +507,7 @@ static void pv_wait_node(struct mcs_spinlock *node, struct mcs_spinlock *prev)
 	struct pv_node *pp = (struct pv_node *)prev;
 	bool wait_early;
 	int loop;
+	unsigned int rearm = 0;
 
 	for (;;) {
 		for (wait_early = false, loop = SPIN_THRESHOLD; loop; loop--) {
@@ -509,8 +521,26 @@ static void pv_wait_node(struct mcs_spinlock *node, struct mcs_spinlock *prev)
 			 * 256th, so that window is a few hundred cycles against
 			 * a threshold in the millions. Do not reorder these.
 			 */
-			if (READ_ONCE(node->locked))
+			if (READ_ONCE(node->locked)) {
+				/*
+				 * Denominator-completeness fix (GLOCK-11, found by
+				 * independent review): this success return bypasses
+				 * both the ivh_node_spin_iters_sum/attempts accounting
+				 * below AND this identical accounting entirely, so
+				 * GLOCK-10's "iters per attempt" metric silently
+				 * excluded every pass that acquired the lock rather
+				 * than bailing/exhausting -- the review reconstructed
+				 * this excluded population from ivh_beat_tier2_checked
+				 * and found it comparable in size to the measured
+				 * A-vs-B difference in the steady-state rounds. Record
+				 * it here so the two counter pairs can be summed for a
+				 * complete, unbiased average over ALL inner-loop passes,
+				 * not just the ones that bailed or exhausted.
+				 */
+				this_cpu_add(ivh_node_spin_success_iters_sum, SPIN_THRESHOLD - loop);
+				this_cpu_inc(ivh_node_spin_success_attempts);
 				return;
+			}
 			if (pv_wait_early(pp, loop)) {
 				wait_early = true;
 				break;
@@ -520,6 +550,19 @@ static void pv_wait_node(struct mcs_spinlock *node, struct mcs_spinlock *prev)
 		}
 
 		/*
+		 * Spin-iteration accounting (GLOCK-10): record how many of the
+		 * SPIN_THRESHOLD iterations were actually spent before this pass
+		 * gave up on lock-free acquisition -- SPIN_THRESHOLD - loop.
+		 * `loop` still holds the pre-decrement value whether we got here
+		 * via the wait_early break above or via natural exhaustion
+		 * (loop == 0). Placed before the mechanism-2 continue below so
+		 * "spun the full budget and looped back to re-arm" attempts are
+		 * counted too -- that is real spin cost either way.
+		 */
+		this_cpu_add(ivh_node_spin_iters_sum, SPIN_THRESHOLD - loop);
+		this_cpu_inc(ivh_node_spin_attempts);
+
+		/*
 		 * Order pn->state vs pn->locked thusly:
 		 *
 		 * [S] pn->state = VCPU_HALTED	  [S] next->locked = 1
@@ -527,8 +570,12 @@ static void pv_wait_node(struct mcs_spinlock *node, struct mcs_spinlock *prev)
 		 * [L] pn->locked		[RmW] pn->state = VCPU_HASHED
 		 *
 		 * Matches the cmpxchg() from pv_kick_node().
+		 *
+		 * The store itself is placed AFTER the mechanism-2 early-continue
+		 * below, not here -- see the bug note there. Only the ordering
+		 * comment stays in its original spot since it documents the
+		 * store/cmpxchg pairing, not the store's location.
 		 */
-		smp_store_mb(pn->state, VCPU_HALTED);
 
 		/*
 		 * IVH mechanism 2 ("scoped halt"): only ever go to sleep (real
@@ -550,13 +597,59 @@ static void pv_wait_node(struct mcs_spinlock *node, struct mcs_spinlock *prev)
 		 * Scoped to mechanism 2 ONLY. Mechanisms 0 and 1 keep their
 		 * existing behavior unchanged: fall through and sleep once the
 		 * threshold is spent regardless of wait_early.
+		 *
+		 * BUG FIX (found via independent review, GLOCK-9): the
+		 * pn->state = VCPU_HALTED store used to happen BEFORE this gate,
+		 * so a waiter that decided NOT to halt (the continue below) went
+		 * back to spinning while still advertising VCPU_HALTED, with no
+		 * restore path -- stock always pairs the HALTED store with an
+		 * actual pv_wait() + cmpxchg(HALTED->RUNNING) at the bottom of
+		 * this loop; the continue skipped both. Consequences: (1) a
+		 * concurrent pv_kick_node() from the predecessor could observe
+		 * VCPU_HALTED and go through the whole hash/IPI kick path for a
+		 * waiter that never slept -- exactly the PV overhead mechanism 2
+		 * is supposed to avoid; (2) a narrow race where the queue head
+		 * reads this stale HALTED state in pv_wait_head_or_lock() and
+		 * clobbers it with a plain WRITE_ONCE while the predecessor is
+		 * mid-hash, risking a leaked/duplicate pv_hash() entry; (3) it
+		 * inflates tier-1 fires in every successor queued behind this
+		 * waiter, since their tier-1 check (prev->state != VCPU_RUNNING)
+		 * now trips on stale bookkeeping instead of a real signal. Moving
+		 * the store below the gate makes state changes exactly match
+		 * stock's invariant: pn->state only becomes VCPU_HALTED
+		 * immediately before an actual pv_wait() call.
 		 */
-		if (!wait_early && READ_ONCE(ivh_pv_wait_mechanism) == 2)
+		/*
+		 * GLOCK-12 re-arm cap, per independent review: the above gate
+		 * used to be unconditional for mechanism 2 -- ANY exhaustion
+		 * with wait_early==false re-armed a whole fresh SPIN_THRESHOLD
+		 * budget, with no upper bound on how many times. When the
+		 * predecessor is just genuinely, unremarkably still running
+		 * (the ordinary case under heavy queueing, zero real
+		 * preemption -- correct detector behavior, not a miss), that
+		 * unbounded exposure was found to be a real, measurable cost
+		 * stock never pays (stock halts on the very first exhaustion,
+		 * unconditionally). ivh_pv_rearm_max bounds it: 0 reproduces
+		 * stock's own bound exactly (halt on first exhaustion) while
+		 * tier-2's check remains fully active on every pass up to
+		 * that point; ULONG_MAX (default) preserves the prior
+		 * unbounded behavior unchanged.
+		 */
+		if (!wait_early && READ_ONCE(ivh_pv_wait_mechanism) == 2 &&
+		    rearm < READ_ONCE(ivh_pv_rearm_max)) {
+			rearm++;
 			continue;
+		}
+
+		this_cpu_inc(ivh_node_rearm_hist[rearm < IVH_REARM_HIST_BUCKETS ?
+						  rearm : IVH_REARM_HIST_BUCKETS - 1]);
+
+		smp_store_mb(pn->state, VCPU_HALTED);
 
 		if (!READ_ONCE(node->locked)) {
 			lockevent_inc(pv_wait_node);
 			lockevent_cond_inc(pv_wait_early, wait_early);
+			this_cpu_inc(ivh_halt_from_node);
 			pv_wait(&pn->state, VCPU_HALTED);
 		}
 
@@ -662,8 +755,19 @@ static void pv_kick_node(struct qspinlock *lock, struct mcs_spinlock *node)
 	 * all" decision ivh_pv_kick() makes for mechanism 3, applied at the
 	 * second, independent kick site.
 	 */
+	/*
+	 * GLOCK-12, per independent review: this IPI was found to be the
+	 * dominant cost of ivh_pv_wait_mechanism=2 (~1.5 per acquisition,
+	 * measured via /proc/interrupts RES, vs 0 under stock) -- and unlike
+	 * ivh_pv_kick()'s wake at unlock time, THIS call site runs on the
+	 * ACQUIRER's own critical path, immediately before it enters its
+	 * critical section, adding straight to every handoff's latency. The
+	 * comment above already establishes a lost/misdelivered IPI is not a
+	 * hang, so gating it is a latency knob, not a correctness one.
+	 * Default 1 (ON, unchanged behavior) via ivh_pv_kick_node_ipi.
+	 */
 	mech = READ_ONCE(ivh_pv_wait_mechanism);
-	if (mech && mech != 3)
+	if (mech && mech != 3 && READ_ONCE(ivh_pv_kick_node_ipi))
 		smp_send_reschedule(pn->cpu);
 }
 
@@ -721,6 +825,16 @@ pv_wait_head_or_lock(struct qspinlock *lock, struct mcs_spinlock *node)
 		}
 		clear_pending(lock);
 
+		/*
+		 * Spin-iteration accounting control (GLOCK-10): only reached via
+		 * natural exhaustion (loop == 0 here, goto gotlock bypasses this
+		 * entirely), so this should average almost exactly SPIN_THRESHOLD
+		 * every time -- this path has no early-bail logic in any
+		 * mechanism. A sanity check on the accounting, not a variable
+		 * under test.
+		 */
+		this_cpu_add(ivh_head_spin_iters_sum, SPIN_THRESHOLD - loop);
+		this_cpu_inc(ivh_head_spin_attempts);
 
 		if (!lp) { /* ONCE */
 			lp = pv_hash(lock, pn);
@@ -750,6 +864,7 @@ pv_wait_head_or_lock(struct qspinlock *lock, struct mcs_spinlock *node)
 		WRITE_ONCE(pn->state, VCPU_HASHED);
 		lockevent_inc(pv_wait_head);
 		lockevent_cond_inc(pv_wait_again, waitcnt);
+		this_cpu_inc(ivh_halt_from_head);
 		pv_wait(&lock->locked, _Q_SLOW_VAL);
 
 		/*

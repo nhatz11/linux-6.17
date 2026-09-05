@@ -1135,6 +1135,55 @@ unsigned long ivh_pv_wait_trace = 0UL;
 unsigned long ivh_pv_kick_pure_ipi = 0UL;
 
 /*
+ * GLOCK-12, per independent review: mechanism 2 was found to send ~1.5
+ * smp_send_reschedule() IPIs per lock acquisition that mechanism 0 (stock)
+ * never sends at all (measured: 33 RES interrupts/12s under stock vs
+ * 160,000-175,000 under mechanism 2), and one of the two call sites --
+ * pv_kick_node(), qspinlock_paravirt.h -- fires from the thread that just
+ * ACQUIRED the lock, on its own critical-path, before it does any real work.
+ * That call site's own comment already establishes a lost/misdelivered IPI
+ * is not a hang (the caller's for(;;) re-checks node->locked regardless, and
+ * mechanism 2's HLT un-halts on the next timer tick at the latest), so this
+ * is a safe knob, not a correctness-risk one. Default 1 (ON, current
+ * behavior unchanged) so nothing changes until deliberately toggled.
+ */
+unsigned long ivh_pv_kick_node_ipi = 1UL;
+
+/*
+ * GLOCK-12: same rationale, for the OTHER unconditional smp_send_reschedule()
+ * call site -- ivh_pv_kick()'s mechanism 1/2 branch below, which runs at
+ * UNLOCK time (off the critical path, after lock->locked is already
+ * released) rather than at acquisition. Kept as an independent knob from
+ * ivh_pv_kick_node_ipi so the two sites' costs can be measured separately;
+ * the review expected this one to be nearly free since it isn't on the
+ * handoff critical path, but that is a prediction to verify, not an
+ * assumption to bake in by leaving it unmeasurable. Default 1 (ON).
+ */
+unsigned long ivh_pv_kick_unlock_ipi = 1UL;
+
+/*
+ * GLOCK-12: bounds how many times pv_wait_node()'s mechanism-2 "scoped halt"
+ * loop may re-arm a full fresh SPIN_THRESHOLD budget instead of halting, per
+ * independent review of GLOCK-11's data. Under mechanism 2, when a full pass
+ * exhausts its budget with neither tier finding anything to report (the
+ * ordinary case under heavy queueing with zero real preemption -- correct
+ * behavior from the detector, not a miss), the caller does not halt like
+ * stock does; it re-arms and spins another full budget, unboundedly, until
+ * something finally fires. Each miss costs a full ~32768-iteration lap that
+ * stock's unconditional-halt-on-exhaustion design never pays.
+ *
+ * 0 reproduces stock's own bound exactly: halt on the FIRST exhaustion, same
+ * as mechanism 0, while tier-2's early-bail check remains fully active on
+ * every pass leading up to that (this is the "adaptive spinning only, no
+ * incidental baggage" configuration the whole point of tier-2 is to test).
+ * ULONG_MAX (the default, current behavior) never caps it. Values in between
+ * let a histogram-informed value be chosen once ivh_node_rearm_hist (see
+ * <asm/ivh_tsc_beat.h>) has been read under a real workload, rather than
+ * guessed.
+ */
+unsigned long ivh_pv_rearm_max = ULONG_MAX;
+
+/*
  * IVH per-CPU TSC heartbeat -- storage, knobs and validation counters.
  * Declared (with the full design comment) in <asm/ivh_tsc_beat.h>.
  */
@@ -1168,6 +1217,17 @@ DEFINE_PER_CPU(u64, ivh_beat_publishes);
  * instead of inferred from tier-2's counts alone.
  */
 DEFINE_PER_CPU(u64, ivh_beat_tier1_fired);
+DEFINE_PER_CPU(u64, ivh_halt_from_node);
+DEFINE_PER_CPU(u64, ivh_halt_from_head);
+DEFINE_PER_CPU(u64, ivh_beat_tier2_checked);
+DEFINE_PER_CPU(u64, ivh_beat_tier2_fired);
+DEFINE_PER_CPU(u64, ivh_node_spin_iters_sum);
+DEFINE_PER_CPU(u64, ivh_node_spin_attempts);
+DEFINE_PER_CPU(u64, ivh_head_spin_iters_sum);
+DEFINE_PER_CPU(u64, ivh_head_spin_attempts);
+DEFINE_PER_CPU(u64, ivh_node_spin_success_iters_sum);
+DEFINE_PER_CPU(u64, ivh_node_spin_success_attempts);
+DEFINE_PER_CPU(u64, ivh_node_rearm_hist[IVH_REARM_HIST_BUCKETS]);
 DEFINE_PER_CPU(s64, ivh_beat_min_age) = S64_MAX;
 DEFINE_PER_CPU(u64, ivh_beat_age_hist_running[IVH_BEAT_AGE_HIST_BUCKETS]);
 DEFINE_PER_CPU(u64, ivh_beat_age_hist_preempted[IVH_BEAT_AGE_HIST_BUCKETS]);
@@ -1251,6 +1311,38 @@ static int ivh_pv_proc_kick_pure_ipi(const struct ctl_table *table, int write,
 	}
 
 	WRITE_ONCE(ivh_pv_kick_pure_ipi, val);
+	return 0;
+}
+
+/*
+ * GLOCK-12: ivh_pv_kick()'s unconditional smp_send_reschedule() (the "belt
+ * and braces" call, sent regardless of ivh_pv_kick_pure_ipi) is, on a host
+ * that does not advertise KVM_FEATURE_PV_UNHALT, the ONLY wake mechanism
+ * mechanism 1/2 has at all -- ivh_pv_hypercall_kick() is unreachable in that
+ * case regardless of ivh_pv_kick_pure_ipi's value. Refuse to disable it
+ * unless the host actually offers that fallback, for the same reason
+ * ivh_pv_reject_unsafe_combo() exists: a lost wake here is not a hang IF a
+ * fallback wake exists, but with neither available it strands every halted
+ * waiter and freezes the VM.
+ */
+static int ivh_pv_proc_kick_unlock_ipi(const struct ctl_table *table, int write,
+				       void *buffer, size_t *lenp, loff_t *ppos)
+{
+	unsigned long val = READ_ONCE(ivh_pv_kick_unlock_ipi);
+	struct ctl_table tmp = *table;
+	int ret;
+
+	tmp.data = &val;
+	ret = proc_doulongvec_minmax(&tmp, write, buffer, lenp, ppos);
+	if (ret || !write)
+		return ret;
+
+	if (!val && !kvm_para_has_feature(KVM_FEATURE_PV_UNHALT)) {
+		pr_err("IVH: refusing ivh_pv_kick_unlock_ipi=0: the host does not advertise KVM_FEATURE_PV_UNHALT, so smp_send_reschedule() is the ONLY wake ivh_pv_kick() has for mechanism 1/2 -- disabling it here would strand every halted waiter and freeze the VM.\n");
+		return -EINVAL;
+	}
+
+	WRITE_ONCE(ivh_pv_kick_unlock_ipi, val);
 	return 0;
 }
 
@@ -1361,6 +1453,27 @@ static const struct ctl_table ivh_pv_sysctls[] = {
 		.maxlen		= sizeof(unsigned long),
 		.mode		= 0644,
 		.proc_handler	= ivh_pv_proc_beat_publish_mask,
+	},
+	{
+		.procname	= "ivh_pv_kick_node_ipi",
+		.data		= &ivh_pv_kick_node_ipi,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_pv_kick_unlock_ipi",
+		.data		= &ivh_pv_kick_unlock_ipi,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= ivh_pv_proc_kick_unlock_ipi,
+	},
+	{
+		.procname	= "ivh_pv_rearm_max",
+		.data		= &ivh_pv_rearm_max,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
 	},
 };
 
@@ -1561,12 +1674,22 @@ static void ivh_pv_wait(u8 *ptr, u8 val)
 		return;
 	}
 	/*
-	 * mechanism==2 with IRQs already disabled by an outer context falls
-	 * through to the bounded poll below on purpose: see the IF=0 HLT
-	 * discussion above. Never halt() here.
+	 * mechanism==2 with IRQs already disabled by an outer context: never
+	 * halt() here (see above). Also never engage the bounded TPAUSE/PAUSE
+	 * poll below -- that poll's IVH_PV_ADAPTIVE_TSC deadline (~1ms) is
+	 * sized for "a real halt was available but we chose to wait rather
+	 * than take it", not for "halting is illegal for this call". For the
+	 * irqsave-held-lock population (rq->lock, waitqueue locks, ...) IVH
+	 * has nothing safe to add over a plain spin, so behave exactly like
+	 * mechanism 3: an uninstrumented, immediately-rechecking cpu_relax()
+	 * loop -- no fixed floor, no PV bookkeeping, no hypercall.
 	 */
-	if (unlikely(READ_ONCE(ivh_pv_wait_mechanism) == 2))
-		ivh_pv_trace("mech2 FALLTHROUGH to bounded poll (irqs already disabled on entry)");
+	if (unlikely(READ_ONCE(ivh_pv_wait_mechanism) == 2)) {
+		ivh_pv_trace("mech2 native-spin (irqs already disabled on entry)");
+		while (READ_ONCE(*ptr) == val)
+			cpu_relax();
+		return;
+	}
 
 	/*
 	 * sysctl ON: IVH's own non-hypervisor-cooperative substitute. Bounded,
@@ -1657,16 +1780,32 @@ static void ivh_pv_kick(int cpu)
 	 * in either write order), so the stranding case above cannot arise
 	 * while it is suppressed.
 	 */
+	/*
+	 * GLOCK-12: the hypercall also fires when ivh_pv_kick_unlock_ipi=0,
+	 * regardless of ivh_pv_kick_pure_ipi -- the proc handler above
+	 * already refuses to let kick_unlock_ipi go to 0 unless PV_UNHALT is
+	 * available, so this is a guaranteed fallback wake, not a gamble.
+	 */
 	if (kvm_para_has_feature(KVM_FEATURE_PV_UNHALT) &&
-	    !READ_ONCE(ivh_pv_kick_pure_ipi)) {
+	    (!READ_ONCE(ivh_pv_kick_pure_ipi) || !READ_ONCE(ivh_pv_kick_unlock_ipi))) {
 		ivh_pv_trace("KICK target_cpu=%d via hypercall (PV_UNHALT)", cpu);
 		ivh_pv_hypercall_kick(cpu);
 	} else if (READ_ONCE(ivh_pv_kick_pure_ipi)) {
 		ivh_pv_trace("KICK target_cpu=%d hypercall SKIPPED (ivh_pv_kick_pure_ipi=1)", cpu);
 	}
 
-	ivh_pv_trace("KICK target_cpu=%d via smp_send_reschedule (RESCHEDULE_VECTOR IPI)", cpu);
-	smp_send_reschedule(cpu);
+	/*
+	 * GLOCK-12, per independent review: measured as ~1.5 RES IPIs per
+	 * lock acquisition under mechanism 2, but unlike pv_kick_node()'s
+	 * critical-path IPI, this one runs at unlock time (lock->locked
+	 * already released), off the acquirer's critical path -- expected to
+	 * be nearly free, but that is a prediction this knob lets be
+	 * verified rather than assumed. Default 1 (ON, unchanged behavior).
+	 */
+	if (READ_ONCE(ivh_pv_kick_unlock_ipi)) {
+		ivh_pv_trace("KICK target_cpu=%d via smp_send_reschedule (RESCHEDULE_VECTOR IPI)", cpu);
+		smp_send_reschedule(cpu);
+	}
 }
 
 /*

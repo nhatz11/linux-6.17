@@ -81,6 +81,19 @@ DECLARE_PER_CPU_ALIGNED(struct ivh_tsc_beat, ivh_tsc_beat);
 extern unsigned long ivh_pv_preempt_src;
 extern unsigned long ivh_pv_beat_threshold;
 extern unsigned long ivh_pv_beat_publish_mask;
+/*
+ * GLOCK-12: independent review found mechanism 2 sends ~1.5 rescheduling
+ * IPIs per lock acquisition that stock never sends, via two call sites in
+ * qspinlock_paravirt.h -- pv_kick_node()'s smp_send_reschedule() (on the
+ * ACQUIRER's critical path) and pv_wait_node()'s unbounded re-arm loop
+ * (pays a full fresh SPIN_THRESHOLD lap on every miss, where stock just
+ * halts). Both are now gated by these knobs so tier-2's isolated
+ * contribution -- with neither of these two incidental costs riding along
+ * on the same ivh_pv_wait_mechanism=2 switch -- can finally be measured
+ * directly. See arch/x86/kernel/kvm.c for each knob's full rationale.
+ */
+extern unsigned long ivh_pv_kick_node_ipi;
+extern unsigned long ivh_pv_rearm_max;
 
 /*
  * Shadow-comparator validation counters and the threshold-tuning histograms,
@@ -101,6 +114,83 @@ DECLARE_PER_CPU(u64, ivh_beat_false_pos);
 DECLARE_PER_CPU(u64, ivh_beat_false_neg);
 DECLARE_PER_CPU(u64, ivh_beat_publishes);
 DECLARE_PER_CPU(u64, ivh_beat_tier1_fired);
+/*
+ * Split accounting for ivh_lock_halt: it is incremented unconditionally
+ * inside ivh_pv_wait() regardless of which qspinlock_paravirt.h call site
+ * invoked pv_wait(), so its aggregate hlt_cycles/hlt_events cannot tell
+ * apart two structurally different sources:
+ *   - pv_wait_node(): waiting on an MCS queue PREDECESSOR. Threshold-
+ *     sensitive at mechanism==2 (only halts if pv_wait_early() fired).
+ *   - pv_wait_head_or_lock(): waiting for the actual lock HOLDER. Always
+ *     spins exactly SPIN_THRESHOLD then halts, unconditionally, in every
+ *     mechanism -- this path has NO adaptive logic at all.
+ * These two counters tag which call site actually reached pv_wait(), so a
+ * threshold sweep can see whether the sensitive path's halt volume moves at
+ * all, instead of that signal being diluted by the insensitive path.
+ */
+DECLARE_PER_CPU(u64, ivh_halt_from_node);
+DECLARE_PER_CPU(u64, ivh_halt_from_head);
+/*
+ * Tier-2 observability at src==2 (found missing via independent review,
+ * GLOCK-9): every OTHER tier-2 diagnostic counter (ivh_beat_agree_*,
+ * false_pos/neg, the age histograms) is computed only up to the `if (src ==
+ * 2) return beat;` early-exit in is_wait_preempted() -- i.e. only at src==1
+ * ("shadow mode", which never actually changes real behavior). At src==2,
+ * the ONLY configuration where tier 2 can affect a real decision, none of
+ * that existed: tier 2's fire rate was structurally uncountable. These two
+ * are incremented unconditionally for every src!=0 call (both src==1 and
+ * src==2), before that early-exit, so a live threshold sweep can measure
+ * `tier2_fired / tier2_checked` directly instead of inferring it.
+ */
+DECLARE_PER_CPU(u64, ivh_beat_tier2_checked);
+DECLARE_PER_CPU(u64, ivh_beat_tier2_fired);
+/*
+ * Spin-iteration accounting (GLOCK-10): ivh_lock_halt only measures time
+ * spent AFTER a wait has already decided to sleep -- it says nothing about
+ * how many SPIN_THRESHOLD iterations were burned busy-spinning beforehand,
+ * which is where early-bail's actual value proposition lives (fewer wasted
+ * cpu_relax() iterations, not a faster or slower wake once halted). These
+ * record SPIN_THRESHOLD - loop (iterations actually spent) at the exact
+ * point each inner spin loop gives up on lock-free acquisition, for both
+ * call sites:
+ *   - ivh_node_spin_*: pv_wait_node() (queue-predecessor wait). Threshold-
+ *     sensitive at mechanism==2 -- an early bail (tier1 or tier2) should
+ *     show a LOWER average than tier1-only (src=0), if early bail is doing
+ *     its job.
+ *   - ivh_head_spin_*: pv_wait_head_or_lock() (lock-holder wait). Has no
+ *     early-bail logic in any mechanism -- expected to average almost
+ *     exactly SPIN_THRESHOLD always, as a sanity-check control on the
+ *     accounting itself.
+ */
+DECLARE_PER_CPU(u64, ivh_node_spin_iters_sum);
+DECLARE_PER_CPU(u64, ivh_node_spin_attempts);
+DECLARE_PER_CPU(u64, ivh_head_spin_iters_sum);
+DECLARE_PER_CPU(u64, ivh_head_spin_attempts);
+/*
+ * Denominator-completeness fix (GLOCK-11, found by independent review of
+ * GLOCK-10's data): ivh_node_spin_iters_sum/attempts above only recorded
+ * passes that bailed early or exhausted the budget -- a pass that acquired
+ * the lock via the node->locked return in pv_wait_node()'s inner loop was
+ * silently excluded from both the sum and the attempt count, biasing the
+ * "iters per attempt" average toward only the unsuccessful subpopulation.
+ * These record the same SPIN_THRESHOLD - loop quantity at that excluded
+ * return site, so (ivh_node_spin_iters_sum + ivh_node_spin_success_iters_sum)
+ * / (ivh_node_spin_attempts + ivh_node_spin_success_attempts) is the
+ * complete, unbiased average over every inner-loop pass.
+ */
+DECLARE_PER_CPU(u64, ivh_node_spin_success_iters_sum);
+DECLARE_PER_CPU(u64, ivh_node_spin_success_attempts);
+/*
+ * GLOCK-12: histogram of observed re-arm depth (how many extra full
+ * SPIN_THRESHOLD laps a pv_wait_node() call took before finally halting),
+ * indexed by min(rearm_count, IVH_REARM_HIST_BUCKETS - 1). Exists so
+ * ivh_pv_rearm_max can be chosen from data instead of guessed -- per
+ * independent review, 711 total re-arms per window could be 711 waiters
+ * re-arming once or 20 waiters re-arming 35 times, and those imply
+ * completely different caps.
+ */
+#define IVH_REARM_HIST_BUCKETS 16
+DECLARE_PER_CPU(u64, ivh_node_rearm_hist[IVH_REARM_HIST_BUCKETS]);
 DECLARE_PER_CPU(s64, ivh_beat_min_age);
 DECLARE_PER_CPU(u64, ivh_beat_age_hist_running[IVH_BEAT_AGE_HIST_BUCKETS]);
 DECLARE_PER_CPU(u64, ivh_beat_age_hist_preempted[IVH_BEAT_AGE_HIST_BUCKETS]);
