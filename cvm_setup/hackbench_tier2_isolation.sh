@@ -226,63 +226,50 @@ snap() {
 field() { echo "$1" | grep -oP "(^| )${2}=\K[0-9]+" | head -1; }
 
 # --- arm configurations ---------------------------------------------------
-# Ordering rules enforced below, both verified against the running kernel's
-# arch/x86/kernel/kvm.c:
-#   * entering D:  kick_pure_ipi=0 BEFORE wait_mechanism=0.
-#   * leaving  D:  wait_mechanism=2 BEFORE kick_pure_ipi=1.
-#   * beat_threshold is set BEFORE preempt_src=2, never after, so src==2 is
-#     never briefly live with the other arm's threshold.
+# 2026-09-05 rebuild: the old ivh_pv_wait_mechanism (0-3) + kick_pure_ipi +
+# kick_node_ipi + kick_unlock_ipi + rearm_max pile collapsed to one switch,
+# ivh_adaptive_mode (0=vanilla, 1=pure IPI, 2=IVH adaptive). See
+# tools/bpf/docs/ivh_adaptive_spinning_build_plan_2026-09-05.md and the
+# kernel source repo's commit "IVH mode collapse: vanilla / pure-IPI /
+# adaptive" for the full rationale. Old arms H1K/G0K/G0N are DELETED -- they
+# existed purely to sweep the now-deleted kick knobs and have no successor
+# mode. Old G0's tier-2 was already dead at preempt_src=0 (vcpu_is_preempted()
+# is hardwired false on this host, no KVM_FEATURE_STEAL_TIME), so mode 1
+# reproduces its actual behavior exactly, just without the kick-knob
+# workarounds that used to be needed to fake "pure IPI" out of mode 2.
 configure_D() {
-  set_sysctl ivh_pv_preempt_src 0
-  set_sysctl ivh_pv_kick_pure_ipi 0
-  set_sysctl ivh_pv_wait_mechanism 0
-  set_sysctl ivh_pv_kick_unlock_ipi 1
-  set_sysctl ivh_pv_kick_node_ipi 1
-  set_sysctl ivh_pv_rearm_max 18446744073709551615
+  set_sysctl ivh_adaptive_mode 0
   set_sysctl ivh_universal_eligible 0
 }
 
-configure_mech2_base() {   # everything except preempt_src / beat_threshold
+configure_mode1_base() {   # pure IPI, no early bail -- everything except beat_threshold/preempt_src
+  set_sysctl ivh_adaptive_mode 1
   set_sysctl ivh_pv_preempt_src 0
-  set_sysctl ivh_pv_wait_mechanism 2
-  set_sysctl ivh_pv_kick_pure_ipi 1
-  set_sysctl ivh_pv_kick_node_ipi 0
-  set_sysctl ivh_pv_kick_unlock_ipi 1
-  set_sysctl ivh_pv_rearm_max 0
   set_sysctl ivh_pv_beat_publish_mask "$PUBLISH_MASK"
   set_sysctl ivh_universal_eligible 0
 }
 
-configure_G0() { configure_mech2_base; }
+configure_G0() { configure_mode1_base; }
 configure_G1() {
-  configure_mech2_base
+  set_sysctl ivh_adaptive_mode 2
   set_sysctl ivh_pv_beat_threshold "$THRESH_CYCLES_1"
   set_sysctl ivh_pv_preempt_src 1
+  set_sysctl ivh_pv_beat_publish_mask "$PUBLISH_MASK"
+  set_sysctl ivh_universal_eligible 0
 }
 configure_H1() {
-  configure_mech2_base
+  set_sysctl ivh_adaptive_mode 2
   set_sysctl ivh_pv_beat_threshold "$THRESH_CYCLES_1"
   set_sysctl ivh_pv_preempt_src 2
+  set_sysctl ivh_pv_beat_publish_mask "$PUBLISH_MASK"
+  set_sysctl ivh_universal_eligible 0
 }
 configure_H2() {
-  configure_mech2_base
+  set_sysctl ivh_adaptive_mode 2
   set_sysctl ivh_pv_beat_threshold "$THRESH_CYCLES_2"
   set_sysctl ivh_pv_preempt_src 2
-}
-configure_H1K() {   # H1 but head-wake uses the hypercall (kick_pure_ipi=0), same as D
-  configure_H1
-  set_sysctl ivh_pv_kick_pure_ipi 0
-}
-configure_G0K() {   # G0 (tier-2 off) but wake uses the latching hypercall, not the IPI.
-  # Isolates the "sticky vs lossy wake" hypothesis from tier-2 entirely: G0K
-  # differs from G0 in exactly kick_pure_ipi. If per-halt cycle cost collapses
-  # toward D's, the wake vehicle -- not tier-2, not halt count -- is the driver.
-  configure_G0
-  set_sysctl ivh_pv_kick_pure_ipi 0
-}
-configure_G0N() {   # G0 but the node-unlock IPI is also restored (kick_node_ipi=1)
-  configure_G0
-  set_sysctl ivh_pv_kick_node_ipi 1
+  set_sysctl ivh_pv_beat_publish_mask "$PUBLISH_MASK"
+  set_sysctl ivh_universal_eligible 0
 }
 configure_D_MIG() {    # D + IVH proactive migration on (vcap/MY_ivh_atc must already be running)
   configure_D
@@ -300,12 +287,9 @@ configure_arm() {
     G1)     configure_G1 ;;
     H1)     configure_H1 ;;
     H2)     configure_H2 ;;
-    H1K)    configure_H1K ;;
-    G0K)    configure_G0K ;;
-    G0N)    configure_G0N ;;
     D_MIG)  configure_D_MIG ;;
     H1_MIG) configure_H1_MIG ;;
-    *)      fatal "unknown arm '$1'" ;;
+    *)      fatal "unknown arm '$1' (H1K/G0K/G0N were retired in the 2026-09-05 mode collapse -- they swept knobs that no longer exist)" ;;
   esac
 }
 
