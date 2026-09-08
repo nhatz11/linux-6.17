@@ -1099,6 +1099,28 @@ unsigned long ivh_adaptive_mode = 0UL;
  */
 unsigned long ivh_pv_wait_trace = 0UL;
 
+/*
+ * IVH Idea 4 -- EXPERIMENTAL, deliberately not the shipped Stage 1 design.
+ * Default 0: today's safe behavior (busy-spin, never halt, when IRQs are
+ * already disabled at ivh_pv_wait() entry). When 1: enable IRQs for the
+ * halt, then explicitly restore them to disabled before returning to the
+ * caller -- see ivh_pv_wait()'s IF=0 branch.
+ *
+ * This exists ONLY to run a deliberate, targeted reproduction of the
+ * hazard identified in the build-plan doc (§9.4/§9.4.1): every wake_up()
+ * variant takes the generic wait-queue lock via spin_lock_irqsave()
+ * specifically because it must be callable from hardirq context. If an
+ * interrupt lands on this CPU during the open window and its handler
+ * wants the SAME lock, that handler enqueues behind this CPU's own
+ * already-in-flight MCS node -- a permanent deadlock, not a slowdown,
+ * because this CPU can never finish the handler (which needs the lock)
+ * to get back to its own earlier queue position (which the handler is
+ * now blocking). NOT proven safe against this hazard. NOT for general use.
+ * See cvm_setup/ hazard_a_test module for the deliberate reproduction.
+ */
+unsigned long ivh_pv_irqoff_halt = 0UL;
+DEFINE_PER_CPU(u64, ivh_irqoff_halt_used);
+
 #define ivh_pv_trace(fmt, ...)						\
 	do {								\
 		if (unlikely(READ_ONCE(ivh_pv_wait_trace)))		\
@@ -1155,10 +1177,63 @@ DEFINE_PER_CPU(u64, ivh_node_spin_success_attempts);
 DEFINE_PER_CPU(s64, ivh_beat_min_age) = S64_MAX;
 DEFINE_PER_CPU(u64, ivh_beat_age_hist_running[IVH_BEAT_AGE_HIST_BUCKETS]);
 DEFINE_PER_CPU(u64, ivh_beat_age_hist_preempted[IVH_BEAT_AGE_HIST_BUCKETS]);
+DEFINE_PER_CPU(u64, ivh_beat_age_hist_raw[IVH_BEAT_AGE_HIST_BUCKETS]);
+DEFINE_PER_CPU(u64, ivh_head_arm);
+DEFINE_PER_CPU(u64, ivh_head_yield_try_tier1);
+DEFINE_PER_CPU(u64, ivh_head_yield_ok_tier1);
+DEFINE_PER_CPU(u64, ivh_head_yield_try_tier2);
+DEFINE_PER_CPU(u64, ivh_head_yield_ok_tier2);
+DEFINE_PER_CPU(u64, ivh_head_woke_yielded);
+DEFINE_PER_CPU(u64, ivh_head_woke_moot);
+DEFINE_PER_CPU(u64, ivh_head_spin_enter);
+DEFINE_PER_CPU(u64, ivh_head_yield_try_tier2_spinning);
+DEFINE_PER_CPU(u64, ivh_head_yield_ok_tier2_spinning);
+DEFINE_PER_CPU(u64, ivh_head_spinning_prearm);
 DEFINE_PER_CPU(u64, ivh_wake_hypercall);
 DEFINE_PER_CPU(u64, ivh_wake_ipi);
 DEFINE_PER_CPU(u64, ivh_wait_irqoff_nohalt);
 DEFINE_PER_CPU(u32, ivh_vanilla_inflight);
+
+/*
+ * IVH Idea 4 Stage 0: attribution for the ivh_wait_irqoff_nohalt population.
+ * Small fixed per-CPU table, not a real hash table -- the build-plan doc's
+ * expectation is a handful of distinct call sites, not thousands, so a
+ * linear scan is fine and keeps this easy to audit. Read-only consumer,
+ * zero behavior change: this does not alter which waiters halt vs spin, it
+ * only records *why* the spin population looks the way it does, so the
+ * Idea 4 correctness audit has a concrete, short list of real call sites
+ * instead of "audit every spin_lock_irqsave() in the kernel."
+ *
+ * Race-free by construction: only ever touched from ivh_pv_wait()'s IF=0
+ * branch, which by definition runs with this CPU's interrupts already off,
+ * on this same CPU -- no other context can preempt in and race the update.
+ */
+#define IVH_IRQOFF_ATTR_SLOTS 16
+struct ivh_irqoff_attr_slot {
+	unsigned long ret_ip;
+	u64 count;
+};
+DEFINE_PER_CPU(struct ivh_irqoff_attr_slot, ivh_irqoff_attr[IVH_IRQOFF_ATTR_SLOTS]);
+DEFINE_PER_CPU(u64, ivh_irqoff_attr_overflow);
+
+static void ivh_irqoff_attr_record(unsigned long ret_ip)
+{
+	struct ivh_irqoff_attr_slot *tbl = this_cpu_ptr(ivh_irqoff_attr);
+	int i;
+
+	for (i = 0; i < IVH_IRQOFF_ATTR_SLOTS; i++) {
+		if (tbl[i].ret_ip == ret_ip) {
+			tbl[i].count++;
+			return;
+		}
+		if (tbl[i].ret_ip == 0) {
+			tbl[i].ret_ip = ret_ip;
+			tbl[i].count = 1;
+			return;
+		}
+	}
+	this_cpu_inc(ivh_irqoff_attr_overflow);
+}
 
 /*
  * HLT/poll cycle accounting for ivh_pv_wait()'s halt paths. Declared in
@@ -1384,6 +1459,13 @@ static const struct ctl_table ivh_pv_sysctls[] = {
 		.mode		= 0644,
 		.proc_handler	= ivh_pv_proc_beat_publish_mask,
 	},
+	{
+		.procname	= "ivh_pv_irqoff_halt",
+		.data		= &ivh_pv_irqoff_halt,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
 };
 
 static int __init ivh_pv_sysctl_init(void)
@@ -1570,7 +1652,35 @@ static void ivh_pv_wait(u8 *ptr, u8 val)
 	 * modes 1/2 materially less halt-y than mode 0.
 	 */
 	this_cpu_inc(ivh_wait_irqoff_nohalt);
+	ivh_irqoff_attr_record(this_cpu_read(qlock_slowpath_caller_ip));
 	ivh_pv_trace("native-spin (irqs already disabled on entry)");
+
+	/*
+	 * Idea 4 EXPERIMENTAL path -- see ivh_pv_irqoff_halt's comment above.
+	 * in_nmi()/in_hardirq()/in_serving_softirq() are refused unconditionally:
+	 * that's a real but narrower protection (this CPU is not ALREADY inside
+	 * an interrupt handler trying to use this path recursively) -- it does
+	 * NOT protect against the hazard this path exists to test (an
+	 * INDEPENDENT interrupt landing during the window opened below).
+	 */
+	if (READ_ONCE(ivh_pv_irqoff_halt) &&
+	    !in_nmi() && !in_hardirq() && !in_serving_softirq()) {
+		this_cpu_inc(ivh_irqoff_halt_used);
+		if (READ_ONCE(*ptr) == val) {
+			ivh_pv_trace("HALT enter (irqoff-halt, IF=1 at hlt)");
+			ivh_lock_halt_begin(false);
+			safe_halt();		/* sti;hlt -- HLT taken with IF=1 */
+			ivh_beat_halt_exit();
+			ivh_lock_halt_end();
+			local_irq_disable();	/* restore: entry to this function was IRQs-off */
+			ivh_pv_trace("HALT exit (woke, irqoff-halt)");
+		}
+		/* else: condition already cleared; IRQs are still off from entry, nothing to restore */
+		WARN_ONCE(!irqs_disabled(),
+			  "IVH Idea 4: ivh_pv_wait() returning with IRQs enabled, entry was disabled");
+		return;
+	}
+
 	while (READ_ONCE(*ptr) == val)
 		cpu_relax();
 }

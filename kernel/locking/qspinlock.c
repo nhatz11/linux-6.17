@@ -80,6 +80,10 @@
  */
 static DEFINE_PER_CPU_ALIGNED(struct qnode, qnodes[_Q_MAX_NODES]);
 
+#ifdef CONFIG_PARAVIRT_SPINLOCKS
+DEFINE_PER_CPU(unsigned long, qlock_slowpath_caller_ip);
+#endif
+
 /*
  * Generate the native code for queued_spin_unlock_slowpath(); provide NOPs for
  * all the PV callbacks.
@@ -87,7 +91,8 @@ static DEFINE_PER_CPU_ALIGNED(struct qnode, qnodes[_Q_MAX_NODES]);
 
 static __always_inline void __pv_init_node(struct mcs_spinlock *node) { }
 static __always_inline void __pv_wait_node(struct mcs_spinlock *node,
-					   struct mcs_spinlock *prev) { }
+					   struct mcs_spinlock *prev,
+					   struct qspinlock *lock) { }
 static __always_inline void __pv_kick_node(struct qspinlock *lock,
 					   struct mcs_spinlock *node) { }
 static __always_inline u32  __pv_wait_head_or_lock(struct qspinlock *lock,
@@ -133,6 +138,19 @@ void __lockfunc queued_spin_lock_slowpath(struct qspinlock *lock, u32 val)
 	struct mcs_spinlock *prev, *next, *node;
 	u32 old, tail;
 	int idx;
+
+	/*
+	 * IVH Idea 4 Stage 0 attribution: qlock_slowpath_caller_ip is stashed
+	 * upstream, in the real lock-entry wrappers (_raw_spin_lock(),
+	 * _raw_spin_lock_irqsave(), kernel/locking/spinlock.c), not here.
+	 * A live attempt to capture it here via a single _RET_IP_ only ever
+	 * resolved to _raw_spin_lock_irqsave() itself (the one generic,
+	 * noinline wrapper every spin_lock_irqsave() call site in the kernel
+	 * funnels through), and a 2-frame stack_trace_save() attempt did not
+	 * reliably unwind past it either -- confirmed live, not assumed.
+	 * Capturing at the real, non-inlined call-site boundary instead needs
+	 * no unwinding and is exact by construction.
+	 */
 
 	BUILD_BUG_ON(CONFIG_NR_CPUS >= (1U << _Q_TAIL_CPU_BITS));
 
@@ -288,7 +306,7 @@ pv_queue:
 		/* Link @node into the waitqueue. */
 		WRITE_ONCE(prev->next, node);
 
-		pv_wait_node(node, prev);
+		pv_wait_node(node, prev, lock);
 		arch_mcs_spin_lock_contended(&node->locked);
 
 		/*

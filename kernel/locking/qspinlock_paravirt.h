@@ -56,10 +56,47 @@ enum vcpu_state {
 	VCPU_HASHED,		/* = pv_hash'ed + VCPU_HALTED */
 };
 
+/*
+ * IVH Idea 2 (head-role takeover) Stage 0 -- observe-only, no takeover logic
+ * yet. head_ctl packs {gen:32 | yields:16 | state:16}; only `state` is used
+ * this stage (HEAD_IDLE/HEAD_ARMED/HEAD_SPINNING -- HEAD_YIELDED is declared
+ * for Stage 1 forward-compat but nothing sets it yet, so
+ * ivh_head_woke_yielded must read 0 in every Stage-0 run). See tools/bpf/docs/
+ * ivh_adaptive_spinning_build_plan_2026-09-05.md §2 for the full design.
+ *
+ * HEAD_SPINNING (Stage 0b, added 2026-09-08) closes a blind spot found in the
+ * first Stage-0 data: HEAD_ARMED is set only immediately before the head's
+ * real pv_wait(), i.e. only AFTER the head has already burned its whole
+ * SPIN_THRESHOLD and has already stored VCPU_HASHED into its own pn->state.
+ * A node waiter that classifies its predecessor by re-reading pp->state
+ * therefore ALWAYS resolves that window to tier 1, and tier 2 can never be
+ * observed in it -- live data confirmed exactly that (try_tier1 = 5210,
+ * try_tier2 = 0, against 7214 global tier-2 fires).
+ *
+ * The window that actually matters for Idea 2 is the structurally EARLIER
+ * one: the head is still in its own spin loop, has not exhausted
+ * SPIN_THRESHOLD, its pn->state is still VCPU_RUNNING -- and yet its vCPU has
+ * genuinely been preempted by the host mid-spin. That is precisely what the
+ * TSC heartbeat (tier 2) exists to detect, and Stage 0 as first shipped could
+ * not see it at all. HEAD_SPINNING marks that window, so a waiter can now
+ * distinguish three predecessor states rather than two: not-the-head
+ * (HEAD_IDLE), head-still-spinning (HEAD_SPINNING), head-committed-to-halt
+ * (HEAD_ARMED).
+ *
+ * Numeric values of the pre-existing states are deliberately left unchanged
+ * so any existing offline decoder of head_ctl keeps working.
+ */
+#define HEAD_IDLE 0
+#define HEAD_ARMED 1
+#define HEAD_YIELDED 2
+#define HEAD_SPINNING 3
+#define HC(gen, y, st) (((u64)(gen) << 32) | ((u64)(y) << 16) | (st))
+
 struct pv_node {
 	struct mcs_spinlock	mcs;
 	int			cpu;
 	u8			state;
+	u64			head_ctl;
 };
 
 /*
@@ -315,6 +352,29 @@ static inline bool is_wait_preempted(int cpu)
 		this_cpu_inc(ivh_beat_tier2_fired);
 
 	/*
+	 * Unconditional (src==1 AND src==2) raw age histogram -- added
+	 * 2026-09-07. The EXISTING ivh_beat_age_hist_running/preempted below
+	 * are gated behind src==1's ground-truth comparison, which is dead on
+	 * any host without a real steal-time page (this one included:
+	 * vcpu_is_preempted() is hardwired false here, so src==1's "ground
+	 * truth" is meaningless and that histogram has never once been
+	 * populated under real src==2 operation this whole investigation).
+	 * This one is not split by any ground truth -- it just answers "what
+	 * does the real age distribution look like under real src==2 use,"
+	 * which is the one thing the existing histogram cannot answer here.
+	 * Same log2 bucketing as the existing histogram, deliberately: bucket
+	 * i is 2^i..2^(i+1)-1 cycles, bucket 0 absorbs zero/negative age, top
+	 * bucket saturates.
+	 */
+	{
+		int raw_bucket = (age > 0) ? ilog2((u64)age) : 0;
+
+		if (raw_bucket >= IVH_BEAT_AGE_HIST_BUCKETS)
+			raw_bucket = IVH_BEAT_AGE_HIST_BUCKETS - 1;
+		this_cpu_inc(ivh_beat_age_hist_raw[raw_bucket]);
+	}
+
+	/*
 	 * Cross-vCPU TSC drift guard (build plan sec 2.8).  Track the minimum
 	 * age this reader has ever seen.  Costs one compare, and the store is
 	 * taken only when a new minimum is found.  TSC-only, no PV read --
@@ -443,6 +503,7 @@ static void pv_init_node(struct mcs_spinlock *node)
 
 	pn->cpu = smp_processor_id();
 	pn->state = VCPU_RUNNING;
+	pn->head_ctl = HC(0, 0, HEAD_IDLE);
 
 	/*
 	 * IVH heartbeat cold-start seed (build plan sec 2.2, "a second hole").
@@ -469,7 +530,8 @@ static void pv_init_node(struct mcs_spinlock *node)
  * pv_kick_node() is used to set _Q_SLOW_VAL and fill in hash table on its
  * behalf.
  */
-static void pv_wait_node(struct mcs_spinlock *node, struct mcs_spinlock *prev)
+static void pv_wait_node(struct mcs_spinlock *node, struct mcs_spinlock *prev,
+			  struct qspinlock *lock)
 {
 	struct pv_node *pn = (struct pv_node *)node;
 	struct pv_node *pp = (struct pv_node *)prev;
@@ -510,6 +572,96 @@ static void pv_wait_node(struct mcs_spinlock *node, struct mcs_spinlock *prev)
 			}
 			if (pv_wait_early(pp, loop)) {
 				wait_early = true;
+
+				/*
+				 * IVH Idea 2 Stage 0: OBSERVE ONLY, no takeover
+				 * logic yet -- counts what a real takeover would
+				 * fire on, without acting on it. `pp` is our
+				 * predecessor; if it's currently the queue head
+				 * and looks stale enough to trigger this
+				 * early-bail, check whether the lock is actually
+				 * free right now -- that's the real
+				 * opportunity-rate question for Stage 1.
+				 *
+				 * Stage 0b splits that by WHICH head window we
+				 * caught, because the two are not the same
+				 * opportunity and must not be summed:
+				 *
+				 *   HEAD_ARMED    - the head already exhausted
+				 *                   its own SPIN_THRESHOLD and
+				 *                   is committed to halting.
+				 *                   Late. Sub-split by tier,
+				 *                   as before.
+				 *   HEAD_SPINNING - the head is still in its own
+				 *                   spin loop and has NOT given
+				 *                   up. Strictly earlier, and
+				 *                   reachable only via tier 2.
+				 *   HEAD_IDLE     - prev is not the queue head;
+				 *                   nothing to observe.
+				 */
+				switch (READ_ONCE(pp->head_ctl) & 0xffff) {
+				case HEAD_ARMED: {
+					bool tier1 = READ_ONCE(pp->state) != VCPU_RUNNING;
+
+					if (tier1) {
+						this_cpu_inc(ivh_head_yield_try_tier1);
+						if (!READ_ONCE(lock->locked))
+							this_cpu_inc(ivh_head_yield_ok_tier1);
+					} else {
+						this_cpu_inc(ivh_head_yield_try_tier2);
+						if (!READ_ONCE(lock->locked))
+							this_cpu_inc(ivh_head_yield_ok_tier2);
+					}
+					break;
+				}
+				case HEAD_SPINNING:
+					/*
+					 * IVH Idea 2 Stage 0b: the window the
+					 * HEAD_ARMED case above is structurally
+					 * blind to -- prev is the queue head and
+					 * is STILL SPINNING in its own
+					 * SPIN_THRESHOLD loop, has not decided to
+					 * halt, and yet looks stale to us. This
+					 * is the real tier-2 catch: strictly
+					 * earlier than the armed window, which by
+					 * construction can only be entered after
+					 * the head already gave up on its own.
+					 *
+					 * NO tier1/tier2 split here, and that is
+					 * a fact about the code, not a shortcut.
+					 * HEAD_SPINNING is stored in the same
+					 * breath as pn->state = VCPU_RUNNING and
+					 * nothing but the head itself writes
+					 * pn->state during its tenure
+					 * (pv_kick_node()'s cmpxchg only fires on
+					 * VCPU_HALTED). So pp->state re-reads
+					 * VCPU_RUNNING throughout this window,
+					 * tier 1 cannot have been what fired, and
+					 * duplicating the split would only
+					 * manufacture a permanently-zero counter
+					 * -- the exact defect that made the armed
+					 * window's tier-2 half useless.
+					 *
+					 * The single exception is the head's own
+					 * short pre-arm gap (its VCPU_HASHED
+					 * store through pv_hash()/xchg() to the
+					 * HEAD_ARMED store). Counted separately
+					 * below, on purpose, so it can be shown
+					 * to be small instead of silently
+					 * inflating the tier-2 numbers.
+					 */
+					if (READ_ONCE(pp->state) != VCPU_RUNNING) {
+						this_cpu_inc(ivh_head_spinning_prearm);
+						break;
+					}
+					this_cpu_inc(ivh_head_yield_try_tier2_spinning);
+					if (!READ_ONCE(lock->locked))
+						this_cpu_inc(ivh_head_yield_ok_tier2_spinning);
+					break;
+				default:
+					/* HEAD_IDLE: prev isn't the queue head. */
+					break;
+				}
 				break;
 			}
 			ivh_beat_publish_in_spin(loop);
@@ -657,6 +809,25 @@ pv_wait_head_or_lock(struct qspinlock *lock, struct mcs_spinlock *node)
 		WRITE_ONCE(pn->state, VCPU_RUNNING);
 
 		/*
+		 * IVH Idea 2 Stage 0b: mark "head is actively spinning, not yet
+		 * armed to halt". Deliberately in the same breath as the
+		 * VCPU_RUNNING store above, and deliberately INSIDE the retry
+		 * loop rather than once before it: lock stealing means this
+		 * loop genuinely re-enters (see the comment at the bottom of
+		 * it), and each re-entry is a fresh spin tenure that has to be
+		 * re-marked, exactly as pn->state is re-stored here.
+		 *
+		 * Pairing these two stores is also what makes the observer side
+		 * in pv_wait_node() unambiguous: for as long as head_ctl reads
+		 * HEAD_SPINNING, pn->state reads VCPU_RUNNING, right up until
+		 * this vCPU itself stores VCPU_HASHED below. Nobody else writes
+		 * pn->state while we hold the head role -- pv_kick_node()'s
+		 * cmpxchg only fires on VCPU_HALTED, which the head never is.
+		 */
+		WRITE_ONCE(pn->head_ctl, HC(0, 0, HEAD_SPINNING));
+		this_cpu_inc(ivh_head_spin_enter);
+
+		/*
 		 * Set the pending bit in the active lock spinning loop to
 		 * disable lock stealing before attempting to acquire the lock.
 		 */
@@ -716,7 +887,33 @@ pv_wait_head_or_lock(struct qspinlock *lock, struct mcs_spinlock *node)
 		lockevent_inc(pv_wait_head);
 		lockevent_cond_inc(pv_wait_again, waitcnt);
 		this_cpu_inc(ivh_halt_from_head);
+		this_cpu_inc(ivh_head_arm);
+		/*
+		 * IVH Idea 2 Stage 0: arm right before the real halt -- this is
+		 * ivh_head_arm's exact site, so the two counters must agree
+		 * (>0.1% deviation means the arm is misplaced). Nothing sets
+		 * HEAD_YIELDED yet (Stage 1 territory), so this is always
+		 * un-done by the plain reset below, never the yielded branch --
+		 * that's the whole Stage-0 acceptance check for this half.
+		 *
+		 * Stage 0b note: this store is deliberately NOT moved earlier.
+		 * That leaves a short HEAD_SPINNING-but-VCPU_HASHED gap running
+		 * from the WRITE_ONCE(pn->state, VCPU_HASHED) above through
+		 * pv_hash()/xchg() to here. It is the only way an observer can
+		 * see HEAD_SPINNING with pp->state != VCPU_RUNNING, so
+		 * pv_wait_node() counts that case into its own separate
+		 * ivh_head_spinning_prearm rather than folding it into the
+		 * tier-2 spinning-window counters. Moving the arm earlier would
+		 * close the gap but break the ivh_head_arm == ivh_halt_from_head
+		 * site identity that is Stage 0's acceptance check.
+		 */
+		WRITE_ONCE(pn->head_ctl, HC(0, 0, HEAD_ARMED));
 		pv_wait(&lock->locked, _Q_SLOW_VAL);
+		if ((READ_ONCE(pn->head_ctl) & 0xffff) == HEAD_YIELDED)
+			this_cpu_inc(ivh_head_woke_yielded);
+		else
+			this_cpu_inc(ivh_head_woke_moot);
+		WRITE_ONCE(pn->head_ctl, HC(0, 0, HEAD_IDLE));
 
 		/*
 		 * Because of lock stealing, the queue head vCPU may not be
@@ -731,6 +928,36 @@ pv_wait_head_or_lock(struct qspinlock *lock, struct mcs_spinlock *node)
 	 * be nozero to enable better code optimization.
 	 */
 gotlock:
+	/*
+	 * IVH Idea 2 Stage 0b: retire the head role explicitly on the acquire
+	 * path. Both `goto gotlock` sites above (trylock_clear_pending() inside
+	 * the spin loop, and the xchg(&lock->locked, _Q_SLOW_VAL) == 0 race)
+	 * leave the loop WITHOUT ever calling pv_wait(), so neither reaches the
+	 * "reset head_ctl to HEAD_IDLE" store that follows pv_wait() below.
+	 *
+	 * As Stage 0 originally shipped that was harmless: HEAD_ARMED was
+	 * stored only at :arm, immediately before pv_wait(), with no exit
+	 * between the two, so head_ctl was provably already HEAD_IDLE at every
+	 * gotlock. HEAD_SPINNING breaks that property -- it is set at the top
+	 * of the loop, so it is live across both gotlock sites. Without this
+	 * store, a node that acquired the lock here would keep advertising
+	 * HEAD_SPINNING to its MCS successor for the whole window between our
+	 * acquire and the successor observing node->locked == 1, miscounting a
+	 * lock OWNER as a spinning head (and, at Stage 1, offering it up as a
+	 * takeover target).
+	 *
+	 * Placing the reset here rather than at each goto covers both sites and
+	 * every future one. It is ordered before the successor's release
+	 * (arch_mcs_spin_unlock_contended()'s smp_store_release of
+	 * next->locked, back in queued_spin_lock_slowpath()), so any successor
+	 * that has observed node->locked == 1 is guaranteed to see HEAD_IDLE.
+	 *
+	 * Cross-tenure leakage beyond that window is separately impossible:
+	 * pv_init_node() re-stores HC(0,0,HEAD_IDLE) on every slowpath entry,
+	 * and does so before the smp_wmb() + xchg_tail() that first publishes
+	 * this qnode where any successor could find it (qspinlock.c:272-296).
+	 */
+	WRITE_ONCE(pn->head_ctl, HC(0, 0, HEAD_IDLE));
 	return (u32)(atomic_read(&lock->val) | _Q_LOCKED_VAL);
 }
 

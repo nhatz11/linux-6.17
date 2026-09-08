@@ -171,6 +171,65 @@ DECLARE_PER_CPU(u64, ivh_node_spin_success_attempts);
 DECLARE_PER_CPU(s64, ivh_beat_min_age);
 DECLARE_PER_CPU(u64, ivh_beat_age_hist_running[IVH_BEAT_AGE_HIST_BUCKETS]);
 DECLARE_PER_CPU(u64, ivh_beat_age_hist_preempted[IVH_BEAT_AGE_HIST_BUCKETS]);
+/*
+ * Unconditional raw age histogram, populated for src==1 AND src==2 alike,
+ * not split by any ground truth -- see kernel/locking/qspinlock_paravirt.h's
+ * is_wait_preempted() for why this exists (the two above are gated behind
+ * src==1's ground-truth comparison, which is dead on any host without a
+ * real steal-time page, this one included).
+ */
+DECLARE_PER_CPU(u64, ivh_beat_age_hist_raw[IVH_BEAT_AGE_HIST_BUCKETS]);
+
+/*
+ * IVH Idea 2 (head-role takeover) Stage 0 counters -- observe-only, see
+ * kernel/locking/qspinlock_paravirt.h's pv_wait_node()/pv_wait_head_or_lock().
+ * ivh_head_arm ~= ivh_halt_from_head is the Stage-0 sanity check (same site).
+ * try/ok split by tier so tier-1 (predecessor not running) and tier-2
+ * (TSC-heartbeat stale) can be compared as independent candidate triggers
+ * before Stage 1 commits to either one.
+ */
+DECLARE_PER_CPU(u64, ivh_head_arm);
+DECLARE_PER_CPU(u64, ivh_head_yield_try_tier1);
+DECLARE_PER_CPU(u64, ivh_head_yield_ok_tier1);
+DECLARE_PER_CPU(u64, ivh_head_yield_try_tier2);
+DECLARE_PER_CPU(u64, ivh_head_yield_ok_tier2);
+DECLARE_PER_CPU(u64, ivh_head_woke_yielded);
+DECLARE_PER_CPU(u64, ivh_head_woke_moot);
+/*
+ * IVH Idea 2 Stage 0b counters (2026-09-08) -- the head-still-SPINNING window,
+ * which the counters above are structurally blind to. HEAD_ARMED is only set
+ * once the head has already burned its whole SPIN_THRESHOLD and stored
+ * VCPU_HASHED, so ivh_head_yield_try_tier2 can never fire in that window and
+ * measured 0 against 5210 tier-1 fires. These count the earlier and more
+ * interesting case instead: tier 2 catching a head whose vCPU was preempted
+ * MID-SPIN, while it still believes itself VCPU_RUNNING.
+ *
+ *   ivh_head_spin_enter               - head spin-loop entries; the
+ *                                       denominator, and the HEAD_SPINNING
+ *                                       mirror of ivh_head_arm. Includes the
+ *                                       re-entries caused by lock stealing.
+ *                                       ivh_head_spin_enter -
+ *                                       ivh_head_spin_attempts = spin loops
+ *                                       that ended in an acquire rather than
+ *                                       in exhaustion.
+ *   ivh_head_yield_try_tier2_spinning - tier 2 fired against a still-spinning
+ *                                       head. Compare against
+ *                                       ivh_head_yield_try_tier1, NOT summed
+ *                                       with it: different windows.
+ *   ivh_head_yield_ok_tier2_spinning  - of those, the lock read free -- the
+ *                                       Stage-1 opportunity rate for this
+ *                                       window.
+ *   ivh_head_spinning_prearm          - HEAD_SPINNING seen with state !=
+ *                                       VCPU_RUNNING, i.e. the head's short
+ *                                       VCPU_HASHED-to-HEAD_ARMED gap. A
+ *                                       hygiene counter, expected small;
+ *                                       excluded from the two above so the
+ *                                       tier-2 window stays clean.
+ */
+DECLARE_PER_CPU(u64, ivh_head_spin_enter);
+DECLARE_PER_CPU(u64, ivh_head_yield_try_tier2_spinning);
+DECLARE_PER_CPU(u64, ivh_head_yield_ok_tier2_spinning);
+DECLARE_PER_CPU(u64, ivh_head_spinning_prearm);
 
 /*
  * Mode-collapse canaries (2026-09-05 rebuild): the wake-vehicle contract for

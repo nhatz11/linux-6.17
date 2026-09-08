@@ -18,6 +18,9 @@
 #include <linux/linkage.h>
 #include <linux/preempt.h>
 #include <linux/spinlock.h>
+#ifdef CONFIG_PARAVIRT_SPINLOCKS
+#include <asm/qspinlock.h>
+#endif
 #include <linux/interrupt.h>
 #include <linux/debug_locks.h>
 #include <linux/export.h>
@@ -269,6 +272,10 @@ EXPORT_SYMBOL(_raw_spin_trylock_bh);
 #ifndef CONFIG_INLINE_SPIN_LOCK
 noinline void __lockfunc _raw_spin_lock(raw_spinlock_t *lock)
 {
+#ifdef CONFIG_PARAVIRT_SPINLOCKS
+	/* IVH Idea 4 Stage 0 attribution -- see arch/x86/include/asm/qspinlock.h */
+	this_cpu_write(qlock_slowpath_caller_ip, _RET_IP_);
+#endif
 	ivh_pre_lock(lock);
 	__raw_spin_lock(lock);
 	if (!in_interrupt()) {
@@ -284,6 +291,10 @@ noinline unsigned long __lockfunc _raw_spin_lock_irqsave(raw_spinlock_t *lock)
 {
 	unsigned long flags;
 
+#ifdef CONFIG_PARAVIRT_SPINLOCKS
+	/* IVH Idea 4 Stage 0 attribution -- see arch/x86/include/asm/qspinlock.h */
+	this_cpu_write(qlock_slowpath_caller_ip, _RET_IP_);
+#endif
 	ivh_pre_lock(lock);
 	flags = __raw_spin_lock_irqsave(lock);
 	if (!in_interrupt()) {
@@ -298,6 +309,10 @@ EXPORT_SYMBOL(_raw_spin_lock_irqsave);
 #ifndef CONFIG_INLINE_SPIN_LOCK_IRQ
 noinline void __lockfunc _raw_spin_lock_irq(raw_spinlock_t *lock)
 {
+#ifdef CONFIG_PARAVIRT_SPINLOCKS
+	/* IVH Idea 4 Stage 0 attribution -- see arch/x86/include/asm/qspinlock.h */
+	this_cpu_write(qlock_slowpath_caller_ip, _RET_IP_);
+#endif
 	ivh_pre_lock(lock);
 	__raw_spin_lock_irq(lock);
 	if (!in_interrupt()) {

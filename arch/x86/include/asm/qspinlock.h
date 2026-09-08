@@ -42,6 +42,18 @@ extern void __pv_queued_spin_lock_slowpath(struct qspinlock *lock, u32 val);
 extern void __raw_callee_save___pv_queued_spin_unlock(struct qspinlock *lock);
 extern bool nopvspin;
 
+/*
+ * IVH Idea 4 Stage 0: best-effort attribution for the "entered the slowpath
+ * with IRQs already off" population (see ivh_wait_irqoff_nohalt in
+ * arch/x86/kernel/kvm.c). Stashed here at slowpath entry -- the one place
+ * that still has the real caller's return address -- and consumed only from
+ * ivh_pv_wait()'s IF=0 branch, which by construction already runs on this
+ * same CPU with interrupts off, so there is no read/write race to guard
+ * against. Not paravirt-specific in principle, but gated on
+ * CONFIG_PARAVIRT_SPINLOCKS since nothing reads it otherwise.
+ */
+DECLARE_PER_CPU(unsigned long, qlock_slowpath_caller_ip);
+
 #define	queued_spin_unlock queued_spin_unlock
 /**
  * queued_spin_unlock - release a queued spinlock
