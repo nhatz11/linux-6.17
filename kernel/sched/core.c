@@ -433,6 +433,94 @@ static void ivh_uc_maybe_close_window(struct rq *rq, u64 now)
 }
 
 /*
+ * ivh_vact_tick - minimal Part C port: TSC-native, steal-time-independent
+ * host-preemption detection at tick granularity. Feeds
+ * ivh_gate_time_left_reject()'s tsc_pe==true branch (kernel/sched/fair.c).
+ * Called from account_process_tick() (kernel/sched/cputime.c), between
+ * ivh_tick_steal_accumulate() and ivh_uc_tick() -- same relative position
+ * as production/kernel-43-clean, preserved deliberately even though this
+ * port has no ordering dependency on either neighbour, purely so a future
+ * diff against the source tree stays easy to read.
+ *
+ * Ported from kernel-43-clean's ivh_vact_tick() (kernel/sched/core.c) with
+ * everything NOT needed by the three tsc_pe fields removed: the
+ * ivh_vact_residual sub-threshold split (ivh_vact_gap_split()), the window/
+ * capacity-close accumulation feeding ivh_vact_capacity (a Gate-1-only
+ * input, confirmed unreachable from Gate 2 -- ivh_proc_cap_source() rejects
+ * any cap_source value other than 0/3, so this port cannot silently start
+ * feeding Gate 1), and the shadow-comparison counters (ivh_decision_shadow
+ * is not ported). What remains is exactly the jump detector: publish a
+ * tick-only TSC stamp, and when the gap since the last one exceeds the
+ * threshold, decide whether idle explains it or it was a genuine
+ * preemption, and if the latter, close the "burst" so
+ * ivh_vact_last_active_c/_last_preempt_tsc reflect it.
+ *
+ * Uses its own sysctl, ivh_vact_jump_ns (kernel/sched/bpf_sched.c), NOT
+ * ivh_pv_beat_threshold (arch/x86/kernel/kvm.c). It used to reuse that
+ * knob, on the theory that it's the same raw-TSC-cycles quantity with the
+ * same tsc_khz-derived recalibration. That coupling was a real bug:
+ * /root/spin_mode sets ivh_pv_beat_threshold to 220000 cycles (~100us) for
+ * IVH_PV/STOCK_TAS's qspinlock early-bail tuning -- one tenth of a
+ * CONFIG_HZ=1000 tick period (~2,200,000 cycles at this host's
+ * tsc_khz=2200000). Measured effect: ~100% of ordinary ticks misclassified
+ * as jumps (~1000 jumps/sec/CPU) under spin_mode 2, against LOC-tick
+ * ground truth showing ~0% real preemption on the same run. ivh_vact_jump_ns
+ * is ns-valued (converted to cycles below via ivh_tsc_ns_to_cycles(), so it
+ * stays correct at any tsc_khz) and is deliberately excluded from
+ * /root/spin_mode's per-mode sysctl resets, since it must hold one stable
+ * value across every spin mode for ivh_vact_jumps to be comparable
+ * cross-mode. Default is TICK_NSEC + TICK_NSEC/2 (1.5 tick periods): at
+ * CONFIG_HZ=1000 that's 1,500,000ns, which is bit-identical in cycles to
+ * the 1500us/3,300,000-cycle operating point validated above.
+ *
+ * Both comparisons are SIGNED on purpose (age, and the idle-exit-vs-old
+ * test below) -- matching ivh_beat_age()'s own discipline elsewhere in this
+ * tree: a small cross-source skew must read as "ordered", not wrap into a
+ * huge positive and misclassify a fresh stamp as an ancient one.
+ */
+void ivh_vact_tick(void)
+{
+	struct rq *rq = this_rq();
+	u64 now = ivh_raw_tsc();
+	u64 old = rq->ivh_vact_stamp;
+	u64 thresh_c;
+	s64 age;
+
+	rq->ivh_vact_stamp = now;		/* the publish, unconditional */
+
+	if (unlikely(!old)) {
+		/* First tick ever on this rq: nothing to compare against yet. */
+		rq->ivh_vact_burst_start_tsc = now;
+		return;
+	}
+
+	thresh_c = ivh_tsc_ns_to_cycles(READ_ONCE(ivh_vact_jump_ns));
+	if (unlikely(!thresh_c))
+		return;		/* tsc_khz not known yet: cannot classify */
+
+	age = (s64)(now - old);
+	if (likely(age <= (s64)thresh_c))
+		return;		/* normal ticking, no gap to explain */
+
+	/*
+	 * A gap. Exactly two explanations: the CPU went idle and came back
+	 * (idle_exit_tsc at or after the stamp we're about to overwrite), or
+	 * it was a genuine host preemption. See account_idle_time()'s
+	 * ivh_vact_idle_exit_tsc write (kernel/sched/cputime.c) for the other
+	 * half of this test.
+	 */
+	if ((s64)(rq->ivh_vact_idle_exit_tsc - old) >= 0) {
+		rq->ivh_vact_burst_start_tsc = rq->ivh_vact_idle_exit_tsc;
+		rq->ivh_vact_idle_explained++;
+	} else {
+		rq->ivh_vact_last_active_c    = old - rq->ivh_vact_burst_start_tsc;
+		rq->ivh_vact_last_preempt_tsc = now;
+		rq->ivh_vact_burst_start_tsc  = now;
+		rq->ivh_vact_jumps++;
+	}
+}
+
+/*
  * ivh_uc_tick - one tick's worth of the "uc" (used-capacity) signal, the
  * ivh_cap_source=3 input production actually runs (sec 1.5 item 2).
  * Called from account_process_tick() (kernel/sched/cputime.c). One-tick lag

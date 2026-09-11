@@ -13769,15 +13769,24 @@ static __always_inline unsigned long ivh_gate_capacity(struct rq *rq, unsigned l
  * ivh_gate_time_left_reject - Gate 2's "time left" verdict. Returns true to
  * REJECT (enough runway remains, so no migration is warranted).
  *
- * Production also has a TSC-native branch (ivh_preempt_event_source==2)
- * feeding this from Part C's rq->ivh_vact_* fields. Not ported: production
- * itself leaves ivh_preempt_event_source at its compiled default of 0 (sec
- * 1.4 item 6, a documented script-drift gap, not the intended
- * configuration), so the real shipped kernel never actually takes that
- * branch either -- omitting it here reproduces production's ACTUAL
- * behavior, not a simplification of it.
+ * @tsc_pe selects the preemption-event series (G-LOCK-23: now ported, the
+ * minimal Part C subset -- see kernel/sched/core.c's ivh_vact_tick()).
+ * When set, every term is computed in raw TSC cycles and converted to ns AT
+ * THE POINT OF USE, because the formula unavoidably mixes them with
+ * last_cs_ns and ivh_time_left_threshold_ns, both nanoseconds. Note what is
+ * NOT done: an absolute TSC value is never compared against an absolute
+ * sched_clock() value -- only DURATIONS cross the unit boundary ("cycles
+ * since the last preemption event", "length of the last burst"), because
+ * the two clocks share no epoch and comparing their absolute values would
+ * be a silently meaningless gate. Ported verbatim from kernel-43-clean's
+ * ivh_gate_time_left_reject(), same reasoning, same care.
+ *
+ * rq->last_idle_tp's TSC counterpart is rq->ivh_vact_idle_exit_tsc, written
+ * at the same instant in account_idle_time() (kernel/sched/cputime.c), so
+ * the max() has the same meaning in both branches below.
  */
-static __always_inline bool ivh_gate_time_left_reject(struct rq *rq, u64 last_cs_ns)
+static __always_inline bool ivh_gate_time_left_reject(struct rq *rq, u64 last_cs_ns,
+						      bool tsc_pe)
 {
 	if (!READ_ONCE(ivh_time_left_source)) {
 		/* Original formula. ewma_act_ns has no in-tree writer in this
@@ -13791,7 +13800,9 @@ static __always_inline bool ivh_gate_time_left_reject(struct rq *rq, u64 last_cs
 		if (ewma == 0)
 			return false;
 
-		act_sofar = sched_clock() - rq->last_preemption;
+		act_sofar = tsc_pe
+			? ivh_tsc_cycles_to_ns(ivh_raw_tsc() - rq->ivh_vact_last_preempt_tsc)
+			: sched_clock() - rq->last_preemption;
 
 		return ewma > act_sofar &&
 		       (ewma - act_sofar) >= ivh_time_left_threshold_ns;
@@ -13799,11 +13810,23 @@ static __always_inline bool ivh_gate_time_left_reject(struct rq *rq, u64 last_cs
 
 	{
 		/* Later tree's formula -- the one production actually runs. */
-		u64 last_active = rq->last_active_time;
-		u64 elapsed_since_active = sched_clock() -
-			max(rq->last_preemption, (u64)rq->last_idle_tp);
-		s64 runway = (s64)last_active - (s64)elapsed_since_active;
-		s64 time_left = runway - (s64)last_cs_ns;
+		u64 last_active, elapsed_since_active;
+		s64 runway, time_left;
+
+		if (tsc_pe) {
+			u64 ref = max(rq->ivh_vact_last_preempt_tsc,
+				      rq->ivh_vact_idle_exit_tsc);
+
+			last_active = ivh_tsc_cycles_to_ns(rq->ivh_vact_last_active_c);
+			elapsed_since_active = ivh_tsc_cycles_to_ns(ivh_raw_tsc() - ref);
+		} else {
+			last_active = rq->last_active_time;
+			elapsed_since_active = sched_clock() -
+				max(rq->last_preemption, (u64)rq->last_idle_tp);
+		}
+
+		runway = (s64)last_active - (s64)elapsed_since_active;
+		time_left = runway - (s64)last_cs_ns;
 
 		return last_active != 0 &&
 		       time_left > (s64)ivh_time_left_threshold_ns;
@@ -13819,13 +13842,14 @@ static __always_inline bool ivh_gate_time_left_reject(struct rq *rq, u64 last_cs
 static __always_inline bool ivh_steal_imminent(struct rq *rq)
 {
 	unsigned long cap_src = READ_ONCE(ivh_cap_source);
+	bool tsc_pe = READ_ONCE(ivh_preempt_event_source) == 2;
 
 	if (ivh_gate_capacity(rq, cap_src) > ivh_capacity_threshold) {
 		this_cpu_inc(ivh_steal_imminent_capacity_reject);
 		return false;
 	}
 
-	if (ivh_gate_time_left_reject(rq, current->last_cs_ns)) {
+	if (ivh_gate_time_left_reject(rq, current->last_cs_ns, tsc_pe)) {
 		this_cpu_inc(ivh_steal_imminent_time_left_reject);
 		return false;
 	}
@@ -13846,11 +13870,12 @@ static __always_inline bool ivh_rq_capacity_and_timeleft_ok(struct rq *rq,
 							     struct task_struct *t)
 {
 	unsigned long cap_src = READ_ONCE(ivh_cap_source);
+	bool tsc_pe = READ_ONCE(ivh_preempt_event_source) == 2;
 
 	if (ivh_gate_capacity(rq, cap_src) > ivh_capacity_threshold)
 		return false;
 
-	return !ivh_gate_time_left_reject(rq, t->last_cs_ns);
+	return !ivh_gate_time_left_reject(rq, t->last_cs_ns, tsc_pe);
 }
 
 /**

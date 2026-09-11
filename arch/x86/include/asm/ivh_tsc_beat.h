@@ -83,6 +83,36 @@ extern unsigned long ivh_pv_beat_threshold;
 extern unsigned long ivh_pv_beat_publish_mask;
 
 /*
+ * ivh_pv_tier1_confirm (G-LOCK-25 scoping) -- tier 1 (prev->state !=
+ * VCPU_RUNNING) fires on ANY halted predecessor, but most halted node
+ * predecessors are themselves halted because THEIR OWN predecessor tripped
+ * tier 2, not because of independently-confirmed preemption -- one tier-2
+ * inference walks down the MCS queue tail one cheap byte load at a time
+ * (measured: ~2.77 tier-1 fires per tier-2 fire). A halted vCPU publishes no
+ * heartbeat, so is_wait_preempted() on an already-halted prev is exactly a
+ * "how long has prev actually been down" freshness check, with no new
+ * per-node state needed at all.
+ *   0 (default) = upstream tier-1 behavior, bit-identical: any prev->state
+ *     != VCPU_RUNNING bails immediately.
+ *   1 = SHADOW: run the confirmation check, record agree/disagree, but
+ *     STILL BAIL either way -- zero behavior change, exists to measure the
+ *     confirmation's selectivity (is it a filter or an indiscriminate
+ *     throttle?) before anything real depends on it.
+ *   2 = AUTHORITATIVE: an unconfirmed tier-1 trip (heartbeat still reads
+ *     fresh) does NOT bail; only a confirmed-stale predecessor does.
+ * Only reachable when ivh_adaptive_mode == ADAPTIVE (modes VANILLA and
+ * PURE_IPI are untouched); value 2 is refused unless ivh_pv_preempt_src == 2
+ * (see ivh_pv_proc_tier1_confirm(), arch/x86/kernel/kvm.c) -- at src == 0,
+ * is_wait_preempted() is hardwired to vcpu_is_preempted(), which is
+ * hardwired false on any host without a real steal-time page (this one
+ * included), so authoritative confirm at src == 0 would silently suppress
+ * every single tier-1 bail. Default 0: the sign of this trade is not proven,
+ * same posture as ivh_adaptive_irqoff_bail_gate and ivh_pv_spin_threshold's
+ * own "bail later" experiment, which measured ~9% SLOWER.
+ */
+extern unsigned long ivh_pv_tier1_confirm;
+
+/*
  * Shadow-comparator validation counters and the threshold-tuning histograms,
  * defined in arch/x86/kernel/kvm.c. Plain DEFINE_PER_CPU(u64, ...) rather
  * than lockevent_*: CONFIG_LOCK_EVENT_COUNTS is not set on this build.
@@ -232,37 +262,137 @@ DECLARE_PER_CPU(u64, ivh_head_yield_ok_tier2_spinning);
 DECLARE_PER_CPU(u64, ivh_head_spinning_prearm);
 
 /*
- * Mode-collapse canaries (2026-09-05 rebuild): the wake-vehicle contract for
- * ivh_adaptive_mode is machine-checkable, not just documented. Exactly one of
- * these increments per __pv_queued_spin_unlock_slowpath() wake:
- *   mode 0 (VANILLA)   -> ivh_wake_hypercall only, ivh_wake_ipi == 0
- *   mode 1/2 (non-zero) -> ivh_wake_ipi only, ivh_wake_hypercall == 0
- * A nonzero ivh_wake_hypercall while ivh_adaptive_mode != 0 (or vice versa)
- * means the single shared wake helper in arch/x86/kernel/kvm.c has a bug --
- * this replaces the two independently-evolved, silently-diverging kick knobs
- * the pre-rebuild code had.
+ * Mode-collapse canaries (2026-09-05 rebuild; contract updated
+ * G-LOCK-22-hybrid): the wake-vehicle contract is machine-checkable, not
+ * just documented. Exactly one of these increments per
+ * __pv_queued_spin_unlock_slowpath() wake, and the vehicle is now a
+ * function of (mode, ivh_pv_allowed()), NOT of mode alone:
+ *   ivh_mode_uses_hypercall(mode) true  -> ivh_wake_hypercall only,
+ *                                          ivh_wake_ipi == 0
+ *   ivh_mode_uses_hypercall(mode) false -> ivh_wake_ipi only,
+ *                                          ivh_wake_hypercall == 0
+ * Concretely: mode PURE_IPI is unconditionally the second row; modes VANILLA
+ * and ADAPTIVE are BOTH the first row whenever ivh_pv_allowed(), otherwise
+ * the second -- treated identically, since ivh_pv_allow is a simulated-
+ * environment override that has to look the same to every mode that
+ * consults the real feature bit, not just to ADAPTIVE. So ivh_wake_hypercall
+ * > 0 while ivh_adaptive_mode == ADAPTIVE is EXPECTED when PV is allowed --
+ * this is the one bit of the pre-G-LOCK-22-hybrid contract that changed; do
+ * not mistake it for the bug this canary exists to catch. See
+ * <asm/qspinlock.h>'s ivh_mode_uses_hypercall().
+ *
+ * One more exception, VANILLA-only: when !ivh_pv_allowed(), VANILLA sends
+ * NEITHER vehicle (see ivh_wake_vanilla_nopv_noop below) -- it is the only
+ * mode whose wait side never halts in that case, so it has nothing to wake.
  */
 DECLARE_PER_CPU(u64, ivh_wake_hypercall);
 DECLARE_PER_CPU(u64, ivh_wake_ipi);
 /*
- * Set for the whole duration of ivh_pv_wait()'s VANILLA branch (not just the
- * halt() call), cleared before every return from it. A live 0->nonzero
- * ivh_adaptive_mode write drains against this: modes 1/2 never send the
- * KVM_HC_KICK_CPU hypercall, so a CPU already committed to a bare, RFLAGS.IF=0
- * halt() when the mode flips would otherwise have no wake vehicle left at
- * all -- the 2026-07-24 hard-freeze class. See ivh_pv_proc_adaptive_mode().
+ * Pairs with ivh_wait_vanilla_nopv_spin below. Mode VANILLA's !ivh_pv_allowed()
+ * wake site: correctly a no-op (nobody halted), counted so "did we ever
+ * accidentally IPI here" has a direct answer instead of inferring it from
+ * ivh_wake_ipi staying zero for an unrelated reason.
  */
-DECLARE_PER_CPU(u32, ivh_vanilla_inflight);
+DECLARE_PER_CPU(u64, ivh_wake_vanilla_nopv_noop);
 /*
- * Counts the one irreducible gap between "vanilla" and modes 1/2: a waiter
- * that reaches ivh_pv_wait() with IRQs already disabled cannot halt in modes
- * 1/2 (no hypercall means no pv_unhalted latch, and a maskable IPI cannot
- * wake an IF=0 HLT) and instead falls through to an uninstrumented
- * cpu_relax() loop. Large values mean a given workload's irqsave-held-lock
- * population is making modes 1/2 materially less halt-y than mode 0, which
- * matters for interpreting any comparison against it.
+ * Set for the whole duration of ivh_pv_wait()'s PV-native-halt branch (not
+ * just the halt() call), cleared before every return from it. Renamed from
+ * ivh_vanilla_inflight (G-LOCK-22-hybrid): mode ADAPTIVE now takes this same
+ * branch whenever ivh_pv_allowed(), so it must be tracked too, not just
+ * mode VANILLA. A live ivh_adaptive_mode write whose OLD mode used the
+ * hypercall and NEW mode doesn't drains against this: the non-hypercall
+ * modes never send KVM_HC_KICK_CPU, so a CPU already committed to a bare,
+ * RFLAGS.IF=0 halt() when the mode flips would otherwise have no wake
+ * vehicle left at all -- the 2026-07-24 hard-freeze class. See
+ * ivh_pv_proc_adaptive_mode() / ivh_mode_uses_hypercall().
+ */
+DECLARE_PER_CPU(u32, ivh_pv_halt_inflight);
+/*
+ * G-LOCK-22-hybrid partition counters for ivh_pv_wait(). Every
+ * ivh_pv_wait_calls falls into EXACTLY ONE of these five -- asserting that
+ * exhaustive partition in the test harness is what proves no sub-population
+ * is silently uncounted, the exact failure mode that produced weeks of null
+ * tier-2 A/B results earlier in this project:
+ *   ivh_wait_pv_halt_irqoff    - PV-native halt, IRQs already off at entry
+ *                                (bare halt(), mode VANILLA or ADAPTIVE)
+ *   ivh_wait_pv_halt_irqon     - PV-native halt, IRQs on at entry
+ *                                (safe_halt(), mode VANILLA or ADAPTIVE)
+ *   ivh_wait_ipi_halt_irqon    - IPI-wake halt, IRQs on at entry
+ *                                (safe_halt(), mode PURE_IPI always, or
+ *                                ADAPTIVE without PV)
+ *   ivh_wait_irqoff_nohalt     - no hypercall available, IRQs already off:
+ *                                busy-spin only (mode PURE_IPI, or ADAPTIVE
+ *                                without PV -- see below)
+ *   ivh_wait_vanilla_nopv_spin - mode VANILLA with !ivh_pv_allowed(): busy-
+ *                                spin only, unconditionally (VANILLA never
+ *                                even checks irqs_disabled() in this case)
+ */
+DECLARE_PER_CPU(u64, ivh_wait_pv_halt_irqoff);
+DECLARE_PER_CPU(u64, ivh_wait_pv_halt_irqon);
+DECLARE_PER_CPU(u64, ivh_wait_ipi_halt_irqon);
+/*
+ * Counts the one irreducible gap left once PV-native halt covers the IF=0
+ * case whenever it's allowed: a waiter that reaches ivh_pv_wait() with IRQs
+ * already disabled AND no hypercall available (mode PURE_IPI always, or mode
+ * ADAPTIVE with !ivh_pv_allowed()) cannot halt at all (no hypercall means no
+ * pv_unhalted latch, and a maskable IPI cannot wake an IF=0 HLT) and instead
+ * falls through to an uninstrumented cpu_relax() loop. Large values mean a
+ * given workload's irqsave-held-lock population is making that config
+ * materially less halt-y than PV-native, which matters for interpreting any
+ * comparison against it.
  */
 DECLARE_PER_CPU(u64, ivh_wait_irqoff_nohalt);
+DECLARE_PER_CPU(u64, ivh_wait_vanilla_nopv_spin);
+/*
+ * pv_wait_early()'s G-LOCK-22-hybrid early-bail suppression firing count
+ * (kernel/locking/qspinlock_paravirt.h) -- see ivh_adaptive_irqoff_bail_gate
+ * (arch/x86/kernel/kvm.c) for what this gates and why it defaults off.
+ * Must-have, not decoration: without it, ivh_beat_tier1_fired's denominator
+ * silently loses a population whenever the gate is on.
+ */
+DECLARE_PER_CPU(u64, ivh_earlybail_suppressed);
+
+/*
+ * G-LOCK-25 scoping: per-bail-cause halt-duration accounting for
+ * pv_wait_node()'s pv_wait() call (kernel/locking/qspinlock_paravirt.h).
+ * Behavior-neutral -- these are read, never acted on. Answers the question
+ * ivh_lock_halt's aggregate hlt_cycles/hlt_events cannot: does the blocked
+ * duration for a TIER-1-caused halt actually clear the fixed cost of taking
+ * one (a real hypercall/vmexit round trip), or is tier 1 (mostly cascading
+ * off tier-2-induced halts, see ivh_pv_tier1_confirm above) paying that fixed
+ * cost for waits that were about to resolve anyway?
+ *
+ * Indexed by enum pv_bail_cause. PV_BAIL_TIER1_AGREED/_DISAGREED are only
+ * distinguished when ivh_pv_tier1_confirm != 0; at confirm == 0 every tier-1
+ * bail is recorded as plain PV_BAIL_TIER1 (no verdict computed, none to
+ * record). Exhaustive partition: sum over all PV_BAIL_* must equal
+ * ivh_halt_from_node exactly -- assert this in the test harness.
+ */
+enum pv_bail_cause {
+	PV_BAIL_NONE = 0,
+	PV_BAIL_TIER1,			/* confirm==0: no verdict computed */
+	PV_BAIL_TIER1_AGREED,		/* confirm!=0: heartbeat ALSO reads stale */
+	PV_BAIL_TIER1_DISAGREED,	/* confirm!=0: heartbeat reads FRESH */
+	PV_BAIL_TIER2,
+	PV_BAIL_EXHAUST,		/* SPIN_THRESHOLD ran out, no early bail */
+	PV_BAIL_COUNT
+};
+
+DECLARE_PER_CPU(u64, ivh_node_halt_cycles[PV_BAIL_COUNT]);
+DECLARE_PER_CPU(u64, ivh_node_halt_events[PV_BAIL_COUNT]);
+DECLARE_PER_CPU(u64, ivh_node_halt_hist[PV_BAIL_COUNT][IVH_BEAT_AGE_HIST_BUCKETS]);
+
+/*
+ * ivh_pv_tier1_confirm's own counters -- see the knob's comment above for
+ * the 0/1/2 semantics. _checked/_agreed/_disagreed only increment at
+ * confirm != 0 (mirrors ivh_beat_tier2_checked/_fired's own posture: cost is
+ * paid only when someone might act on the answer). ivh_tier1_suppressed is
+ * confirm==2 only -- the count of tier-1 trips that did NOT bail.
+ */
+DECLARE_PER_CPU(u64, ivh_tier1_confirm_checked);
+DECLARE_PER_CPU(u64, ivh_tier1_confirm_agreed);
+DECLARE_PER_CPU(u64, ivh_tier1_confirm_disagreed);
+DECLARE_PER_CPU(u64, ivh_tier1_suppressed);
 
 /*
  * Publish this CPU's heartbeat. rdtsc(), NOT rdtsc_ordered() -- this is a

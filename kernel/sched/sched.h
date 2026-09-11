@@ -152,6 +152,28 @@ extern void ivh_tick_steal_accumulate(void);	/* kernel/sched/core.c */
 extern int  is_cpu_preempted(int cpunum);	/* kernel/sched/cputime.c */
 
 /*
+ * G-LOCK-23: minimal Part C ("ivh_vact") port. ivh_preempt_event_source
+ * selects which clock ivh_gate_time_left_reject() reads its preemption-event
+ * terms from: 0 (default) = the existing real-but-dead-on-this-host
+ * paravirt_steal_clock()-derived rq->last_preemption/last_active_time path
+ * (requires KVM_FEATURE_STEAL_TIME, confirmed absent on this host); 2 =
+ * ivh_vact_tick()'s TSC-native, steal-time-independent jump detector below.
+ * Value 1 (production's ewma_act_ns/vsched_module path) is not ported --
+ * that field has no in-tree writer here either, same posture as
+ * ivh_steal_source's dropped value 1 above -- its validating handler
+ * refuses it outright.
+ */
+extern unsigned long ivh_preempt_event_source;	/* kernel/sched/bpf_sched.c */
+extern void ivh_vact_tick(void);		/* kernel/sched/core.c */
+/*
+ * ivh_vact_tick()'s own jump-vs-noise threshold, in nanoseconds (converted
+ * to raw TSC cycles at the point of use). Deliberately independent of
+ * ivh_pv_beat_threshold (arch/x86/kernel/kvm.c) -- see ivh_vact_tick()'s
+ * comment for why reusing that knob was a real bug.
+ */
+extern unsigned long ivh_vact_jump_ns;		/* kernel/sched/bpf_sched.c */
+
+/*
  * IVH per-CPU TSC heartbeat and raw-TSC<->ns helpers (Step 4/6). The real
  * implementation is x86-only; everything else gets the no-op fallbacks
  * below so the generic tick path in kernel/sched/{core,cputime}.c stays
@@ -1451,6 +1473,32 @@ struct rq {
 	u64			ivh_tks_samples;
 	u64			ivh_tks_events;
 	u64			ivh_tks_skipped;
+
+	/*
+	 * G-LOCK-23: minimal Part C ("ivh_vact") port -- ONLY the fields
+	 * ivh_gate_time_left_reject()'s tsc_pe==true branch actually reads,
+	 * plus two pure-instrumentation counters kept because this tree has
+	 * no /proc/ivh_debug to read a verdict from otherwise (verification
+	 * is via ivh_vact_jumps/_idle_explained directly on struct rq,
+	 * bpftrace/drgn). Deliberately NOT the full Part C system: no
+	 * capacity/EMA estimator (ivh_vact_capacity and friends), no
+	 * residual-split state, no window accumulation, no shadow-compare
+	 * counters -- all of that feeds Gate 1 or diagnostics this port does
+	 * not need, confirmed by reading kernel-43-clean's ivh_vact_tick()
+	 * and ivh_gate_capacity() directly, not by assumption. See
+	 * ivh_vact_tick() (kernel/sched/core.c) and account_idle_time()'s
+	 * one-line addition (kernel/sched/cputime.c) for the two writers.
+	 * Zero-initialized at rq creation like every other field here; no
+	 * sched_init() change needed -- BSS-zero is the correct "unseeded"
+	 * state ivh_vact_tick()'s own `!old` branch already handles.
+	 */
+	u64			ivh_vact_stamp;
+	u64			ivh_vact_idle_exit_tsc;
+	u64			ivh_vact_burst_start_tsc;
+	u64			ivh_vact_last_preempt_tsc;
+	u64			ivh_vact_last_active_c;
+	u64			ivh_vact_jumps;		/* instrumentation */
+	u64			ivh_vact_idle_explained;	/* instrumentation */
 };
 
 #ifdef CONFIG_FAIR_GROUP_SCHED

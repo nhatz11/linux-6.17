@@ -21,6 +21,7 @@
 #include <linux/hardirq.h>
 #include <linux/mutex.h>
 #include <linux/prefetch.h>
+#include <linux/sched/clock.h>
 #include <asm/byteorder.h>
 #include <asm/qspinlock.h>
 #include <trace/events/lock.h>
@@ -30,6 +31,62 @@
  */
 #include "qspinlock.h"
 #include "qspinlock_stat.h"
+
+/*
+ * G-LOCK-23: mode-agnostic contended-acquisition wait-time accounting (see
+ * <asm/qspinlock.h> for ivh_slowpath_wait_measure's declaration and the full
+ * rationale/precedent). Defined here, inside the #ifndef _GEN_PV_LOCK_SLOWPATH
+ * guard, so exactly one copy of each function exists even though this file
+ * is compiled twice; the CALL SITES inside queued_spin_lock_slowpath() below
+ * are outside this guard and do get compiled twice, once per mode variant,
+ * which is the whole point.
+ *
+ * Gating matches every other optional IVH knob: one predicted branch of a
+ * read-mostly global when off, no clock read at all.
+ *
+ * in_interrupt() exclusion restored from the migration-engine precedent
+ * (ivh_obs_wait_begin(), commit 194f859759c7) after round-review flagged its
+ * absence as a real measurement-fidelity bug, not just a style deviation: a
+ * spin waiter runs with IRQs on on some paths, and a hardirq/softirq landing
+ * mid-wait that contends on a DIFFERENT lock would otherwise be counted as
+ * its own nested interval while those same nanoseconds are still inside the
+ * outer frame's span -- summing overlapping intervals, not disjoint ones.
+ * Since how much of a wait happens IRQs-on differs BY MODE (e.g. mode
+ * ADAPTIVE's safe_halt() path vs. an IRQs-off busy-spin corner), that bias
+ * would not cancel out across the exact comparison this counter exists to
+ * support. Excluding interrupt-context entries entirely is the same choice
+ * the precedent made, for the same reason.
+ */
+static __always_inline u64 ivh_slowpath_wait_begin(void)
+{
+	if (likely(!READ_ONCE(ivh_slowpath_wait_measure)) || in_interrupt())
+		return 0;
+	return sched_clock();
+}
+
+static __always_inline void ivh_slowpath_wait_end(u64 start)
+{
+	u64 now;
+
+	if (!start)
+		return;
+
+	/*
+	 * Guard against a backwards TSC (unstable/unsynced across a vCPU
+	 * migration -- CONFIG_HAVE_UNSTABLE_SCHED_CLOCK is set on this
+	 * config and native_sched_clock() keeps using the TSC even when
+	 * marked unstable). start/now are always read on the same CPU
+	 * (preemption is disabled across the whole slowpath), so this can
+	 * only trip on a genuine backwards step, not cross-CPU skew -- but
+	 * with no reset path for this accumulator, a single unguarded
+	 * underflow would silently add ~2^64 ns to it forever.
+	 */
+	now = sched_clock();
+	if (now > start) {
+		this_cpu_add(ivh_slowpath_wait_ns, now - start);
+		this_cpu_inc(ivh_slowpath_wait_events);
+	}
+}
 
 /*
  * The basic principle of a queue-based spinlock can best be understood
@@ -136,6 +193,10 @@ static __always_inline u32  __pv_wait_head_or_lock(struct qspinlock *lock,
 void __lockfunc queued_spin_lock_slowpath(struct qspinlock *lock, u32 val)
 {
 	struct mcs_spinlock *prev, *next, *node;
+	/* G-LOCK-23: entry here IS the point of genuine contention -- the
+	 * inline fast-path cmpxchg has already failed. See ivh_slowpath_wait_begin()
+	 * in <asm/qspinlock.h> for the mode-agnostic design rationale. */
+	u64 ivh_wait_start = ivh_slowpath_wait_begin();
 	u32 old, tail;
 	int idx;
 
@@ -157,8 +218,11 @@ void __lockfunc queued_spin_lock_slowpath(struct qspinlock *lock, u32 val)
 	if (pv_enabled())
 		goto pv_queue;
 
-	if (virt_spin_lock(lock))
+	if (virt_spin_lock(lock)) {
+		/* test-and-set fallback acquired it */
+		ivh_slowpath_wait_end(ivh_wait_start);
 		return;
+	}
 
 	/*
 	 * Wait for in-progress pending->locked hand-overs with a bounded
@@ -222,6 +286,8 @@ void __lockfunc queued_spin_lock_slowpath(struct qspinlock *lock, u32 val)
 	 */
 	clear_pending_set_locked(lock);
 	lockevent_inc(lock_pending);
+	/* acquired via the pending bit; waiting done */
+	ivh_slowpath_wait_end(ivh_wait_start);
 	return;
 
 	/*
@@ -391,6 +457,10 @@ locked:
 
 release:
 	trace_contention_end(lock, 0);
+	/* Covers every goto release: (no-node fallback, post-init trylock,
+	 * uncontended cmpxchg) as well as the contended fallthrough -- all of
+	 * them are acquisitions. */
+	ivh_slowpath_wait_end(ivh_wait_start);
 
 	/*
 	 * release the node

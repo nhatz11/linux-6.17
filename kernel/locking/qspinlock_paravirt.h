@@ -327,7 +327,7 @@ static struct pv_node *pv_unhash(struct qspinlock *lock)
  * ONE rdtsc, not two: ivh_beat_age() is called once and both the verdict and
  * the histogram sample are derived from that single reading.
  */
-static inline bool is_wait_preempted(int cpu)
+static inline bool is_wait_preempted(int cpu, bool tier2)
 {
 	unsigned long src = READ_ONCE(ivh_pv_preempt_src);
 	s64 age, min_age;
@@ -346,10 +346,30 @@ static inline bool is_wait_preempted(int cpu)
 	 * threshold's real fire rate is measurable in the one configuration
 	 * (src==2) that actually acts on it. See ivh_tsc_beat.h for why this
 	 * was missing.
+	 *
+	 * G-LOCK-25: this function now has a SECOND call site --
+	 * ivh_pv_tier1_confirm's tier-1 confirmation check
+	 * (kernel/locking/qspinlock_paravirt.h's pv_wait_early()). That call
+	 * is answering a different question ("is THIS specific prev actually
+	 * stale" for a node that already looked non-running) than tier 2's own
+	 * call ("does prev look preempted at all"), so it must NOT be folded
+	 * into ivh_beat_tier2_checked/_fired or ivh_beat_age_hist_raw --
+	 * mixing the two populations would corrupt tier 2's own fire-rate
+	 * measurement with confirm-check traffic. `tier2` selects which
+	 * counter pair this call increments; the callee cannot infer it from
+	 * `src` alone since both call sites can be live at the same time.
 	 */
-	this_cpu_inc(ivh_beat_tier2_checked);
-	if (beat)
-		this_cpu_inc(ivh_beat_tier2_fired);
+	if (tier2) {
+		this_cpu_inc(ivh_beat_tier2_checked);
+		if (beat)
+			this_cpu_inc(ivh_beat_tier2_fired);
+	} else {
+		this_cpu_inc(ivh_tier1_confirm_checked);
+		if (beat)
+			this_cpu_inc(ivh_tier1_confirm_agreed);
+		else
+			this_cpu_inc(ivh_tier1_confirm_disagreed);
+	}
 
 	/*
 	 * Unconditional (src==1 AND src==2) raw age histogram -- added
@@ -365,8 +385,13 @@ static inline bool is_wait_preempted(int cpu)
 	 * Same log2 bucketing as the existing histogram, deliberately: bucket
 	 * i is 2^i..2^(i+1)-1 cycles, bucket 0 absorbs zero/negative age, top
 	 * bucket saturates.
+	 *
+	 * G-LOCK-25: gated on `tier2` for the same reason as the counters
+	 * above -- this histogram exists to characterize tier 2's OWN age
+	 * distribution; confirm-check traffic answering a different question
+	 * must not be mixed into it.
 	 */
-	{
+	if (tier2) {
 		int raw_bucket = (age > 0) ? ilog2((u64)age) : 0;
 
 		if (raw_bucket >= IVH_BEAT_AGE_HIST_BUCKETS)
@@ -450,11 +475,11 @@ static inline bool is_wait_preempted(int cpu)
  * The src check is placed FIRST and reads a read-mostly global, so the
  * default path is one predicted branch and no rdtsc.
  */
-static __always_inline void ivh_beat_publish_in_spin(int loop)
+static __always_inline void ivh_beat_publish_in_spin(unsigned long loop)
 {
 	if (likely(!READ_ONCE(ivh_pv_preempt_src)))
 		return;
-	if (loop & (int)READ_ONCE(ivh_pv_beat_publish_mask))
+	if (loop & READ_ONCE(ivh_pv_beat_publish_mask))
 		return;
 
 	ivh_tsc_beat_publish();
@@ -462,18 +487,124 @@ static __always_inline void ivh_beat_publish_in_spin(int loop)
 }
 
 /*
- * Return true if when it is time to check the previous node which is not
- * in a running state.
+ * G-LOCK-25 scoping: record how many raw TSC cycles ONE pv_wait() call
+ * actually blocked for, bucketed by why the waiter decided to stop spinning
+ * (enum pv_bail_cause). Behavior-neutral -- this only reads, records, and
+ * returns; nothing here feeds back into any decision. Same log2 bucketing
+ * as ivh_beat_age_hist_raw, for the same reason (a real wait distribution is
+ * heavy-tailed; a mean alone would hide exactly the short-halt population
+ * this exists to characterize).
  */
-static inline bool
-pv_wait_early(struct pv_node *prev, int loop)
+static __always_inline void ivh_node_halt_record(enum pv_bail_cause cause, u64 cycles)
 {
-	if ((loop & PV_PREV_CHECK_MASK) != 0)
-		return false;
+	int bucket = cycles ? ilog2(cycles) : 0;
 
-	if (READ_ONCE(prev->state) != VCPU_RUNNING) {
+	if (bucket >= IVH_BEAT_AGE_HIST_BUCKETS)
+		bucket = IVH_BEAT_AGE_HIST_BUCKETS - 1;
+
+	this_cpu_add(ivh_node_halt_cycles[cause], cycles);
+	this_cpu_inc(ivh_node_halt_events[cause]);
+	this_cpu_inc(ivh_node_halt_hist[cause][bucket]);
+}
+
+/*
+ * Return the reason (enum pv_bail_cause) this waiter should stop spinning
+ * and halt, or PV_BAIL_NONE if it's not time to check yet / nothing fired.
+ *
+ * G-LOCK-25: was `bool`; widened to a cause so pv_wait_node() can record
+ * per-bail-cause halt-duration histograms without re-deriving why a given
+ * pass bailed. Every existing `return true`/`return false` site below maps
+ * 1:1 onto a truthy/PV_BAIL_NONE enum value, so this is a pure signature
+ * widening, not a behavior change by itself.
+ */
+static inline enum pv_bail_cause
+pv_wait_early(struct pv_node *prev, unsigned long loop)
+{
+	unsigned long mode;
+
+	if ((loop & PV_PREV_CHECK_MASK) != 0)
+		return PV_BAIL_NONE;
+
+	mode = READ_ONCE(ivh_adaptive_mode);
+
+	/*
+	 * G-LOCK-22-hybrid: for mode ADAPTIVE only, and only when the sysctl
+	 * below is on, suppress early bail entirely when there is nowhere
+	 * productive to bail TO -- !ivh_pv_allowed() (no hypercall available)
+	 * and irqs_disabled() (the eventual ivh_pv_wait() call is just going
+	 * to busy-spin no matter when it's reached, see its comment). Bailing
+	 * early in that case doesn't change the FINAL wait behavior, it only
+	 * moves this waiter to pv_kick_node()'s _Q_SLOW_VAL/hash bookkeeping
+	 * sooner, forcing the eventual unlocker onto the slow-unlock path and
+	 * a real, unneeded IPI on a third CPU's critical path. Default OFF:
+	 * the sign of this trade is not proven, see the sysctl's own comment.
+	 * irqs_disabled() is a valid predictor here -- IRQ state is a property
+	 * of the caller's context and cannot change under a spinning waiter.
+	 */
+	if (mode == IVH_MODE_ADAPTIVE && READ_ONCE(ivh_adaptive_irqoff_bail_gate) &&
+	    !ivh_pv_allowed() && irqs_disabled()) {
+		this_cpu_inc(ivh_earlybail_suppressed);
+		return PV_BAIL_NONE;
+	}
+
+	/*
+	 * G-LOCK-21-spin: ivh_pv_tier1_enable == 0 removes tier 1 entirely --
+	 * a waiter then only ever bails early via tier 2 below (and only then
+	 * if ivh_adaptive_mode == ADAPTIVE and ivh_pv_preempt_src != 0; outside
+	 * that, disabling tier 1 leaves NO early-bail signal at all, and a
+	 * waiter only stops spinning by exhausting ivh_pv_spin_threshold).
+	 * Default 1 reproduces stock behavior exactly -- tier 1 is upstream's
+	 * entire pv_wait_early() check.
+	 */
+	if (READ_ONCE(ivh_pv_tier1_enable) &&
+	    READ_ONCE(prev->state) != VCPU_RUNNING) {
+		unsigned long confirm = READ_ONCE(ivh_pv_tier1_confirm);
+
+		/*
+		 * G-LOCK-25: prev->state == VCPU_HALTED is a FACT about prev,
+		 * not a guess -- but it carries no information about HOW LONG
+		 * prev has been down, and under mode ADAPTIVE most halted node
+		 * predecessors are halted because THEIR OWN predecessor
+		 * tripped tier 2, so one tier-2 inference walks down the queue
+		 * tail one cheap byte load at a time (measured: ~2.77 tier-1
+		 * fires per tier-2 fire).
+		 *
+		 * A halted vCPU publishes no heartbeat (see ivh_beat_publish_
+		 * in_spin() and account_process_tick()'s tick-driven publish,
+		 * both skipped while halted), so is_wait_preempted() on an
+		 * already-halted prev is exactly a "how long has prev been
+		 * down" freshness check, needing no new per-node state.
+		 *
+		 * confirm==0: unchanged, bail immediately (upstream behavior).
+		 * confirm==1: SHADOW -- compute the verdict, record it, STILL
+		 *   BAIL either way. Zero behavior change; exists to measure
+		 *   whether confirmation is a genuine filter (short surviving
+		 *   halts, long suppressed ones) or an indiscriminate throttle
+		 *   (same distribution, just fewer) before anything acts on it.
+		 * confirm==2: authoritative -- an unconfirmed trip (heartbeat
+		 *   still reads fresh) does not bail.
+		 *
+		 * Default 0 because the sign of this trade is NOT proven: this
+		 * is a "bail later instead of earlier" change, and the closely
+		 * analogous ivh_pv_spin_threshold experiment measured ~9%
+		 * SLOWER. Same posture and precedent as
+		 * ivh_adaptive_irqoff_bail_gate above.
+		 */
+		if (mode == IVH_MODE_ADAPTIVE && confirm) {
+			if (is_wait_preempted(prev->cpu, false)) {
+				this_cpu_inc(ivh_beat_tier1_fired);
+				return PV_BAIL_TIER1_AGREED;
+			}
+			if (confirm == 2) {
+				this_cpu_inc(ivh_tier1_suppressed);
+				return PV_BAIL_NONE;
+			}
+			this_cpu_inc(ivh_beat_tier1_fired);
+			return PV_BAIL_TIER1_DISAGREED;
+		}
+
 		this_cpu_inc(ivh_beat_tier1_fired);
-		return true;
+		return PV_BAIL_TIER1;
 	}
 
 	/*
@@ -486,10 +617,10 @@ pv_wait_early(struct pv_node *prev, int loop)
 	 * re-checks node->locked regardless; this only changes *when* we
 	 * transition from hot-spin to halt.
 	 */
-	if (READ_ONCE(ivh_adaptive_mode) != IVH_MODE_ADAPTIVE)
-		return false;
+	if (mode != IVH_MODE_ADAPTIVE)
+		return PV_BAIL_NONE;
 
-	return is_wait_preempted(prev->cpu);
+	return is_wait_preempted(prev->cpu, true) ? PV_BAIL_TIER2 : PV_BAIL_NONE;
 }
 
 /*
@@ -536,10 +667,20 @@ static void pv_wait_node(struct mcs_spinlock *node, struct mcs_spinlock *prev,
 	struct pv_node *pn = (struct pv_node *)node;
 	struct pv_node *pp = (struct pv_node *)prev;
 	bool wait_early;
-	int loop;
+	enum pv_bail_cause cause = PV_BAIL_NONE;
+	unsigned long loop;
+	unsigned long threshold;
+	u64 halt_tsc;
 
 	for (;;) {
-		for (wait_early = false, loop = SPIN_THRESHOLD; loop; loop--) {
+		/*
+		 * G-LOCK-21-spin: read once per attempt, not per iteration --
+		 * a live sysctl change only takes effect on the next attempt,
+		 * never mid-spin, so SPIN_THRESHOLD - loop accounting below
+		 * stays internally consistent within a single attempt.
+		 */
+		threshold = READ_ONCE(ivh_pv_spin_threshold);
+		for (wait_early = false, loop = threshold; loop; loop--) {
 			/*
 			 * node->locked stays UNCONDITIONALLY FIRST. That is
 			 * also the mitigation for sec 2.2's "one real hole":
@@ -566,11 +707,12 @@ static void pv_wait_node(struct mcs_spinlock *node, struct mcs_spinlock *prev,
 				 * complete, unbiased average over ALL inner-loop passes,
 				 * not just the ones that bailed or exhausted.
 				 */
-				this_cpu_add(ivh_node_spin_success_iters_sum, SPIN_THRESHOLD - loop);
+				this_cpu_add(ivh_node_spin_success_iters_sum, threshold - loop);
 				this_cpu_inc(ivh_node_spin_success_attempts);
 				return;
 			}
-			if (pv_wait_early(pp, loop)) {
+			cause = pv_wait_early(pp, loop);
+			if (cause) {
 				wait_early = true;
 
 				/*
@@ -676,8 +818,20 @@ static void pv_wait_node(struct mcs_spinlock *node, struct mcs_spinlock *prev,
 		 * via the wait_early break above or via natural exhaustion
 		 * (loop == 0).
 		 */
-		this_cpu_add(ivh_node_spin_iters_sum, SPIN_THRESHOLD - loop);
+		this_cpu_add(ivh_node_spin_iters_sum, threshold - loop);
 		this_cpu_inc(ivh_node_spin_attempts);
+
+		/*
+		 * G-LOCK-25: `cause` holds whatever the LAST pv_wait_early()
+		 * call in the loop above returned. If this pass ended via the
+		 * wait_early break, that is the real bail cause. If it ended
+		 * by natural exhaustion (loop == 0, wait_early still false),
+		 * the last call actually returned PV_BAIL_NONE (that's WHY the
+		 * loop kept going) -- override it here, once, rather than
+		 * carrying a stale non-cause into the halt-duration histogram.
+		 */
+		if (!wait_early)
+			cause = PV_BAIL_EXHAUST;
 
 		/*
 		 * Order pn->state vs pn->locked thusly:
@@ -694,7 +848,9 @@ static void pv_wait_node(struct mcs_spinlock *node, struct mcs_spinlock *prev,
 			lockevent_inc(pv_wait_node);
 			lockevent_cond_inc(pv_wait_early, wait_early);
 			this_cpu_inc(ivh_halt_from_node);
+			halt_tsc = ivh_raw_tsc();
 			pv_wait(&pn->state, VCPU_HALTED);
+			ivh_node_halt_record(cause, ivh_raw_tsc() - halt_tsc);
 		}
 
 		/*
@@ -787,7 +943,8 @@ pv_wait_head_or_lock(struct qspinlock *lock, struct mcs_spinlock *node)
 	struct pv_node *pn = (struct pv_node *)node;
 	struct qspinlock **lp = NULL;
 	int waitcnt = 0;
-	int loop;
+	unsigned long loop;
+	unsigned long threshold;
 
 	/*
 	 * If pv_kick_node() already advanced our state, we don't need to
@@ -832,7 +989,9 @@ pv_wait_head_or_lock(struct qspinlock *lock, struct mcs_spinlock *node)
 		 * disable lock stealing before attempting to acquire the lock.
 		 */
 		set_pending(lock);
-		for (loop = SPIN_THRESHOLD; loop; loop--) {
+		/* G-LOCK-21-spin: read once per attempt, see pv_wait_node(). */
+		threshold = READ_ONCE(ivh_pv_spin_threshold);
+		for (loop = threshold; loop; loop--) {
 			if (trylock_clear_pending(lock))
 				goto gotlock;
 			/*
@@ -855,7 +1014,7 @@ pv_wait_head_or_lock(struct qspinlock *lock, struct mcs_spinlock *node)
 		 * mechanism. A sanity check on the accounting, not a variable
 		 * under test.
 		 */
-		this_cpu_add(ivh_head_spin_iters_sum, SPIN_THRESHOLD - loop);
+		this_cpu_add(ivh_head_spin_iters_sum, threshold - loop);
 		this_cpu_inc(ivh_head_spin_attempts);
 
 		if (!lp) { /* ONCE */

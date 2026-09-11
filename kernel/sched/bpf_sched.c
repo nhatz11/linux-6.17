@@ -37,9 +37,15 @@ DEFINE_PER_CPU(u64, ivh_cs_fake_clock_ctr);
  * 0 (declared in include/linux/bpf_sched.h so kernel/locking/spinlock.c can
  * reach it too). Ported verbatim from production except where noted; see
  * this step's commit message for the full exclusion list (Hot Threads,
- * Part C/ivh_vact_*, ivh_uc_shadow/ivh_decision_shadow,
- * ivh_uc_avgcap_enabled, the ivh_ref_* Plan-2 steal estimator, ivh_ka_*
- * idle keepalive, ivh_preempt_event_source/the tsc_pe Gate-2 branch, and
+ * Part C/ivh_vact_* (G-LOCK-23 note: a MINIMAL subset of this -- just the
+ * jump-detector fields ivh_gate_time_left_reject()'s tsc_pe branch reads,
+ * see kernel/sched/core.c's ivh_vact_tick() -- was ported after all; the
+ * capacity/EMA estimator, residual split, window accumulation, and
+ * ivh_vact_capacity itself remain unported, deliberately), ivh_uc_shadow/
+ * ivh_decision_shadow, ivh_uc_avgcap_enabled, the ivh_ref_* Plan-2 steal
+ * estimator, ivh_ka_* idle keepalive (G-LOCK-23 note: ivh_preempt_event_source
+ * and the tsc_pe Gate-2 branch ARE now ported, see below -- this list entry
+ * is stale, kept only so the exclusion list's history stays legible), and
  * the broadcast preempt-migrate mechanism / cfs_spin_len hook).
  */
 unsigned long ivh_universal_eligible = 0UL;
@@ -91,6 +97,71 @@ static int ivh_proc_cap_source(const struct ctl_table *table, int write,
 	WRITE_ONCE(ivh_cap_source, val);
 	return 0;
 }
+
+/*
+ * G-LOCK-23: which preemption-event clock ivh_gate_time_left_reject()'s
+ * (kernel/sched/fair.c) two formulas read their "time since last preemption/
+ * idle-exit" terms from.
+ *   0 (default) = the existing paravirt_steal_clock()-derived
+ *                 rq->last_preemption/last_active_time path -- real code,
+ *                 but requires KVM_FEATURE_STEAL_TIME, confirmed absent on
+ *                 this host, so this is a documented no-op here (matches
+ *                 ewma_act_ns's existing "safe no-op, not a missing
+ *                 feature" posture, same file's comment on that field in
+ *                 kernel/sched/sched.h).
+ *   2            = ivh_vact_tick()'s TSC-native jump detector (kernel/sched/
+ *                 core.c), steal-time-independent, the minimal Part C port
+ *                 this value exists to select.
+ * Value 1 (production's ewma_act_ns/vsched_module path) is not ported --
+ * that field has no in-tree writer in this rebuild either (it is written
+ * exclusively by an out-of-tree module via /proc/vact_write) -- same
+ * posture as ivh_cap_source's refusal of its own unported values above.
+ */
+unsigned long ivh_preempt_event_source = 0UL;
+
+static int ivh_proc_preempt_event_source(const struct ctl_table *table, int write,
+					 void *buffer, size_t *lenp, loff_t *ppos)
+{
+	unsigned long val = READ_ONCE(ivh_preempt_event_source);
+	struct ctl_table tmp = *table;
+	int ret;
+
+	tmp.data = &val;
+	ret = proc_doulongvec_minmax(&tmp, write, buffer, lenp, ppos);
+	if (ret || !write)
+		return ret;
+
+	if (val != 0 && val != 2) {
+		pr_err("IVH: refusing ivh_preempt_event_source=%lu: this rebuild "
+		       "only implements 0 (steal-time path, dead without "
+		       "KVM_FEATURE_STEAL_TIME) and 2 (ivh_vact_tick(), TSC-native) "
+		       "-- 1 (ewma_act_ns/vsched_module) is not ported, see "
+		       "kernel/sched/core.c's ivh_vact_tick()\n", val);
+		return -EINVAL;
+	}
+
+	WRITE_ONCE(ivh_preempt_event_source, val);
+	return 0;
+}
+
+/*
+ * ivh_vact_tick()'s (kernel/sched/core.c) own jump-vs-noise threshold, in
+ * nanoseconds -- converted to raw TSC cycles at the point of use via
+ * ivh_tsc_ns_to_cycles(), so it stays correct at any tsc_khz. Deliberately
+ * NOT ivh_pv_beat_threshold (arch/x86/kernel/kvm.c): that knob is set to
+ * 220000 cycles (~100us) by /root/spin_mode's IVH_PV/STOCK_TAS modes for
+ * qspinlock early-bail tuning, one tenth of a CONFIG_HZ=1000 tick period,
+ * which measured as ~100% of ordinary ticks misclassified as jumps. This
+ * knob must never be added to /root/spin_mode's per-mode sysctl resets --
+ * it needs to hold one stable value across every spin mode for
+ * ivh_vact_jumps to be comparable cross-mode. Default is 1.5 tick periods
+ * (TICK_NSEC + TICK_NSEC/2), which at CONFIG_HZ=1000 is 1,500,000ns --
+ * bit-identical in cycles to the 1500us default ivh_pv_beat_threshold
+ * itself boots with, the operating point this was validated against.
+ */
+#define IVH_VACT_JUMP_NS	(TICK_NSEC + TICK_NSEC / 2)
+unsigned long ivh_vact_jump_ns = IVH_VACT_JUMP_NS;
+static unsigned long ivh_vact_jump_ns_min = TICK_NSEC;
 
 /*
  * IVH "uc" (used-capacity): in-kernel replica of vcap's used/(used+stolen)
@@ -194,6 +265,21 @@ static const struct ctl_table ivh_sysctls[] = {
 		.maxlen		= sizeof(unsigned long),
 		.mode		= 0644,
 		.proc_handler	= ivh_proc_cap_source,
+	},
+	{
+		.procname	= "ivh_preempt_event_source",
+		.data		= &ivh_preempt_event_source,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= ivh_proc_preempt_event_source,
+	},
+	{
+		.procname	= "ivh_vact_jump_ns",
+		.data		= &ivh_vact_jump_ns,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+		.extra1		= &ivh_vact_jump_ns_min,
 	},
 	{
 		.procname	= "ivh_uc_enabled",

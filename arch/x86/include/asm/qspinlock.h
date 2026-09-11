@@ -153,25 +153,59 @@ static inline bool vcpu_is_preempted(long cpu)
  * pv_wait_early() (kernel/locking/qspinlock_paravirt.h) run:
  *
  *   0 - VANILLA: byte-for-byte the pre-IVH kvm_wait()/kvm_kick_cpu()
- *       behavior when the host advertises KVM_FEATURE_PV_UNHALT (real
- *       host-cooperative halt + KVM_HC_KICK_CPU hypercall wake), else a
- *       plain bounded cpu_relax() busy loop — the least-surprising,
- *       lowest-risk degenerate case when the host offers nothing to
- *       cooperate with.
- *   1 - PURE_IPI: identical control flow to mode 0, except the one wake
- *       (at unlock time, __pv_queued_spin_unlock_slowpath()'s pv_kick())
- *       is smp_send_reschedule() instead of the hypercall. No hypercall is
- *       ever sent in this mode.
- *   2 - ADAPTIVE: mode 1 plus pv_wait_early()'s TSC-heartbeat early bail
- *       (is_wait_preempted(), gated on ivh_pv_preempt_src — see
- *       <asm/ivh_tsc_beat.h>). Still no hypercall.
+ *       behavior whenever ivh_pv_allowed() (real host-cooperative halt +
+ *       KVM_HC_KICK_CPU hypercall wake), else a plain bounded cpu_relax()
+ *       busy loop with NO wake vehicle at all -- the least-surprising,
+ *       lowest-risk degenerate case when there's nothing to cooperate
+ *       with. Under the DEFAULT boot policy (ivh_pv_allow=1) this is
+ *       driven purely by ivh_pv_unhalt_avail, i.e. genuinely "what stock
+ *       PV actually does on this host" -- ivh_pv_allow=0 is a deliberate
+ *       simulated-environment override (see below) that ALSO degrades
+ *       VANILLA to its real no-PV_UNHALT behavior, because that is what
+ *       upstream itself would do on a host that doesn't advertise the
+ *       feature; without this, "PV not allowed" would have no reachable
+ *       baseline arm to compare mode ADAPTIVE against.
+ *   1 - PURE_IPI: identical control flow to VANILLA's "no PV_UNHALT"
+ *       degenerate case, except the one wake (at unlock time,
+ *       __pv_queued_spin_unlock_slowpath()'s pv_kick()) is
+ *       smp_send_reschedule() instead of nothing. No hypercall is ever
+ *       sent in this mode, and it never consults ivh_pv_allowed() -- it
+ *       is the deliberate fixed, minimal-KVM-dependency portable baseline,
+ *       completely unaffected by ivh_pv_allow either way.
+ *   2 - ADAPTIVE (G-LOCK-22-hybrid): self-configuring hybrid, NOT simply
+ *       "mode 1 plus early bail" as earlier revisions of this comment said.
+ *       Per-waiter, at every ivh_pv_wait()/pv_wait_early() call:
+ *         - ivh_pv_allowed() true (host advertises PV_UNHALT AND the
+ *           ivh_pv_allow=1 boot policy, see below): behave EXACTLY like
+ *           mode VANILLA's PV_UNHALT branch (same halt()/safe_halt(), same
+ *           hypercall wake) -- no interrupt-handling logic of ADAPTIVE's
+ *           own is needed here, because the hypercall's latching
+ *           pv_unhalted already wakes an IF=0 halt() natively. PLUS
+ *           pv_wait_early()'s tier-1/tier-2 early bail stays active (this
+ *           combination -- PV-native halt semantics with early bail -- is
+ *           new territory; mode VANILLA never gets tier 2, only tier 1).
+ *         - ivh_pv_allowed() false and IRQs on at the wait call: IPI wake
+ *           (mode PURE_IPI's own path) + early bail, same as before.
+ *         - ivh_pv_allowed() false and IRQs off at the wait call: plain
+ *           busy-spin only, no halt attempt (ivh_pv_irqoff_halt / Idea 4 is
+ *           NEVER consulted for this mode -- see ivh_pv_wait()'s comment
+ *           for why this corner doesn't need it). Early bail is ALSO
+ *           suppressed here by default (see ivh_adaptive_irqoff_bail_gate
+ *           below), since bailing early accomplishes nothing when the
+ *           eventual wait is going to busy-spin regardless -- it only
+ *           forces the eventual unlocker onto pv_kick_node()'s
+ *           _Q_SLOW_VAL/hash/wasted-IPI slow-unlock path sooner.
+ *       Headline framing: PV allowed makes Idea 4's benefit available for
+ *       free (real halt/wake at IF=0, zero reopened-IF risk), so ADAPTIVE
+ *       doesn't need Idea 4 at all except in the one irreducible corner
+ *       where no better option exists -- and even there it declines it by
+ *       default, leaving that experiment to mode PURE_IPI.
  *
- * NOTE: a maskable IPI cannot un-halt a HLT taken with RFLAGS.IF=0, so
- * modes 1/2 halt ONLY via safe_halt() on the IRQs-were-enabled path; a
- * waiter that arrives with IRQs already off degrades to an uninstrumented
- * cpu_relax() loop instead (counted in ivh_wait_irqoff_nohalt) — this is
- * an irreducible consequence of never sending the hypercall in these
- * modes, not a bug. See ivh_pv_wait()'s comment.
+ * ivh_pv_allowed()/ivh_mode_uses_hypercall() below are the single shared
+ * predicate ivh_pv_wait(), ivh_wake() and the mode-transition drain
+ * (ivh_pv_proc_adaptive_mode(), arch/x86/kernel/kvm.c) all use, so sleep
+ * side, wake side and freeze-hazard safety can never independently drift on
+ * which vehicle a given (mode, boot policy) combination actually uses.
  *
  * This only ever branches inside the already-registered, permanently
  * installed ivh_pv_wait()/ivh_pv_kick() callbacks (arch/x86/kernel/kvm.c)
@@ -188,6 +222,98 @@ enum {
 	IVH_MODE_ADAPTIVE	= 2,
 };
 extern unsigned long ivh_adaptive_mode;
+
+/*
+ * ivh_pv_unhalt_avail: cached kvm_para_has_feature(KVM_FEATURE_PV_UNHALT),
+ * set once in kvm_spinlock_init(). See its definition in kvm.c for why a
+ * live re-read on every halt/wake is unacceptable on a TDX guest (an
+ * uncached CPUID in this leaf range is a full TDVMCALL round-trip to the
+ * host, not a native instruction).
+ *
+ * ivh_pv_allow: boot parameter (NOT a live sysctl -- see kvm.c), default 1.
+ * 0 forces BOTH VANILLA and ADAPTIVE to act as if PV_UNHALT weren't
+ * advertised, even though it is -- the way to reach/measure both modes'
+ * IPI-wake and busy-spin branches on a host that actually supports the
+ * hypercall, without needing host/QEMU-side control over what's advertised
+ * to this guest. Applies to VANILLA too, deliberately: see
+ * ivh_mode_uses_hypercall()'s comment just below for why a policy meant to
+ * simulate a different environment has to affect every mode that consults
+ * the real feature bit, not just ADAPTIVE.
+ */
+extern bool ivh_pv_unhalt_avail;
+extern unsigned long ivh_pv_allow;
+
+static __always_inline bool ivh_pv_allowed(void)
+{
+	return ivh_pv_unhalt_avail && READ_ONCE(ivh_pv_allow);
+}
+
+/*
+ * PURE_IPI is the one mode that must NEVER hypercall regardless of policy --
+ * everything else (VANILLA and ADAPTIVE alike) follows ivh_pv_allowed().
+ * Deliberately identical treatment for VANILLA and ADAPTIVE: ivh_pv_allow=0
+ * is a simulated-environment knob ("pretend the host doesn't advertise
+ * PV_UNHALT"), and a simulated environment must look the same to every mode
+ * that would otherwise consult the real feature bit, not just to ADAPTIVE.
+ */
+static __always_inline bool ivh_mode_uses_hypercall(unsigned long mode)
+{
+	if (mode == IVH_MODE_PURE_IPI)
+		return false;
+	return ivh_pv_allowed();
+}
+
+/*
+ * G-LOCK-22-hybrid: default-OFF sysctl, see kvm.c's definition for the full
+ * rationale (its sign is NOT proven -- the closely analogous
+ * ivh_pv_spin_threshold experiment measured ~9% SLOWER for the same "bail
+ * later instead of earlier" trade). Read from pv_wait_early() below.
+ */
+extern unsigned long ivh_adaptive_irqoff_bail_gate;
+
+/*
+ * G-LOCK-23: mode-agnostic contended-acquisition wait-time accounting. See
+ * kvm.c's definition of ivh_slowpath_wait_measure for the full rationale
+ * and the migration-engine-era precedent this ports from. Called from
+ * kernel/locking/qspinlock.c's queued_spin_lock_slowpath(), which is
+ * compiled once natively and once (self-included) as the PV variant, so
+ * these call sites (one begin, three ends -- see queued_spin_lock_slowpath()
+ * itself) cover every mode this project tests with no per-mode
+ * instrumentation needed.
+ *
+ * Only the plain externs live here, deliberately: the accessor functions
+ * themselves (ivh_slowpath_wait_begin()/_end()) need sched_clock(), and
+ * this header is included from contexts (e.g. asm-offsets.c via
+ * asm/spinlock.h) that do NOT have <linux/sched/clock.h> visible -- the
+ * exact same reason <asm/tsc.h> is barred from this file elsewhere below.
+ * The two functions are defined locally in qspinlock.c instead, where that
+ * include is safe, matching where the original migration-engine version
+ * defined them too.
+ */
+extern unsigned long ivh_slowpath_wait_measure;
+DECLARE_PER_CPU(u64, ivh_slowpath_wait_ns);
+DECLARE_PER_CPU(u64, ivh_slowpath_wait_events);
+
+/*
+ * G-LOCK-21-spin experimental knobs (spinning-threshold study):
+ *   ivh_pv_tier1_enable   - 1 (default) = stock behavior: pv_wait_early()
+ *                           bails as soon as the predecessor's own state
+ *                           says it stopped running. 0 = tier 1 is skipped
+ *                           entirely; the only early-bail signal left is
+ *                           tier 2 (TSC heartbeat), gated as always on
+ *                           ivh_adaptive_mode == ADAPTIVE and
+ *                           ivh_pv_preempt_src != 0. With this at 0 and
+ *                           either of those unmet, a waiter gets NO early
+ *                           signal at all and only stops spinning by
+ *                           exhausting ivh_pv_spin_threshold.
+ *   ivh_pv_spin_threshold - runtime-tunable replacement for the compile-time
+ *                           SPIN_THRESHOLD loop budget (default 1<<15,
+ *                           <asm/spinlock.h>). Read once per spin attempt;
+ *                           changing it live only affects attempts that
+ *                           haven't started their inner loop yet.
+ */
+extern unsigned long ivh_pv_tier1_enable;
+extern unsigned long ivh_pv_spin_threshold;
 
 /*
  * The IVH per-CPU TSC heartbeat -- the candidate replacement for

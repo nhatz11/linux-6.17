@@ -237,6 +237,14 @@ void account_idle_time(u64 cputime)
 	 * steal event ended -- see steal_account_process_time() below.
 	 */
 	rq->last_idle_tp = sched_clock();
+	/*
+	 * G-LOCK-23: TSC-native counterpart of the line above, for
+	 * ivh_vact_tick()'s (kernel/sched/core.c) idle-vs-preemption test --
+	 * same instant, same reason, just the raw-cycles clock the
+	 * steal-time-independent tsc_pe==true gate branch needs instead of
+	 * sched_clock() ns.
+	 */
+	rq->ivh_vact_idle_exit_tsc = ivh_raw_tsc();
 }
 
 
@@ -538,6 +546,14 @@ void account_process_tick(struct task_struct *p, int user_tick)
 	this_rq()->clock_preempt = sched_clock();
 	ivh_tsc_beat_publish();
 	ivh_tick_steal_accumulate();
+	/*
+	 * G-LOCK-23: same placement discipline as its neighbours -- every
+	 * tick, every CPU, before the early return below, because a skipped
+	 * tick would produce a gap ivh_vact_tick()'s jump detector cannot
+	 * tell apart from real host preemption, which is the one thing this
+	 * signal exists to measure.
+	 */
+	ivh_vact_tick();
 	ivh_uc_tick();
 
 	if (vtime_accounting_enabled_this_cpu())
