@@ -1247,3 +1247,206 @@ is structural, not a defect in either mechanism:
   (REMRD) that could have closed the kick-cost gap, on portability grounds. Tier-2 would very
   plausibly earn its keep on a host with heavier real oversubscription (its entire premise); it is
   not, and was never going to be, a lever against the kick-cost tax itself.
+
+## 11. G-LOCK-22-hybrid: the PV-allowed/PV-not-allowed adaptive model, and STOCK_PV vs IVH_PV results (2026-09-10)
+
+### 11.1 The redesign
+
+§10.1's kick-cost-vs-early-bail split above pointed at the actual fix directly: G0/H1's structural
+kick-cost tax against stock PV comes entirely from *always* using a real IPI, even on hosts where
+the hypercall is available and cheap. `ivh_adaptive_mode` (mode 2, ADAPTIVE) was redesigned around
+that: it now senses whether the hypercall vehicle is actually usable and picks the cheapest correct
+mechanism per-environment, rather than a fixed vehicle per mode:
+
+- **PV allowed** (`ivh_pv_allowed()` — host advertises `KVM_FEATURE_PV_UNHALT` AND the new
+  `ivh_pv_allow` boot policy permits it, both true by default on this host): ADAPTIVE takes the
+  *identical* `ivh_pv_native_halt()` path VANILLA uses — same `halt()`/`safe_halt()`, same
+  `KVM_HC_KICK_CPU` hypercall wake — closing the kick-cost gap completely, PLUS keeps tier-1/tier-2
+  early bail active (new territory: mode VANILLA never got tier-2, only tier-1). Mechanically, the
+  *only* remaining difference between mode VANILLA and mode ADAPTIVE-with-PV is bail timing.
+- **PV not allowed** (`ivh_pv_allow=0`, a new boot parameter — same reasoning as §7's portability
+  framing, just made testable in-guest without needing host/QEMU cooperation): real IPI wake +
+  `safe_halt()` + early bail for waiters whose IRQs are on at the wait call (unchanged from the old
+  G0/H1 mechanism); plain busy-spin, no halt attempt at all, for waiters whose IRQs are already off
+  (Idea 4/§6's reopened-IF trick is deliberately NOT used here for this mode — see below).
+- **New: `ivh_pv_tas`, a second boot parameter** giving a genuine fourth comparison arm: real,
+  unmodified upstream test-and-set/`virt_spin_lock()` spinlocks, no MCS queue, no PV ops registered
+  at all. `kvm_spinlock_init()` returns before any of its own logic runs, leaving
+  `virt_spin_lock_key` exactly as `native_pv_lock_init()` (any hypervisor guest) already set it.
+  This is the true "PV not allowed" baseline stock upstream itself would exhibit — G0/H1/IVH_NOPV
+  were never actually comparable to it, since MCS queueing (paravirt spinlocks) stayed compiled in
+  and registered throughout this whole project's `ivh_pv_wait()`-in-a-queue substitute.
+
+Headline framing that came out of this: PV-allowed ADAPTIVE doesn't need Idea 4 (§6) at all — the
+hypercall's latching `pv_unhalted` already wakes an IF=0 `halt()` natively, with zero reopened-IF
+risk, strictly dominating Idea 4's trick whenever it's available. Idea 4 is now gated to mode
+PURE_IPI only, kept there purely as a continuing, isolated Hazard-A research arm (§6/§8), no longer
+part of ADAPTIVE's default path.
+
+Four independent Opus review rounds on this redesign caught, in order: (1) a real freeze-hazard gap
+— the safety drain that rescues halted CPUs during a live `ivh_adaptive_mode` write only tracked
+mode VANILLA, missing the new ADAPTIVE→PURE_IPI transition case; (2) a wake-vehicle regression where
+mode VANILLA without PV_UNHALT lost its old "send nothing" behavior; (3) an unbounded
+`ivh_pv_spin_threshold` sysctl truncating into an `int` loop counter (a multi-billion-iteration
+IRQs-disabled spin was reachable from a single bad `echo`); and (4), the sharpest one, `ivh_pv_tas`
+being registered as a non-early `__setup()` handler, so `kvm_spinlock_init()` (which runs earlier in
+boot) would silently never see it while the read-only sysctl mirror still reported success — fixed
+by switching to `early_param()`, matching upstream's own `nopvspin` registration for exactly this
+reason. All four are fixed and re-verified; see the `G-LOCK-22-hybrid` kernel tree
+(`/root/kernels/linux-6.17-vanilla`, branch `ivh-rebuild-main`, uncommitted at time of writing) for
+the actual diffs. `/root/spin_mode` is the resulting entry point: modes 1-5 map to STOCK_PV,
+IVH_PV, STOCK_TAS, IVH_NOPV, and PURE_IPI respectively, each refusing to run (rather than silently
+misconfiguring) if the current boot's `ivh_pv_tas`/`ivh_pv_allow` don't actually support it.
+
+### 11.2 STOCK_PV vs IVH_PV: four attempts, and what they actually show
+
+Ran `hackbench -T -g 1 -f 8 -l 400000` (this project's standard workload throughout) comparing mode
+VANILLA (STOCK_PV) against mode ADAPTIVE-with-PV (IVH_PV) four separate times on the same boot:
+
+| Attempt | Design | STOCK_PV | IVH_PV | Apparent effect |
+|---|---|---|---|---|
+| 1 | 10 vs 10, sequential blocks | mean 55.20s | mean 50.33s | IVH ~8.8% faster |
+| 2 | 4 vs 4, sequential blocks (tier-2 ablation, corrected) | mean 49.10s (tier-2 off) | mean 58.78s (tier-2 on) | IVH ~20% **slower** |
+| 3 | 10 vs 10, sequential blocks | mean 57.89s | mean 41.44s | IVH ~28% faster |
+| 4 | 5 vs 5, **interleaved** (S,I,S,I,...) | mean 50.04s | mean 46.26s | IVH ~7.6% faster (4 of 5 pairs) |
+
+An independent Opus statistical review of attempt 1 found the mean difference was not significant
+(exact permutation test p=0.27; 95% CI on the mean difference spans −7.8% to +25.5%, i.e. contains
+both zero and a reversal), and that the naive median-based "24% faster" figure was an artifact of a
+bimodal run-time distribution: both configs' fast-cluster and slow-cluster centers were nearly
+identical (~43-45s / ~63-64s), only the count landing in each cluster differed (4/10 vs 6/10 fast,
+Fisher exact p=0.66 — indistinguishable from chance), and STOCK_PV's median happened to fall in the
+unstable gap between its own two clusters. The review also found real run-to-run autocorrelation
+(~0.4) in both blocks, consistent with slow-moving external (likely host-side, unobservable from
+this guest — see the steal-time-untrustworthy finding elsewhere in this project) load, which is
+exactly what makes sequential blocking risky here: it lets that drift land unevenly on one side.
+Attempts 2 and 3 then demonstrated this directly and concretely — same machine, same workload,
+same correct method, opposite-sign results four days apart in wall-clock testing time.
+
+Attempt 4 (interleaved) is the methodologically soundest of the four: alternating every single run
+cancels shared drift instead of confounding it, at the cost of a smaller per-config N. It shows the
+same directional lean (IVH faster, 4 of 5 pairs) as attempts 1 and 3, with a magnitude (~7.6%) close
+to attempt 1's. Notably, IVH's advantage was largest in the two slowest/highest-contention pairs
+(−5.0s, −12.3s) and shrank to near-zero once both sides settled into a fast, low-contention floor
+(~42-44s) — mechanistically coherent with tier-2's own premise (§9.0/§10): it only has something to
+catch when a predecessor is actually being preempted for a real, elapsed span; a quiet environment
+gives it nothing to bail on, so both configs converge.
+
+### 11.3 Conclusion (project owner's call, 2026-09-10)
+
+Taken together: STOCK_PV and IVH_PV are **statistically indistinguishable in the aggregate** on
+this workload and this environment — no single result here should be read as a proven win or loss.
+But IVH_PV was never worse in a methodologically sound (interleaved) comparison, tracks stock PV
+closely when the environment is quiet, and shows its largest positive gap specifically when the
+environment looks like it is inducing more preemption/contention (the exact regime tier-2 targets).
+Project owner's read, which this doc records as the working interpretation going forward:
+early bail does not guarantee a win on any given run — preemption itself is unpredictable and this
+host's environment noise dominates small effects — but it appears to make the *impact* of
+preemption, when it happens, less severe more often than not. This is judged good enough to close
+out the "PV allowed" comparison for now and move to the "PV not allowed" comparison, STOCK_TAS
+(mode 3) vs IVH_NOPV (mode 4), next.
+
+### 11.4 Root cause of the STOCK_PV vs IVH_PV noise, found 2026-09-11: wrong instrument, not wrong mechanism
+
+A full day of re-testing on `G-LOCK-24-vactfix` (after the `ivh_vact_jump_ns` fix) reproduced the
+same flip-flopping this doc already knew about: one 5-round batch landed at 50.4s/46.3s (IVH
+faster), nearly identical to this section's Attempt 4 (50.04s/46.26s) — then a batch run an hour
+later, on a calmer host, reversed completely (0/5 rounds favoring IVH). An Opus investigation
+(methodology audit + live counter instrumentation) settled this:
+
+**No methodology bug.** `/root/spin_mode`'s mode switching, the interleaved A-then-B design, and the
+kernel build itself (unchanged hot path since G-LOCK-21, confirmed via diff and a live counter
+cross-check: `ivh_head_spin_iters_sum / ivh_head_spin_attempts` = 32768.0 exactly, matching
+`ivh_pv_spin_threshold`) were all cleared. One real but minor bug found: both test scripts ignore
+`spin_mode`'s exit code, so a refused `ivh_pv_preempt_src=2` write (possible if a CPU hasn't
+published a heartbeat yet) would silently degrade IVH_PV into a no-op — fix with `|| exit 1` plus a
+sysctl readback assertion.
+
+**The actual finding**: tier 2 is working exactly as designed, dramatically and reproducibly — just
+not on the metric this whole comparison has been reading. Measured on 5 fresh interleaved pairs with
+`ivh_slowpath_wait_measure=1` and the spin-iteration/wait counters on:
+
+| metric | STOCK_PV | IVH_PV | separates? |
+|---|---|---|---|
+| hackbench wall time | 23.41s | 23.32s | no — 3/5, coin flip |
+| per-acquisition wait latency | 7897ns | 7895ns | no — 0.02% diff |
+| spin iterations burned | 1,968M | 652M | **yes — 5/5, −66%** |
+| iterations per bail | 15,866 | 308 | **yes — 5/5, 52× faster** |
+| `pv_wait` (HALT) calls | 135K | 2,135K | **yes — 5/5, 15.8× more** |
+
+Tier 2 converts busy-spinning into halt-waiting at very nearly 1:1 latency (7897ns → 7895ns) — it
+does not shorten how long a wait takes, it changes *how* the wait is spent. The reclaimed CPU cycles
+go back to the **host**, invisible to an in-guest wall clock. `hackbench -T -g 1 -f 8` spawns exactly
+16 threads on this VM's 16 vCPUs — the guest is saturated with no surplus runnable work to hand
+reclaimed cycles to, so wall-clock hackbench is structurally blind to tier 2's payoff. This also
+explains this section's own noise: paired-difference sd ≈14.5pp, so n=5 can only detect effects
+≥18% and n=20 only ≥9% — every number in §11.2 and today's re-tests, in both directions, sits inside
+that noise floor. The "IVH tight in the 40s, PV jumping to 50s" memory was almost certainly this
+doc's Attempt 4 (50.04/46.26s) coinciding, by chance at this noise level, with a replay batch
+(50.4/46.3s) — convincing to see twice, but exactly what a 14.5pp noise process produces sometimes.
+
+**Oversubscription fix, tested same day**: `hackbench -T -g 4 -f 8 -l 200000` (~64 threads on 16
+vCPUs, so reclaimed cycles have guest-side work to go to) — 3/3 interleaved rounds favored IVH_PV,
+tight variance, mean 25.37s (STOCK_PV) vs 24.67s (IVH_PV), **+2.8% IVH**. Small but for the first
+time today: consistent, low-noise, no reversals. Needs a bigger batch to confirm, but this looks like
+the first clean wall-clock-visible signal for tier 2 on this workload family.
+
+**Open question, not yet resolved**: is the 15.8× increase in HALT calls actually free, or is tier 2
+trading a large, cheap cost (spin iterations) for a smaller number of a much more expensive one (each
+HALT/kick pair is a real hypercall round-trip, ~10^4 cycles per this project's own TDX measurements
+elsewhere)? The −66%/+15.8× trade nets to roughly 658 spin iterations saved per extra halt — whether
+that's a real per-cycle win depends on the true cost of one spin iteration vs one halt+kick
+round-trip, which has not yet been modeled. Follow-up dispatched to Opus same day.
+
+## 11.5 Halt-cost tradeoff, corrected, and the tier-1-cascade fix — CLOSED, not worth pursuing further (2026-09-11)
+
+**The −66%/15.8× framing above was a measurement artifact.** A rigorous Opus cycle-accounting pass
+found the original "−66% spin iterations" figure only counted bail/exhaust passes (~20% of all
+spinning), excluding the much larger successful-acquisition population tracked separately. True
+figure: **−16.2%** spin-iteration reduction. Real per-iteration cost measured directly at ~26.3
+cycles; real TDX halt/host-round-trip cost measured directly at **~14,166 cycles** via a CPUID-exit
+proxy (cross-validated against a separate ICR-write measurement) — the "~10^4 cycles ... measurements
+elsewhere" cited above was traced to an unfounded assumption, never actually measured anywhere in this
+tree before now. Net result at the corrected numbers: only ~31% of reclaimed spin cycles are net-freed
+(~70% re-spent on halt/kick mechanics); net guest-CPU reclaim ≈ **+1% (uncertain range −1.4% to
++2.3%)** — both latency measures move slightly *against* tier 2. Not a clean win.
+
+**Tier-1 cascade discovered**: one tier-2 bail sets a successor's `prev->state = VCPU_HALTED`, which
+trips that successor's cheap tier-1 check (`prev->state != VCPU_RUNNING`) regardless of whether ITS
+OWN predecessor was ever genuinely preempted — measured **~2.77 tier-1 fires per tier-2 fire**,
+responsible for ~73% of the extra halt cost above. Tier-1 is not mode-gated (fires in STOCK_PV too).
+
+**Fix built and tested live** (G-LOCK-25-tier1confirm): new sysctl `ivh_pv_tier1_confirm` (0/1/2,
+requires `ivh_pv_preempt_src=2` for 2), mirroring tier 2's own TSC-heartbeat confirmation check against
+tier-1's trigger. 0 = unchanged (default). 1 = shadow — compute+record the verdict, still bail (zero
+behavior change). 2 = authoritative — an unconfirmed tier-1 trip does not bail. New unconditional
+per-bail-cause halt-duration histograms (`ivh_node_halt_cycles/_events/_hist[cause]`) added alongside it.
+
+**Phase 1** (confirm=0, `hackbench -T -g4 -f8 -l200000`, oversubscribed): 96.7% of tier-1 halts and
+98.3% of tier-2 halts land in the histogram bucket straddling the ~14,166-cycle overhead floor —
+i.e. most bails pay a full halt/wake round trip for almost no real wait avoided. EXHAUST (genuine
+long waits) looks completely different: only 50.3% in that bucket, real mass out past 500K+ cycles.
+
+**Phase 2** (confirm=1, shadow mode, same workload): tier-1 trips split 43% AGREED / 57% DISAGREED.
+Naive expectation was that DISAGREED = false-positive cascade noise, cheap to suppress. **Wrong** —
+DISAGREED has a *higher* mean halt duration (61,536 vs 35,679 cycles) than AGREED, and Opus's review
+found this is a genuine detection of an upstream stall reported against the wrong CPU (the real
+blocker is further back in the MCS chain than `prev`), not a stale-flag artifact — confirmed via a
+tail-events decomposition (DISAGREED hits the >262K-cycle tail 3.2× more often than AGREED; this
+alone explains 83% of the mean gap). Suppressing DISAGREED trips therefore forces busy-spin on
+precisely the population that most needed to yield, not on wasted round trips.
+
+**Verdict, computed from numbers already in hand**: even suppressing 100% of DISAGREED trips caps out
+at ~1-2% of aggregate vCPU cycles — smaller than the already-marginal tier-2 result above — and the
+sign is a coin flip depending on where in the spin a trip occurs (back-of-envelope: −6,656
+cycles/trip in the worst case, +3,587 cycles/trip in the average case, using this project's own
+measured 26.3 cycles/iteration and the live `ivh_pv_spin_threshold=32768` budget). A live confirm=2
+A/B run was also ruled out on noise-floor grounds independent of the above: the confirm-tracking
+counters swung +17.5% between two behaviorally-identical (confirm=0 vs confirm=1) runs of the exact
+same workload, meaning any real confirm=2 effect below ~20% would be unmeasurable without an
+unrealistic number of runs.
+
+**Closed. Halt count / tier-1-cascade suppression is not worth pursuing further** — ceiling too small,
+sign too uncertain, effect too far inside this project's own noise floor. G-LOCK-25-tier1confirm's
+code (shadow-mode-safe, default-off) is left in the tree as a clean, reviewed, behavior-neutral
+artifact, not as a live optimization to chase.
