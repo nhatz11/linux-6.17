@@ -25,6 +25,9 @@ static inline void tracefs_print_init(void *inst) { }
 #include <immintrin.h>
 #include <sys/auxv.h>
 #include <stdint.h>
+#include <inttypes.h>
+
+#include "ivh_adaptive_futex_lock.h"
 
 /*
  * Host-level steal-time ground truth, read from /proc/vcap_info
@@ -356,7 +359,7 @@ struct thread_data {
 
 struct data {
         unsigned long long              x;
-        unsigned long                   lock;
+        struct ivh_afl_lock             lock;
         struct thread_data              *tdata;
         bool                            done;
 };
@@ -486,15 +489,60 @@ static void do_sleep(unsigned usecs)
         nanosleep(&ts, NULL);
 }
 
+/*
+ * Per-thread pointer to this thread's own tdata, set once at the top of
+ * run_thread(). The lock's before_sleep/after_wake hooks run synchronously
+ * on whichever thread calls ivh_afl_lock(), so referencing this __thread
+ * variable from inside the hooks always resolves to the CALLING thread's
+ * own tdata -- unlike the header's single shared hook_arg, which is one
+ * pointer per LOCK, not per thread, and would be the wrong thread's data
+ * whenever more than one thread ever slept on the same lock.
+ */
+static __thread struct thread_data *g_tdata;
+
+#ifdef IVH_AFL_STATS
+static struct ivh_afl_stats g_afl_totals;
+#endif
+
+/*
+ * Hooks bracketing an actual FUTEX_WAIT sleep. See
+ * ivh_adaptive_futex_lock.h's file header and struct ivh_afl_lock's design
+ * doc sec 5.4 for why these exist: a thread that is genuinely blocked in
+ * the kernel is not spin-waiting, so wait_counter (whose own name is
+ * "spin-wait nesting depth") should reflect that, and an outstanding
+ * cr_counter extension request is something the kernel itself consumes on
+ * return-to-userspace (kernel/rseq.c) -- carrying one into a sleep is a
+ * real inconsistency, not a cosmetic one, exactly like carrying it across
+ * the old lock's inner poll loop was already handled via unextend().
+ */
+static void ivh_afl_hook_before_sleep(void *arg)
+{
+        (void)arg;
+        if (!extend_wait && unextend())
+                g_tdata->extended++;
+        wait_exit();
+}
+
+static void ivh_afl_hook_after_wake(void *arg)
+{
+        (void)arg;
+        wait_enter();
+        if (!extend_wait)
+                extend();
+}
+
 static void grab_lock(struct thread_data *tdata, struct data *data)
 {
         unsigned long long start_wait, start, end, delta;
         unsigned long long end_wait;
         unsigned long long start_wait_ns, start_ns, end_ns;
         unsigned long long start_active_ns, end_active_ns;
-        unsigned long prev;
-        unsigned long my_lock_val;
-        bool contention = false;
+        int lock_ret;
+        int cs_cpu_start, cs_cpu_end;
+        unsigned long long steal_before[VCAP_MAX_CPUS] = {0};
+        unsigned long long steal_after[VCAP_MAX_CPUS] = {0};
+
+        g_tdata = tdata;
 
         {
                 unsigned long long _t0 = get_time_ns();
@@ -517,43 +565,33 @@ static void grab_lock(struct thread_data *tdata, struct data *data)
         start_wait = get_time();
         start_wait_ns = get_time_ns();
 
-        wait_enter(); /* entering spin/wait region; wait_counter > 0 until lock acquired */
-        rmb();
-        while (data->lock && !data->done) {
-                contention = true;
-                rmb();
-        }
+        /*
+         * Moved outside the critical section (design doc sec 6.2): the old
+         * code read this via a pread()+strtok/sscanf parse of an 8KB proc
+         * buffer AFTER acquiring the lock, i.e. inside the very ~13us CS
+         * this project spent this whole session calibrating -- tens of
+         * microseconds of instrumentation overhead inside a 13us window,
+         * and a real syscall (a scheduling point) taken while HOLDING the
+         * lock, which the new heartbeat would (correctly, but
+         * misleadingly) detect as the holder having stalled. This is a
+         * cumulative per-CPU counter already filtered at >100us, so
+         * widening the sampled window to include the wait costs only a
+         * little extra noise, not correctness.
+         */
+        cs_cpu_start = sched_getcpu();
+        read_vcap_steal(steal_before);
 
-        tracefs_printf(NULL, "Grab lock\n");
+        wait_enter(); /* entering spin/wait region; wait_counter > 0 until lock acquired */
         if (extend_wait)
                 extend();
-        do {
-                if (!extend_wait)
-                        extend();
-                start = get_time();
-                /*
-                 * Recomputed fresh on every attempt, not once before the
-                 * wait: with -n (unpinned) threads and a wait long enough
-                 * for guest load balancing to move this thread, a
-                 * once-computed value could publish a stale CPU in the
-                 * lock word, making every waiter monitor the wrong CPU.
-                 */
-                my_lock_val = (unsigned long)sched_getcpu() + 1;
-                prev = cmpxchg(&data->lock, 0, my_lock_val);
-                if (prev) {
-                        contention = true;
-                        if (!extend_wait && unextend())
-                                tdata->extended++;
-                        while (data->lock && !data->done) {
-                                rmb();
-                        }
-                }
-        } while (prev && !data->done);
 
-        if (contention)
-                tdata->contention++;
+        tracefs_printf(NULL, "Grab lock\n");
+        if (!extend_wait)
+                extend();
+        start = get_time();
 
-        if (data->done) {
+        lock_ret = ivh_afl_lock(&data->lock);
+        if (lock_ret != IVH_AFL_OK) {
                 wait_exit(); /* abandoned wait at shutdown */
                 return;
         }
@@ -562,10 +600,6 @@ static void grab_lock(struct thread_data *tdata, struct data *data)
         end_wait = get_time();
         start_ns = get_time_ns();
         start_active_ns = get_time_cputime();
-
-        int cs_cpu_start = sched_getcpu();
-        unsigned long long steal_before[VCAP_MAX_CPUS] = {0};
-        read_vcap_steal(steal_before);
 
         tracefs_printf(NULL, "Have lock!\n");
         delta = end_wait - start_wait;
@@ -577,22 +611,22 @@ static void grab_lock(struct thread_data *tdata, struct data *data)
 
         data->x++;
 
-        if (data->lock != my_lock_val) {
-                printf("Failed locking\n");
-                exit(-1);
+        /*
+         * Loop -- ivh_afl_beat() is self-gated (IVH_AFL_BEAT_MASK) so it is
+         * cheap enough to call every iteration; it only actually republishes
+         * the heartbeat every (mask+1) calls.
+         */
+        for (int i = 0; i < loop_spin; i++) {
+                wmb();
+                ivh_afl_beat(&data->lock);
         }
 
-        /* Loop */
-        for (int i = 0; i < loop_spin; i++)
-                wmb();
-
-        prev = cmpxchg(&data->lock, my_lock_val, 0);
+        ivh_afl_unlock(&data->lock);
         end = get_time();
         end_ns = get_time_ns();
         end_active_ns = get_time_cputime();
 
-        int cs_cpu_end = sched_getcpu();
-        unsigned long long steal_after[VCAP_MAX_CPUS] = {0};
+        cs_cpu_end = sched_getcpu();
         read_vcap_steal(steal_after);
         {
                 /* >100us floor matches the kernel's own >1ms rq->preemptions
@@ -632,10 +666,6 @@ static void grab_lock(struct thread_data *tdata, struct data *data)
 
         if (unextend())
                 tdata->extended++;
-        if (prev != my_lock_val) {
-                printf("Failed unlocking\n");
-                exit(-1);
-        }
 
         delta = end - start;
         if (!tdata->total || tdata->max < delta) {
@@ -680,6 +710,21 @@ static void *run_thread(void *d)
                 do_sleep(100 + tdata->cpu * 27);
                 rmb();
         }
+#ifdef IVH_AFL_STATS
+        __atomic_add_fetch(&g_afl_totals.fast_acquires, ivh_afl_stats.fast_acquires, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&g_afl_totals.slow_acquires, ivh_afl_stats.slow_acquires, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&g_afl_totals.sleeps, ivh_afl_stats.sleeps, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&g_afl_totals.wakes_issued, ivh_afl_stats.wakes_issued, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&g_afl_totals.wakes_skipped, ivh_afl_stats.wakes_skipped, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&g_afl_totals.eagain, ivh_afl_stats.eagain, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&g_afl_totals.eintr, ivh_afl_stats.eintr, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&g_afl_totals.timeouts, ivh_afl_stats.timeouts, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&g_afl_totals.stale_detections, ivh_afl_stats.stale_detections, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&g_afl_totals.stale_recheck_aborts, ivh_afl_stats.stale_recheck_aborts, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&g_afl_totals.wakes_woke_nobody, ivh_afl_stats.wakes_woke_nobody, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&g_afl_totals.wakes_woke_someone, ivh_afl_stats.wakes_woke_someone, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&g_afl_totals.total_threads_woken, ivh_afl_stats.total_threads_woken, __ATOMIC_RELAXED);
+#endif
         return NULL;
 }
 
@@ -775,6 +820,10 @@ int main (int argc, char **argv)
         }
 
         memset(&data, 0, sizeof(data));
+        ivh_afl_global_init();
+        ivh_afl_init(&data.lock);
+        ivh_afl_set_abort_flag(&data.lock, (const volatile bool *)&data.done);
+        ivh_afl_set_hooks(&data.lock, ivh_afl_hook_before_sleep, ivh_afl_hook_after_wake, NULL);
 
         cpus = sysconf(_SC_NPROCESSORS_CONF);
         if (num_threads <= 0)
@@ -856,6 +905,17 @@ int main (int argc, char **argv)
 
         data.done = true;
         wmb();
+        /*
+         * Must run before joining: a thread blocked in FUTEX_WAIT does not
+         * poll data.done at all, so without this wake, pthread_join() below
+         * hangs on any thread that happened to be asleep at end-of-run --
+         * i.e. on essentially every run that had any real contention. The
+         * IVH_AFL_WAIT_TIMEOUT_NS backstop in the header covers the residual
+         * race (a thread between its last abort check and its FUTEX_WAIT
+         * syscall entry when this runs); this wake covers everyone else
+         * immediately instead of waiting out that timeout.
+         */
+        ivh_afl_shutdown_wake(&data.lock);
         for (i = 0; i < num_threads + num_busy_threads; i++) {
                 pthread_join(threads[i], NULL);
                 if (i >= num_threads)
@@ -1002,5 +1062,20 @@ int main (int argc, char **argv)
         printf("Total extended: %lld\n", total_extended);
         printf("      max wait: %lld\n", max_wait);
         printf("           max: %lld (avg: %llu)\n", max, avg_held);
+#ifdef IVH_AFL_STATS
+        printf("\nivh_afl stats (summed across all worker threads):\n");
+        printf("  fast_acquires (0->1, wake-skipping path) : %" PRIu64 "\n", g_afl_totals.fast_acquires);
+        printf("  slow_acquires (0->2 exchange)            : %" PRIu64 "\n", g_afl_totals.slow_acquires);
+        printf("  sleeps (FUTEX_WAIT entered)               : %" PRIu64 "\n", g_afl_totals.sleeps);
+        printf("  wakes_issued (unlock found state==2)      : %" PRIu64 "\n", g_afl_totals.wakes_issued);
+        printf("  wakes_skipped (unlock found state==1)     : %" PRIu64 "\n", g_afl_totals.wakes_skipped);
+        printf("  eagain/eintr/timeouts                     : %" PRIu64 " / %" PRIu64 " / %" PRIu64 "\n",
+               g_afl_totals.eagain, g_afl_totals.eintr, g_afl_totals.timeouts);
+        printf("  stale_detections                          : %" PRIu64 "\n", g_afl_totals.stale_detections);
+        printf("  stale_recheck_aborts (sleep avoided)       : %" PRIu64 "\n", g_afl_totals.stale_recheck_aborts);
+        printf("  wakes_woke_nobody (real, direct measure)  : %" PRIu64 "\n", g_afl_totals.wakes_woke_nobody);
+        printf("  wakes_woke_someone                        : %" PRIu64 "\n", g_afl_totals.wakes_woke_someone);
+        printf("  total_threads_woken                       : %" PRIu64 "\n", g_afl_totals.total_threads_woken);
+#endif
         return 0;
 }
