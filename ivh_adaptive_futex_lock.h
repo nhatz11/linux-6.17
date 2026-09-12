@@ -287,12 +287,15 @@ static void ivh_afl_global_init(void)
 	const char *wake_env = getenv("IVH_AFL_WAKE");
 	const char *disable_env = getenv("IVH_AFL_DISABLE");
 	const char *stale_env = getenv("IVH_AFL_STALE_NS");
+	const char *spins_env = getenv("IVH_AFL_SPINS");
 	unsigned long stale_ns = IVH_AFL_STALE_NS;
 
 	if (wake_env && atoi(wake_env) > 0)
 		ivh_afl_g_wake_count = (uint32_t)atoi(wake_env);
 	if (stale_env && atol(stale_env) > 0)
 		stale_ns = strtoul(stale_env, NULL, 10);
+	if (spins_env && atoi(spins_env) > 0)
+		ivh_afl_g_spins_before_check = (unsigned)atoi(spins_env);
 
 	ivh_afl_calibrate_tsc();
 	ivh_afl_g_stale_tsc = (stale_ns * ivh_afl_tsc_per_ns_x1000) / 1000ULL;
