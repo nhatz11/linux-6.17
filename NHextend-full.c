@@ -518,7 +518,10 @@ static struct ivh_afl_stats g_afl_totals;
 static void ivh_afl_hook_before_sleep(void *arg)
 {
         (void)arg;
-        if (!extend_wait && unextend())
+        /* Only -w (extend_wait) mode holds a cr_counter extension across the
+         * wait at all; in the default mode the extension is now armed after
+         * acquisition (see grab_lock()), so there is nothing to drop here. */
+        if (extend_wait && unextend())
                 g_tdata->extended++;
         wait_exit();
 }
@@ -527,7 +530,7 @@ static void ivh_afl_hook_after_wake(void *arg)
 {
         (void)arg;
         wait_enter();
-        if (!extend_wait)
+        if (extend_wait)
                 extend();
 }
 
@@ -586,15 +589,53 @@ static void grab_lock(struct thread_data *tdata, struct data *data)
                 extend();
 
         tracefs_printf(NULL, "Grab lock\n");
-        if (!extend_wait)
-                extend();
         start = get_time();
 
         lock_ret = ivh_afl_lock(&data->lock);
         if (lock_ret != IVH_AFL_OK) {
+                if (extend_wait && unextend())
+                        tdata->extended++;
                 wait_exit(); /* abandoned wait at shutdown */
                 return;
         }
+
+        /*
+         * Arm the rseq timeslice extension for the CRITICAL SECTION, here,
+         * AFTER the acquisition -- not before the wait.
+         *
+         * This is parity with NHextend3.c, and its absence was a real
+         * (measured) defect in this port, not a style difference.
+         * NHextend3's acquire loop arms `extend()` immediately before each
+         * cmpxchg attempt and disarms it (`unextend()`, yielding if the
+         * kernel had already granted a deferral) the instant that attempt
+         * fails -- so a spinning waiter there holds NO extension request,
+         * and the request the eventual holder carries into its CS was armed
+         * microseconds earlier and is unspent.
+         *
+         * This file used to arm it once before calling ivh_afl_lock(), which
+         * on a contended lock can spin or sleep for MILLISECONDS before
+         * returning. The request sat armed across that whole wait, the
+         * kernel spent it there (granting the waiter a deferral it had no
+         * use for and then setting the yield-owed bit, which this path never
+         * answers), and the thread entered its 1.6ms critical section with
+         * nothing left to defer preemption with.
+         *
+         * Measured cost at loop_spin=600000, 8 threads, 10s: CS *active*
+         * (on-CPU) time was identical between the two binaries (936us vs
+         * 929us, +0.7%), but CS *overall* time was 1,048us vs 948us -- i.e.
+         * the holder spent 113us per CS off-CPU here against 19us in
+         * NHextend3, and CS cycles with a >100us preemption ran 3.12% vs
+         * 1.23%. That entire gap is on the serialized critical path, and it
+         * grew with thread count (the longer the wait, the more certainly
+         * the extension was spent before the CS began), which is exactly the
+         * shape of the 8/4/2-thread regression.
+         *
+         * Note this is the benchmark's own pre-existing rseq cr_counter
+         * mechanism, used here exactly as NHextend3.c uses it -- no kernel
+         * migration-engine signal is consulted.
+         */
+        if (!extend_wait)
+                extend();
 
         wait_exit(); /* lock acquired; no longer spinning/waiting */
         end_wait = get_time();
@@ -612,13 +653,47 @@ static void grab_lock(struct thread_data *tdata, struct data *data)
         data->x++;
 
         /*
-         * Loop -- ivh_afl_beat() is self-gated (IVH_AFL_BEAT_MASK) so it is
-         * cheap enough to call every iteration; it only actually republishes
-         * the heartbeat every (mask+1) calls.
+         * Loop.
+         *
+         * The heartbeat republish interval is gated HERE, by this loop's own
+         * counter, rather than by calling ivh_afl_beat() (whose self-gating
+         * __thread counter is the right API for a caller with no loop of its
+         * own, and the wrong one for this caller -- see the cost note on
+         * ivh_afl_beat() in ivh_adaptive_futex_lock.h).
+         *
+         * Why this matters, measured 2026-09-13: ivh_afl_beat() compiled to a
+         * %fs-relative LOAD *and STORE* of its gate counter on every single
+         * iteration, immediately before the next sfence -- and sfence has to
+         * drain that store, so the per-iteration tax was not the couple of
+         * uops it looks like on paper. At loop_spin=600000 that is 600k
+         * drained stores per critical section, a fixed cost paid whether or
+         * not the adaptive mechanism is ever used. Under real contention (16
+         * threads) it is trivial next to what the mechanism saves; at low
+         * thread counts there is no stalled holder left to catch, so only the
+         * tax remained -- it showed up as a -7% .. -19% throughput regression
+         * against plain NHextend3 at 8/4/2/1 threads.
+         *
+         * next_beat is a plain local whose address never escapes, so it stays
+         * in a register across wmb()'s memory clobber: the per-iteration delta
+         * against NHextend3.c's own `for (i...) wmb();` loop is now two
+         * register-only uops (cmp + a not-taken jcc) and zero memory traffic.
+         * Deliberately NOT restructured into a chunked/nested loop (which
+         * would also hoist the `loop_spin` global reload out of the inner
+         * loop): that would make this CS loop genuinely CHEAPER than the
+         * baseline's and flatter the very comparison this benchmark exists to
+         * make. The republish schedule is unchanged -- one publish every
+         * IVH_AFL_BEAT_INTERVAL iterations, exactly as before.
          */
-        for (int i = 0; i < loop_spin; i++) {
-                wmb();
-                ivh_afl_beat(&data->lock);
+        {
+                int next_beat = IVH_AFL_BEAT_INTERVAL;
+
+                for (int i = 0; i < loop_spin; i++) {
+                        wmb();
+                        if (__builtin_expect(i == next_beat, 0)) {
+                                ivh_afl_publish_heartbeat(&data->lock);
+                                next_beat += IVH_AFL_BEAT_INTERVAL;
+                        }
+                }
         }
 
         ivh_afl_unlock(&data->lock);

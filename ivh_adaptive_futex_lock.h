@@ -125,6 +125,11 @@ enum { IVH_AFL_OK = 0, IVH_AFL_ABORTED = -1 };
 #define IVH_AFL_BEAT_MASK 0x3FFu
 #endif
 
+/* The same gate expressed as a count, for callers that drive the interval
+ * from their own loop counter instead of calling ivh_afl_beat() -- the
+ * preferred pattern in any hot CS loop, see ivh_afl_beat()'s comment. */
+#define IVH_AFL_BEAT_INTERVAL ((int)(IVH_AFL_BEAT_MASK + 1u))
+
 /* FUTEX_WAKE count on unlock. 1 is the validated starting default per this
  * project's "measure before adding complexity" discipline -- waking more
  * than one is a real, known latency hedge (against the woken thread's own
@@ -345,8 +350,33 @@ static inline void ivh_afl_publish_heartbeat(struct ivh_afl_lock *l)
 
 /*
  * Call from inside the critical section. Self-gated by a __thread counter
- * and IVH_AFL_BEAT_MASK -- cheap enough to call every loop iteration; for
- * a caller with no loop, call at a few natural points instead.
+ * and IVH_AFL_BEAT_MASK.
+ *
+ * NOT cheap enough to call every iteration of a hot loop -- the original
+ * comment here claimed it was, and that claim was measured wrong on
+ * 2026-09-13. The gate counter is a __thread variable, so even on the
+ * (1023/1024) calls that publish nothing this compiles to a %fs-relative
+ * load AND store per call; in a CS loop whose body is a store fence (as in
+ * NHextend-full.c) that store has to drain before the next fence, which
+ * cost 7-20% of throughput at low thread counts, where the adaptive
+ * mechanism has no stall to catch and so returns nothing for it.
+ *
+ * ANY CALLER WITH A LOOP COUNTER OF ITS OWN SHOULD GATE ON THAT INSTEAD:
+ *
+ *     int next_beat = IVH_AFL_BEAT_INTERVAL;
+ *     for (int i = 0; i < n; i++) {
+ *             ...body...
+ *             if (i == next_beat) {
+ *                     ivh_afl_publish_heartbeat(l);
+ *                     next_beat += IVH_AFL_BEAT_INTERVAL;
+ *             }
+ *     }
+ *
+ * A local `next_beat` stays in a register across the body's memory
+ * clobbers, so the whole gate costs a register compare and a predicted
+ * not-taken branch, with no memory traffic at all. Use ivh_afl_beat() only
+ * where there is no such counter (straight-line CS code, a few natural
+ * call points) -- that is what it is for.
  *
  * The per-thread gate counter is not reset across different locks, so with
  * multiple locks held in sequence the gating is approximate -- benign, the
@@ -375,6 +405,10 @@ static inline int ivh_afl_lock(struct ivh_afl_lock *l)
 	uint32_t expected;
 	unsigned spins = 0;
 	struct timespec timeout;
+	/* Earliest TSC at which re-reading l->hb_tsc could possibly change
+	 * this waiter's stale/not-stale verdict; see "Tier-2a, DEADLINE SKIP"
+	 * below. INT64_MIN = "nothing observed yet, read on the first check". */
+	int64_t next_hb_read_tsc = INT64_MIN;
 
 	/* --- fast path: uncontended. STRONG cas -- a spurious failure here
 	 * would push an uncontended acquire into the slow path and install a
@@ -471,12 +505,51 @@ static inline int ivh_afl_lock(struct ivh_afl_lock *l)
 		 * direction. This is the single most likely one-character
 		 * bug in this file -- if staleness ever fires constantly on
 		 * an idle host, check this cast first.
+		 *
+		 * Tier-2a, added 2026-09-13 -- DEADLINE SKIP. RDTSC is local
+		 * and free of coherence traffic; the load of l->hb_tsc is not.
+		 * It pulls the holder's heartbeat line into this waiter's
+		 * cache in Shared state, so the holder's next republish has
+		 * to take it back exclusive. With several waiters each
+		 * probing every IVH_AFL_SPINS_BEFORE_CHECK spins, that line
+		 * ping-pongs continuously and the cost lands ON THE HOLDER,
+		 * i.e. directly on the serialized critical path -- measured
+		 * at ~4-5% of throughput at 4 threads on this host.
+		 *
+		 * The skip removes most of those loads for free, using a
+		 * fact the previous code had already computed and thrown
+		 * away: having just seen heartbeat value `hb`, this waiter
+		 * CANNOT legitimately conclude staleness before hb +
+		 * stale_tsc, no matter what happens in between. Heartbeats
+		 * only ever move forward (a republish by this holder, or an
+		 * acquisition by the next one), so a later read can only push
+		 * that deadline further out, never pull it in. Re-reading
+		 * hb_tsc before the deadline therefore cannot change this
+		 * waiter's decision -- it can only generate coherence
+		 * traffic. So: remember the deadline, and until it passes,
+		 * spin on RDTSC alone and never touch the line.
+		 *
+		 * This changes no threshold and no state-machine rule. Worst
+		 * case detection latency is unchanged (a holder that stalls
+		 * immediately after its last beat is still detected one
+		 * stale_tsc later, which is the definition of the threshold);
+		 * the only thing given up is the ability to notice a stall
+		 * EARLIER than the threshold allows, which was never a
+		 * legitimate conclusion to draw in the first place.
 		 */
 		{
 			int64_t now = (int64_t)__rdtsc();
-			int64_t hb = (int64_t)__atomic_load_n(&l->hb_tsc, __ATOMIC_RELAXED);
+			int64_t hb;
+
+			if (now < next_hb_read_tsc) {
+				ivh_afl_cpu_relax();
+				continue;
+			}
+
+			hb = (int64_t)__atomic_load_n(&l->hb_tsc, __ATOMIC_RELAXED);
 
 			if (now - hb < (int64_t)l->stale_tsc) {
+				next_hb_read_tsc = hb + (int64_t)l->stale_tsc;
 				ivh_afl_cpu_relax();
 				continue;
 			}
@@ -497,6 +570,7 @@ static inline int ivh_afl_lock(struct ivh_afl_lock *l)
 			hb = (int64_t)__atomic_load_n(&l->hb_tsc, __ATOMIC_RELAXED);
 			if (now - hb < (int64_t)l->stale_tsc) {
 				IVH_AFL_STAT_INC(stale_recheck_aborts);
+				next_hb_read_tsc = hb + (int64_t)l->stale_tsc;
 				ivh_afl_cpu_relax();
 				continue;
 			}
@@ -517,6 +591,12 @@ static inline int ivh_afl_lock(struct ivh_afl_lock *l)
 			 * the same thing: loop and re-probe. None of them means
 			 * "you now hold the lock." */
 		}
+
+		/* Arbitrary time has passed inside the kernel, and the lock
+		 * has very likely changed hands: the deadline-skip window
+		 * computed before the sleep is meaningless now. Re-read the
+		 * heartbeat on the first check after waking. */
+		next_hb_read_tsc = INT64_MIN;
 
 		if (l->after_wake)
 			l->after_wake(l->hook_arg);
