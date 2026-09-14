@@ -180,6 +180,22 @@ struct ivh_afl_lock {
 	uint64_t stale_tsc;
 	uint32_t wake_count;
 	uint32_t enabled; /* 0 => TSC untrusted or IVH_AFL_DISABLE=1: pure spin, never sleep */
+	/*
+	 * 0 => FUTEX_*_PRIVATE, keyed on (mm, addr): correct and cheapest for a
+	 * lock only ever touched by threads of ONE process.
+	 * 1 => plain FUTEX_*, keyed on (inode, offset): required the moment the
+	 * lock lives in memory shared between PROCESSES (MAP_SHARED / shm), as
+	 * in PostgreSQL's LWLocks, Apache prefork, nginx's ngx_shmtx or MOSBench
+	 * exim. Two processes mapping the same page have different mm, so the
+	 * PRIVATE key would differ per process and waiters would never see each
+	 * other's wakes -- a silent hang, not an error.
+	 *
+	 * Per-lock rather than global on purpose: a process can legitimately
+	 * hold both kinds at once (private per-thread locks plus one shared
+	 * mutex in an mmap'd segment), and paying the shared-key cost on the
+	 * private ones would be pure loss.
+	 */
+	uint32_t shared;
 #ifdef IVH_AFL_DEBUG
 	volatile int owner_tid;
 #endif
@@ -219,12 +235,25 @@ static uint64_t ivh_afl_tsc_per_ns_x1000 = 3000; /* overwritten by calibration *
 static uint64_t ivh_afl_g_stale_tsc;
 static uint32_t ivh_afl_g_wake_count = IVH_AFL_WAKE_COUNT;
 static uint32_t ivh_afl_g_enabled = 1;
+static uint32_t ivh_afl_g_shared = 0;   /* IVH_AFL_SHARED=1 validation override */
 static unsigned ivh_afl_g_spins_before_check = IVH_AFL_SPINS_BEFORE_CHECK;
 
 static inline long ivh_afl_futex(volatile uint32_t *uaddr, int op, uint32_t val,
 				  const struct timespec *timeout)
 {
 	return syscall(SYS_futex, uaddr, op, val, timeout, NULL, 0);
+}
+
+/*
+ * FUTEX_WAIT_PRIVATE is literally FUTEX_WAIT | FUTEX_PRIVATE_FLAG, so the
+ * private/shared choice is one OR, resolved from the lock itself. Reading
+ * l->shared costs nothing extra: it sits in the same cacheline as
+ * l->wake_count and l->stale_tsc, both of which every one of these paths
+ * already touches.
+ */
+static inline int ivh_afl_op(const struct ivh_afl_lock *l, int base)
+{
+	return l->shared ? base : (base | FUTEX_PRIVATE_FLAG);
 }
 
 /*
@@ -293,6 +322,7 @@ static void ivh_afl_global_init(void)
 	const char *disable_env = getenv("IVH_AFL_DISABLE");
 	const char *stale_env = getenv("IVH_AFL_STALE_NS");
 	const char *spins_env = getenv("IVH_AFL_SPINS");
+	const char *shared_env = getenv("IVH_AFL_SHARED");
 	unsigned long stale_ns = IVH_AFL_STALE_NS;
 
 	if (wake_env && atoi(wake_env) > 0)
@@ -308,6 +338,17 @@ static void ivh_afl_global_init(void)
 	ivh_afl_g_enabled = 1;
 	if (disable_env && atoi(disable_env) != 0)
 		ivh_afl_g_enabled = 0;
+
+	/*
+	 * VALIDATION KNOB, not a production one. Forces every lock created by
+	 * ivh_afl_init() onto the shared futex key even in a single-process
+	 * program, so the cost of the (inode, offset) key can be measured
+	 * against the (mm, addr) key on an existing single-process benchmark
+	 * without first writing a multi-process harness. Real multi-process
+	 * users should call ivh_afl_init_shared() per lock instead.
+	 */
+	if (shared_env && atoi(shared_env) != 0)
+		ivh_afl_g_shared = 1;
 	if (!ivh_afl_tsc_trustworthy()) {
 		fprintf(stderr,
 			"ivh_afl: TSC not confirmed reliable (missing constant_tsc/"
@@ -325,6 +366,24 @@ static inline void ivh_afl_init(struct ivh_afl_lock *l)
 	l->stale_tsc = ivh_afl_g_stale_tsc;
 	l->wake_count = ivh_afl_g_wake_count;
 	l->enabled = ivh_afl_g_enabled;
+	l->shared = ivh_afl_g_shared;
+}
+
+/*
+ * Same as ivh_afl_init() but for a lock that will be touched by more than one
+ * PROCESS. Call this instead of ivh_afl_init() for any lock placed in an
+ * mmap(MAP_SHARED) / shm segment. Everything else about the lock is unchanged:
+ * the TSC heartbeat is a plain rdtsc store into the shared page and already
+ * works across processes, and rseq extend()/unextend() is per-thread, so the
+ * futex key is genuinely the only process-scoped thing here.
+ *
+ * Must be called exactly once, by whichever process creates the segment,
+ * BEFORE any other process maps and uses it.
+ */
+static inline void ivh_afl_init_shared(struct ivh_afl_lock *l)
+{
+	ivh_afl_init(l);
+	l->shared = 1;
 }
 
 static inline void ivh_afl_set_abort_flag(struct ivh_afl_lock *l,
@@ -581,7 +640,7 @@ static inline int ivh_afl_lock(struct ivh_afl_lock *l)
 
 		IVH_AFL_STAT_INC(sleeps);
 		{
-			long r = ivh_afl_futex(&l->state, FUTEX_WAIT_PRIVATE, 2, &timeout);
+			long r = ivh_afl_futex(&l->state, ivh_afl_op(l, FUTEX_WAIT), 2, &timeout);
 			if (r < 0) {
 				if (errno == EAGAIN) IVH_AFL_STAT_INC(eagain);
 				else if (errno == EINTR) IVH_AFL_STAT_INC(eintr);
@@ -622,7 +681,7 @@ static inline void ivh_afl_unlock(struct ivh_afl_lock *l)
 		IVH_AFL_STAT_INC(wakes_issued);
 #ifdef IVH_AFL_STATS
 		{
-			long woken = ivh_afl_futex(&l->state, FUTEX_WAKE_PRIVATE,
+			long woken = ivh_afl_futex(&l->state, ivh_afl_op(l, FUTEX_WAKE),
 						   l->wake_count, NULL);
 			if (woken > 0) {
 				IVH_AFL_STAT_INC(wakes_woke_someone);
@@ -632,7 +691,7 @@ static inline void ivh_afl_unlock(struct ivh_afl_lock *l)
 			}
 		}
 #else
-		ivh_afl_futex(&l->state, FUTEX_WAKE_PRIVATE, l->wake_count, NULL);
+		ivh_afl_futex(&l->state, ivh_afl_op(l, FUTEX_WAKE), l->wake_count, NULL);
 #endif
 	} else {
 		IVH_AFL_STAT_INC(wakes_skipped);
@@ -654,7 +713,7 @@ static inline void ivh_afl_unlock(struct ivh_afl_lock *l)
  */
 static inline void ivh_afl_shutdown_wake(struct ivh_afl_lock *l)
 {
-	ivh_afl_futex(&l->state, FUTEX_WAKE_PRIVATE, (uint32_t)INT32_MAX, NULL);
+	ivh_afl_futex(&l->state, ivh_afl_op(l, FUTEX_WAKE), (uint32_t)INT32_MAX, NULL);
 }
 
 #endif /* IVH_ADAPTIVE_FUTEX_LOCK_H */
