@@ -2806,19 +2806,57 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 		error = futex_hash_prctl(arg2, arg3, arg4);
 		break;
 	case PR_SET_IVH_ELIGIBLE:
+		/*
+		 * 2026-07-20: PF_IVH_ELIGIBLE (arg2 == 1) is no longer
+		 * consulted anywhere IVH actually does something -- migration,
+		 * the Hot Threads EWMA feed, and mutex-spin observability are
+		 * all gated on the ivh_universal_eligible sysctl only now, not
+		 * per-process opt-in. Setting/clearing the flag still works
+		 * (PR_GET_IVH_ELIGIBLE still reports it) but it is vestigial:
+		 * no code path reads it to decide whether to do IVH work.
+		 *
+		 * arg2 == 2 (ivh_observe) and arg2 == 3 (ivh_exclude) are
+		 * unaffected by that and both still do something, independent
+		 * of PF_IVH_ELIGIBLE and of each other:
+		 *   2: observe-only stats (ivh_exec -v), independent of
+		 *      ivh_universal_eligible too.
+		 *   3: per-task opt-out. ivh_universal_eligible is a single
+		 *      global switch with no other way to exclude one specific
+		 *      process -- this is what makes ivh_exec -v -n meaningful
+		 *      again now that PF_IVH_ELIGIBLE can't do that job. Checked
+		 *      as `ivh_universal_eligible && !ivh_exclude` everywhere
+		 *      the sysctl gates behavior.
+		 * All three bits are independent and combinable (call once per
+		 * bit wanted).
+		 * arg2 == 0: clear PF_IVH_ELIGIBLE, ivh_observe, AND ivh_exclude.
+		 */
 		if (arg3 || arg4 || arg5)
 			return -EINVAL;
-		if (arg2 == 1)
+		if (arg2 == 1) {
 			current->flags |= PF_IVH_ELIGIBLE;
-		else if (arg2 == 0)
+		} else if (arg2 == 2) {
+			current->ivh_observe = 1;
+		} else if (arg2 == 3) {
+			current->ivh_exclude = 1;
+		} else if (arg2 == 0) {
 			current->flags &= ~PF_IVH_ELIGIBLE;
-		else
+			current->ivh_observe = 0;
+			current->ivh_exclude = 0;
+		} else {
 			return -EINVAL;
+		}
 		break;
 	case PR_GET_IVH_ELIGIBLE:
 		if (arg2 || arg3 || arg4 || arg5)
 			return -EINVAL;
-		error = !!(current->flags & PF_IVH_ELIGIBLE);
+		if (current->ivh_exclude)
+			error = 3;
+		else if (current->flags & PF_IVH_ELIGIBLE)
+			error = 1;
+		else if (current->ivh_observe)
+			error = 2;
+		else
+			error = 0;
 		break;
 	default:
 		trace_task_prctl_unknown(option, arg2, arg3, arg4, arg5);

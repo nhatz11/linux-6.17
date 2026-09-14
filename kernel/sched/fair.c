@@ -87,6 +87,66 @@ EXPORT_SYMBOL_GPL(ivh_migrations_done);
 static DEFINE_PER_CPU(u64, ivh_prelock_calls);
 static DEFINE_PER_CPU(u64, ivh_prelock_cooldown_skipped);
 
+/* Per-CPU rejection counters for ivh_steal_imminent()'s two gates, below. */
+static DEFINE_PER_CPU(u64, ivh_steal_imminent_capacity_reject);
+static DEFINE_PER_CPU(u64, ivh_steal_imminent_time_left_reject);
+
+/*
+ * Decision-agreement comparators (Build 1, tools/bpf/docs/
+ * ivh_tsc_full_redesign_build_plan_2026-07-29.md sec 3.8), declared in
+ * <linux/bpf_sched.h>.  Fed only while ivh_decision_shadow != 0, read only by
+ * /proc/ivh_debug, and never consulted by any decision -- which is the point.
+ * Not static because the declaration is shared, so that a future reader of
+ * bpf_sched.h can see the whole comparator set in one place next to the
+ * source knobs it exists to validate.
+ */
+DEFINE_PER_CPU(u64, ivh_dec_agree_go);
+DEFINE_PER_CPU(u64, ivh_dec_agree_nogo);
+DEFINE_PER_CPU(u64, ivh_dec_tsc_only_go);
+DEFINE_PER_CPU(u64, ivh_dec_real_only_go);
+DEFINE_PER_CPU(u64, ivh_cap_pass_both);
+DEFINE_PER_CPU(u64, ivh_cap_pass_real_only);
+DEFINE_PER_CPU(u64, ivh_cap_pass_tsc_only);
+DEFINE_PER_CPU(u64, ivh_cap_pass_neither);
+
+/*
+ * vcap-retirement comparators, tools/bpf/docs/
+ * ivh_vcap_retirement_build_plan_2026-08-03.md sec 5.4.  Same posture as the
+ * pair above: fed only while ivh_decision_shadow != 0, read only by
+ * /proc/ivh_debug, never consulted by any decision.
+ */
+DEFINE_PER_CPU(u64, ivh_dec_uc_agree_go);
+DEFINE_PER_CPU(u64, ivh_dec_uc_agree_nogo);
+DEFINE_PER_CPU(u64, ivh_dec_uc_only_go);
+DEFINE_PER_CPU(u64, ivh_dec_uc_real_only_go);
+DEFINE_PER_CPU(u64, ivh_uc_pass_both);
+DEFINE_PER_CPU(u64, ivh_uc_pass_vcap_only);
+DEFINE_PER_CPU(u64, ivh_uc_pass_uc_only);
+DEFINE_PER_CPU(u64, ivh_uc_pass_neither);
+/*
+ * Destination-set EMPTY rate, one bool per shadow evaluation per source.
+ * The counter the pair above does not have: pass_{both,real_only,...} can
+ * all be small while EVERY candidate still fails, and that is a materially
+ * different failure ("IVH stops migrating at all") from a biased-but-
+ * nonempty destination set.  Directly predicted by retirement plan sec 1.4:
+ * rq->ivh_vact_capacity reads below 850 on all 16 CPUs on this host today,
+ * which would make ivh_destset_empty_tsc read 100% if it were live.
+ */
+DEFINE_PER_CPU(u64, ivh_destset_empty_vcap);
+DEFINE_PER_CPU(u64, ivh_destset_empty_uc);
+DEFINE_PER_CPU(u64, ivh_destset_empty_tsc);
+
+/*
+ * Mirror of IVH_CAP_FLOOR in tools/bpf/MY_ivh_atc.bpf.c.  The BPF program is
+ * a separate compilation unit with no shared header, so this constant is
+ * duplicated rather than included.  It exists ONLY for the destination-set
+ * comparator in bpf_sched_pre_lock_migrate() -- nothing in the kernel's own
+ * decision path reads it -- but if the BPF side is ever retuned this must be
+ * retuned in the same commit, or the comparator quietly starts modelling a
+ * gate that no longer exists and reports agreement with a fiction.
+ */
+#define IVH_BPF_CAP_FLOOR	850UL
+
 /*
  * ivh_wait diagnostic registry — EXPERIMENT ONLY (bare-schedule() hang
  * investigation, 2026-06-30).  Records every in-flight self-migration
@@ -13199,6 +13259,281 @@ bool ivh_eval_cooldown_ok(void)
 }
 EXPORT_SYMBOL_GPL(ivh_eval_cooldown_ok);
 
+/*
+ * ---------------------------------------------------------------------------
+ * IVH Gate 1+2 source selection (Build 1, tools/bpf/docs/
+ * ivh_tsc_full_redesign_build_plan_2026-07-29.md sec 3.5.4 / 3.8).
+ * ---------------------------------------------------------------------------
+ *
+ * Both gates gain a SOURCE parameter rather than a sysctl read of their own,
+ * so that the same body can be evaluated twice -- once from vcap's numbers,
+ * once from Part C's -- for the shadow comparator.  At the default
+ * ivh_cap_source == 0 / ivh_preempt_event_source == 0 the expressions below
+ * reduce to exactly the code they replaced, term for term.
+ */
+
+/*
+ * Gate 1's capacity input.
+ *
+ * Note it selects rq->ivh_vact_capacity and NOT rq->cpu_capacity_custom.
+ * That is not an oversight: cpu_capacity_custom is the field vcap writes, and
+ * it only reaches rq->cpu_capacity inside update_cpu_capacity(), which runs
+ * at load-balance cadence (guarded by sg->sgc->next_update).  A tick-rate
+ * replacement routed through it would throw away its own resolution, and
+ * writing rq->cpu_capacity directly would be clobbered by the next balance
+ * pass.  A dedicated field also leaves the vcap path completely untouched,
+ * which is what keeps vcap usable as the comparator baseline.
+ */
+/*
+ * @cap_src is the raw ivh_cap_source value (0/1/2/3), not a bool, since
+ * vcap retirement (tools/bpf/docs/ivh_vcap_retirement_build_plan_2026-08-03.md)
+ * added a third real source alongside Part C's rq->ivh_vact_capacity: 3
+ * selects rq->ivh_uc_capacity.  1 (shadow) is never passed here -- the
+ * shadow evaluation below calls this with explicit 0/2/3, never with the
+ * live sysctl value, so this function does not need to special-case it.
+ */
+static __always_inline unsigned long ivh_gate_capacity(struct rq *rq, unsigned long cap_src)
+{
+	switch (cap_src) {
+	case 2:  return rq->ivh_vact_capacity;
+	case 3:  return rq->ivh_uc_capacity;
+	default: return rq->cpu_capacity;
+	}
+}
+
+/*
+ * Gate 2's "time left" verdict.  Returns true to REJECT (enough runway
+ * remains, so no migration is warranted).
+ *
+ * @tsc_pe selects the preemption-event series.  When it is set, every term is
+ * computed in raw TSC cycles and converted to ns AT THE POINT OF USE, because
+ * the formula unavoidably mixes them with current->last_cs_ns and with
+ * ivh_time_left_threshold_ns, both of which are nanoseconds.  Note what is
+ * NOT done: an absolute TSC value is never compared against an absolute
+ * sched_clock() value.  Only DURATIONS cross the unit boundary -- "cycles
+ * since the last preemption event", "length of the last burst" -- because the
+ * two clocks share no epoch and comparing their absolute values would be a
+ * silently meaningless gate.  That mistake was in an earlier planning round
+ * and is exactly what the TSC-native representation is meant to prevent.
+ *
+ * rq->last_idle_tp's TSC counterpart is rq->ivh_vact_idle_exit_tsc, which is
+ * written at the same instant in account_idle_time(), so the max() has the
+ * same meaning in both branches.
+ */
+static __always_inline bool ivh_gate_time_left_reject(struct rq *rq, u64 last_cs_ns,
+						      bool tsc_pe)
+{
+	if (!READ_ONCE(ivh_time_left_source)) {
+		/* Original formula, verbatim apart from the source select. */
+		u64 ewma = rq->ewma_act_ns;
+		u64 act_sofar;
+
+		if (ewma == 0)
+			return false;
+
+		act_sofar = tsc_pe
+			? ivh_tsc_cycles_to_ns(ivh_raw_tsc() - rq->ivh_vact_last_preempt_tsc)
+			: sched_clock() - rq->last_preemption;
+
+		return ewma > act_sofar &&
+		       (ewma - act_sofar) >= ivh_time_left_threshold_ns;
+	}
+
+	{
+		/* Later tree's formula. */
+		u64 last_active, elapsed_since_active;
+		s64 runway, time_left;
+
+		if (tsc_pe) {
+			u64 ref = max(rq->ivh_vact_last_preempt_tsc,
+				      rq->ivh_vact_idle_exit_tsc);
+
+			last_active = ivh_tsc_cycles_to_ns(rq->ivh_vact_last_active_c);
+			elapsed_since_active = ivh_tsc_cycles_to_ns(ivh_raw_tsc() - ref);
+		} else {
+			last_active = rq->last_active_time;
+			elapsed_since_active = sched_clock() -
+				max(rq->last_preemption, (u64)rq->last_idle_tp);
+		}
+
+		runway = (s64)last_active - (s64)elapsed_since_active;
+		time_left = runway - (s64)last_cs_ns;
+
+		return last_active != 0 &&
+		       time_left > (s64)ivh_time_left_threshold_ns;
+	}
+}
+
+/*
+ * Decision-agreement 2x2 (sec 3.8a).  Fed only while ivh_decision_shadow is
+ * on.  Kept in its own inline so that the counting is visibly separate from
+ * the verdict the caller actually returns -- these counters must never become
+ * load-bearing, and physically separating them from the return path is the
+ * cheapest way to keep that true.
+ */
+static __always_inline void ivh_dec_shadow_bin(bool real_go, bool tsc_go)
+{
+	if (real_go == tsc_go) {
+		if (real_go)
+			this_cpu_inc(ivh_dec_agree_go);
+		else
+			this_cpu_inc(ivh_dec_agree_nogo);
+	} else if (tsc_go) {
+		this_cpu_inc(ivh_dec_tsc_only_go);
+	} else {
+		this_cpu_inc(ivh_dec_real_only_go);
+	}
+}
+
+/*
+ * Gate-level agreement (real vs uc), parallel to ivh_dec_shadow_bin() above
+ * but scoped to the capacity term only -- vcap retirement does not touch
+ * Gate 2, so both arms this is fed from use the SAME time-left verdict,
+ * isolating exactly the difference the retirement plan sec 5.4 needs
+ * measured.  A separate function rather than a third arm of
+ * ivh_dec_shadow_bin() so the existing real-vs-tsc counters stay
+ * byte-for-byte what they have always meant.
+ */
+static __always_inline void ivh_dec_uc_shadow_bin(bool real_go, bool uc_go)
+{
+	if (real_go == uc_go) {
+		if (real_go)
+			this_cpu_inc(ivh_dec_uc_agree_go);
+		else
+			this_cpu_inc(ivh_dec_uc_agree_nogo);
+	} else if (uc_go) {
+		this_cpu_inc(ivh_dec_uc_only_go);
+	} else {
+		this_cpu_inc(ivh_dec_uc_real_only_go);
+	}
+}
+
+/*
+ * ivh_steal_imminent - Gate 1+2, "is this vCPU in the IVH danger zone".
+ *
+ * Runtime-switchable between two "time left" formulas via
+ * ivh_time_left_source (kernel/sched/bpf_sched.c):
+ *   0 (default) = this commit's original rq->ewma_act_ns formula, verbatim.
+ *   1           = a later tree's rq->last_active_time formula.
+ *
+ * As of Build 1 it is also runtime-switchable between vcap's inputs and Part
+ * C's, independently for the capacity term and the preemption-event terms.
+ * The existing ivh_steal_imminent_capacity_reject / _time_left_reject
+ * counters stay attached to the SELECTED path only, so what they mean does
+ * not change and a shadow evaluation never inflates them -- the same
+ * discipline the duplicated-gate comment on
+ * ivh_rq_capacity_and_timeleft_ok() below already enforces for the rseq path.
+ */
+static __always_inline bool ivh_steal_imminent(struct rq *rq)
+{
+	unsigned long cap_src = READ_ONCE(ivh_cap_source);
+	bool tsc_pe  = READ_ONCE(ivh_preempt_event_source) == 2;
+
+	/*
+	 * Shadow evaluation FIRST, so that whichever way the selected path
+	 * returns below, both verdicts have already been recorded for this
+	 * evaluation.  Costs extra gate evaluations and is default-off.
+	 *
+	 * uc_go isolates the capacity term only (retirement plan sec 5.4):
+	 * vcap retirement does not touch Gate 2, so both real_go and uc_go
+	 * use the SAME (real, non-TSC) time-left verdict -- comparing them
+	 * against real_go answers "would swapping ONLY the capacity input to
+	 * uc change today's decision", without also mixing in whatever Gate 2
+	 * source happens to be live.
+	 */
+	if (unlikely(READ_ONCE(ivh_decision_shadow))) {
+		u64 cs_ns = current->last_cs_ns;
+		bool real_go = !(ivh_gate_capacity(rq, 0) > ivh_capacity_threshold) &&
+			       !ivh_gate_time_left_reject(rq, cs_ns, false);
+		bool tsc_go  = !(ivh_gate_capacity(rq, 2) > ivh_capacity_threshold) &&
+			       !ivh_gate_time_left_reject(rq, cs_ns, true);
+		bool uc_go   = !(ivh_gate_capacity(rq, 3) > ivh_capacity_threshold) &&
+			       !ivh_gate_time_left_reject(rq, cs_ns, false);
+
+		ivh_dec_shadow_bin(real_go, tsc_go);
+		ivh_dec_uc_shadow_bin(real_go, uc_go);
+	}
+
+	if (ivh_gate_capacity(rq, cap_src) > ivh_capacity_threshold) {
+		this_cpu_inc(ivh_steal_imminent_capacity_reject);
+		return false;
+	}
+
+	if (ivh_gate_time_left_reject(rq, current->last_cs_ns, tsc_pe)) {
+		this_cpu_inc(ivh_steal_imminent_time_left_reject);
+		return false;
+	}
+
+	return true;
+}
+
+/*
+ * ivh_rq_capacity_and_timeleft_ok - Gate 1+2 verdict, WITHOUT the
+ * ivh_steal_imminent_*_reject stat side effects.
+ *
+ * Deliberate duplication of ivh_steal_imminent()'s two gates, not a shared
+ * call: this is invoked from the rseq return-to-userspace path
+ * (rseq_update_cpu_node_id() -> ivh_task_rq_in_danger(), kernel/rseq.c)
+ * every time an IVH-eligible thread resumes userspace execution -- far more
+ * often than actual lock attempts reach ivh_pre_lock()/sys_ivh_cs_enter().
+ * Reusing ivh_steal_imminent() verbatim would inflate
+ * ivh_steal_imminent_capacity_reject/_time_left_reject with advisory
+ * evaluations that never correspond to an actual migration decision,
+ * corrupting what those counters mean in /proc/ivh_debug. Keep the two
+ * gate bodies in sync by hand if either changes.
+ */
+static __always_inline bool ivh_rq_capacity_and_timeleft_ok(struct rq *rq,
+							     struct task_struct *t)
+{
+	unsigned long cap_src = READ_ONCE(ivh_cap_source);
+	bool tsc_pe  = READ_ONCE(ivh_preempt_event_source) == 2;
+
+	/*
+	 * Source selection tracks ivh_steal_imminent() exactly -- if these two
+	 * ever disagreed about which capacity number is authoritative, the
+	 * advisory RSEQ_SCHED_STATE_FLAG_IVH_DANGER bit would be answering a
+	 * different question from the gate it is supposed to predict.
+	 *
+	 * NO shadow evaluation here, deliberately, and for the same reason
+	 * this whole function exists as a duplicate rather than a call: this
+	 * path runs on every return to userspace for every eligible thread,
+	 * far more often than actual lock attempts reach ivh_pre_lock(), so
+	 * feeding the decision-agreement counters from here would swamp them
+	 * with advisory evaluations that never correspond to a migration
+	 * decision -- corrupting exactly the statistic sec 3.8 needs.
+	 */
+	if (ivh_gate_capacity(rq, cap_src) > ivh_capacity_threshold)
+		return false;
+
+	return !ivh_gate_time_left_reject(rq, t->last_cs_ns, tsc_pe);
+}
+
+/**
+ * ivh_task_rq_in_danger - cheap, advisory-only re-evaluation of Gate 1+2 for
+ * the CPU @t is currently on, called from kernel/rseq.c's
+ * rseq_update_cpu_node_id() (the rseq return-to-userspace path) so that
+ * RSEQ_SCHED_STATE_FLAG_IVH_DANGER can be published to userspace via the
+ * already-scheduled rseq_sched_state write -- no extra syscall, no extra
+ * user_write_access, just one more bit computed from data already resident
+ * (task_rq(t)'s cache line is already hot for the ON_CPU-flag update).
+ *
+ * NOT the authoritative migration decision: ivh_pre_lock() /
+ * sys_ivh_cs_enter() still gate the real migration synchronously and can
+ * reject even when this bit is set (this evaluation can be briefly stale --
+ * up to one return-to-userspace interval old -- and does not hold any lock
+ * or cooldown state). The point is purely to let userspace skip the
+ * syscall for the common case where migration is clearly not going to
+ * happen, per NHextend3's IVH_DANGER pre-check (see ivh_cs_enter() there).
+ */
+bool ivh_task_rq_in_danger(struct task_struct *t)
+{
+	if (!READ_ONCE(ivh_universal_eligible) || t->ivh_exclude)
+		return false;
+
+	return ivh_rq_capacity_and_timeleft_ok(task_rq(t), t);
+}
+EXPORT_SYMBOL_GPL(ivh_task_rq_in_danger);
+
 /**
  * bpf_sched_pre_lock_migrate - synchronous self-migration before spinlock acquire.
  *
@@ -13216,7 +13551,6 @@ EXPORT_SYMBOL_GPL(ivh_eval_cooldown_ok);
 void bpf_sched_pre_lock_migrate(void)
 {
 	struct rq *rq;
-	u64 ewma, act_sofar;
 	int target_cpu;
 	int src_cpu;
 	cpumask_var_t saved_mask;
@@ -13233,18 +13567,9 @@ void bpf_sched_pre_lock_migrate(void)
 	rq = this_rq();
 	src_cpu = rq->cpu;
 
-	/* Gate 1: vCPU not throttled */
-	if (rq->cpu_capacity > ivh_capacity_threshold)
+	/* Gate 1+2: vCPU not throttled, enough burst time remains. */
+	if (!ivh_steal_imminent(rq))
 		return;
-
-	/* Gate 2: enough burst time remains — migration not urgent */
-	ewma = rq->ewma_act_ns;
-	if (ewma != 0) {
-		act_sofar = sched_clock() - rq->last_preemption;
-		if (ewma > act_sofar &&
-		    (ewma - act_sofar) >= ivh_time_left_threshold_ns)
-			return;
-	}
 
 	/* Gate 3: task must be movable (more than one allowed CPU) */
 	if (cpumask_weight(current->cpus_ptr) <= 1)
@@ -13253,6 +13578,102 @@ void bpf_sched_pre_lock_migrate(void)
 	/* Gate 4: concurrency cap — don't pile threads into schedule() */
 	if ((unsigned long)atomic_read(&ivh_in_schedule) >= ivh_max_concurrent)
 		return;
+
+	/*
+	 * DESTINATION-SET AGREEMENT (build plan sec 3.8b), default off.
+	 *
+	 * The full BPF scan cannot be run twice, but the thing the capacity
+	 * number actually DECIDES can be: which CPUs pass GATE_CAPACITY_LOW
+	 * (cap > IVH_CAP_FLOOR) and GATE_NOT_BETTER (cap > the source CPU's own
+	 * capacity), the two gates in tools/bpf/MY_ivh_atc.bpf.c that read a
+	 * capacity number at all.  Both are modelled here against vcap's
+	 * numbers and against Part C's, and the pair is binned per candidate
+	 * CPU.
+	 *
+	 * IVH_CAP_FLOOR is 850 in the BPF program and is duplicated here as a
+	 * literal because the BPF program is a separate compilation unit with
+	 * no shared header; if that constant is ever retuned, retune this one
+	 * in the same commit or the comparator quietly starts modelling a gate
+	 * that no longer exists.
+	 *
+	 * This answers "would IVH have picked from the same candidate set",
+	 * which is the operational form of the question and which counters on
+	 * the raw signals cannot answer.  If pass_tsc_only and pass_real_only
+	 * are both small relative to pass_both, the capacity replacement is
+	 * behaviourally equivalent and ivh_cap_source=2 is safe; if either is
+	 * large it is not, and the DIRECTION says which way it is biased.
+	 *
+	 * An O(nr_cpus) walk, which is why it is behind a default-off sysctl --
+	 * but it sits on a path that immediately afterwards takes a global
+	 * raw_spin_lock_irqsave, crosses a BPF trampoline and does a full CPU
+	 * scan anyway, so inside a measurement window it is affordable.  Placed
+	 * after Gates 1-4 so it samples the same population of evaluations that
+	 * would really have gone on to select a destination.
+	 */
+	if (unlikely(READ_ONCE(ivh_decision_shadow))) {
+		unsigned long src_real = rq->cpu_capacity;
+		unsigned long src_tsc  = rq->ivh_vact_capacity;
+		unsigned long src_uc   = rq->ivh_uc_capacity;
+		bool any_real = false, any_uc = false, any_tsc = false;
+		int cpu;
+
+		for_each_online_cpu(cpu) {
+			struct rq *drq = cpu_rq(cpu);
+			bool pass_real, pass_tsc, pass_uc;
+
+			if (cpu == src_cpu)
+				continue;
+
+			pass_real = drq->cpu_capacity > IVH_BPF_CAP_FLOOR &&
+				    drq->cpu_capacity > src_real;
+			pass_tsc  = drq->ivh_vact_capacity > IVH_BPF_CAP_FLOOR &&
+				    drq->ivh_vact_capacity > src_tsc;
+			pass_uc   = drq->ivh_uc_capacity > IVH_BPF_CAP_FLOOR &&
+				    drq->ivh_uc_capacity > src_uc;
+
+			if (pass_real && pass_tsc)
+				this_cpu_inc(ivh_cap_pass_both);
+			else if (pass_real)
+				this_cpu_inc(ivh_cap_pass_real_only);
+			else if (pass_tsc)
+				this_cpu_inc(ivh_cap_pass_tsc_only);
+			else
+				this_cpu_inc(ivh_cap_pass_neither);
+
+			/*
+			 * vcap-retirement destination-set comparator
+			 * (retirement plan sec 5.4), parallel to the {real,tsc}
+			 * pair above but modelling {vcap,uc}.
+			 */
+			if (pass_real && pass_uc)
+				this_cpu_inc(ivh_uc_pass_both);
+			else if (pass_real)
+				this_cpu_inc(ivh_uc_pass_vcap_only);
+			else if (pass_uc)
+				this_cpu_inc(ivh_uc_pass_uc_only);
+			else
+				this_cpu_inc(ivh_uc_pass_neither);
+
+			any_real |= pass_real;
+			any_uc   |= pass_uc;
+			any_tsc  |= pass_tsc;
+		}
+
+		/*
+		 * Destination-set EMPTY rate (retirement plan sec 1.4/5.4):
+		 * a bool per source per evaluation, not per candidate CPU, so
+		 * its denominator is evaluations, not (evaluations x online
+		 * CPUs) like the pass_* counters above -- compare each
+		 * against ITSELF, same discipline the existing comment on
+		 * ivh_dec_* vs ivh_cap_pass_* already states.
+		 */
+		if (!any_real)
+			this_cpu_inc(ivh_destset_empty_vcap);
+		if (!any_uc)
+			this_cpu_inc(ivh_destset_empty_uc);
+		if (!any_tsc)
+			this_cpu_inc(ivh_destset_empty_tsc);
+	}
 
 	/*
 	 * Block recursive IVH calls from any spinlock acquired inside this
@@ -13267,11 +13688,22 @@ void bpf_sched_pre_lock_migrate(void)
 	current->lock_depth++;
 
 	/*
-	 * Select target CPU via BPF hook.  Use trylock: if another thread is
-	 * already selecting, skip migration for this CS rather than spinning
-	 * with IRQs disabled.  The caller will retry on the next lock attempt.
+	 * Select target CPU via BPF hook. ivh_selection_trylock
+	 * (include/linux/bpf_sched.h) switches between:
+	 *   0 = blocking raw_spin_lock_irqsave().
+	 *   1 = trylock-and-skip: if another thread is already selecting,
+	 *       skip migration for this CS rather than spinning with IRQs
+	 *       disabled. The caller retries on its next lock attempt.
 	 */
-	raw_spin_lock_irqsave(&my_spinlock, flags);
+	if (READ_ONCE(ivh_selection_trylock)) {
+		if (!raw_spin_trylock_irqsave(&my_spinlock, flags)) {
+			atomic_inc(&ivh_trylock_misses);
+			current->lock_depth--;
+			return;
+		}
+	} else {
+		raw_spin_lock_irqsave(&my_spinlock, flags);
+	}
 	target_cpu = bpf_sched_cfs_select_run_cpu_spin(
 			rq, current, sched_clock(),
 			average_capacity_all, num_online_cpus());
@@ -13291,11 +13723,74 @@ void bpf_sched_pre_lock_migrate(void)
 	}
 
 	/*
-	 * Synchronous self-migration: temporarily restrict cpus_mask to
-	 * {target_cpu} and call schedule().  The scheduler sees that current
-	 * is no longer allowed on this CPU and migrates it.  When schedule()
-	 * returns we are running on target_cpu.  Restore original mask so the
-	 * task's permanent affinity is unchanged.
+	 * ivh_migrate_mechanism == 1: dispatch via migrate_task_to()
+	 * (stop_one_cpu() + migration_cpu_stop(), CONFIG_NUMA_BALANCING) instead
+	 * of the mechanism-0 path below. No cpus_mask override, so nothing to
+	 * save/restore -- migrate_task_to() requires target_cpu to already be in
+	 * current's cpus_mask and simply declines (mt_ret != 0) rather than
+	 * forcing it otherwise, unlike mechanism 0's temporary override. See the
+	 * full tradeoff comment on ivh_migrate_mechanism in bpf_sched.c.
+	 */
+	if (READ_ONCE(ivh_migrate_mechanism)) {
+		u64 wait_start_ns, wait_elapsed_ns;
+		int wait_slot, mt_ret;
+
+		/* Same target-health check as the mechanism-0 path below. */
+		if (is_cpu_preempted(target_cpu)) {
+			atomic_fetch_andnot(PRMPT_HELD_MASK, prmpt_flags(target_cpu));
+			current->lock_depth--;
+			return;
+		}
+
+		atomic_inc(&ivh_in_schedule);
+
+		wait_start_ns = sched_clock();
+		wait_slot = ivh_wait_register(current, src_cpu, target_cpu, 3);
+		mt_ret = migrate_task_to(current, target_cpu);
+		ivh_wait_unregister(wait_slot);
+		wait_elapsed_ns = sched_clock() - wait_start_ns;
+
+		atomic_dec(&ivh_in_schedule);
+
+		if (wait_elapsed_ns > 1000000ULL) /* >1ms: treat as the slow/stuck case */
+			atomic_inc(&ivh_timeout_count);
+
+		trace_printk(
+			"ivh_stop_one_cpu: comm=%s src=%d dst=%d landed=%d "
+			"wait_elapsed_us=%llu ret=%d\n",
+			current->comm, src_cpu, target_cpu, smp_processor_id(),
+			wait_elapsed_ns / 1000, mt_ret);
+
+		if (mt_ret == 0)
+			atomic_inc(&ivh_migrations_done);
+		atomic_fetch_andnot(PRMPT_HELD_MASK, prmpt_flags(target_cpu));
+		current->lock_depth--;
+		return;
+	}
+
+	/*
+	 * Synchronous self-migration (mechanism 0, default): temporarily
+	 * restrict cpus_mask to {target_cpu} and call set_cpus_allowed_ptr().
+	 * The scheduler sees that current is no longer allowed on this CPU
+	 * and migrates it -- set_cpus_allowed_ptr() itself blocks (via
+	 * affine_move_task()'s wait_for_completion(), core.c) until that
+	 * migration has actually completed, so by the time it returns we are
+	 * already running on target_cpu. Restore original mask so the task's
+	 * permanent affinity is unchanged.
+	 *
+	 * 2026-07-20: dropped the explicit schedule() call that used to sit
+	 * here after set_cpus_allowed_ptr() returned. It was redundant --
+	 * live kernel investigation confirmed set_cpus_allowed_ptr() already
+	 * contains its own internal sleep/wake (the wait_for_completion()
+	 * above) that fully accomplishes the "block until landed" role, so
+	 * the extra schedule() was purely one more wasted context-switch
+	 * round trip on every single migration, not a real requirement.
+	 * (The original bare-schedule() hang investigation from 2026-06-30
+	 * this replaced was about a *different* stuck-task class, in
+	 * set_cpus_allowed_ptr() itself, not something the removed schedule()
+	 * call was providing protection against -- see ivh_wait_register()
+	 * phase 1, still in place below, which continues to instrument
+	 * exactly that call.)
 	 *
 	 * Use cpumask_var_t (heap via GFP_KERNEL) to avoid a 1024-byte
 	 * stack frame on NR_CPUS=8192/CPUMASK_OFFSTACK=y builds.
@@ -13326,35 +13821,17 @@ void bpf_sched_pre_lock_migrate(void)
 	atomic_inc(&ivh_in_schedule);
 
 	/*
-	 * EXPERIMENT: bare-schedule() hang diagnosis, 2026-06-30.
-	 * Swapped from schedule_timeout_interruptible() back to plain
-	 * schedule() (the version that was observed to hang) so we can
-	 * find out *where* a stuck task actually is instead of theorizing.
-	 * ivh_wait_register/unregister + sched_tick()'s
-	 * ivh_scan_stuck_waiters() give a timeline of cur_cpu/on_rq/target
-	 * heartbeat staleness for any attempt that's been pending past a
-	 * threshold while this call is blocked inside schedule() below.
+	 * Register around set_cpus_allowed_ptr() itself. For a running task
+	 * this blocks inside affine_move_task() -> wait_for_completion()
+	 * (core.c) -- that is the entire migration wait now (see the removed-
+	 * schedule() comment above); ivh_scan_stuck_waiters() (sched_tick())
+	 * gives a timeline of cur_cpu/on_rq/target heartbeat staleness for
+	 * any attempt pending past a threshold while blocked in this call.
 	 */
 	u64 wait_start_ns = sched_clock();
-	int wait_slot = -1;
-
-	/*
-	 * Phase 1: register around set_cpus_allowed_ptr() itself. For a
-	 * running task this blocks inside affine_move_task() ->
-	 * wait_for_completion() (core.c) — if the stuck state is actually
-	 * here (not in the phase-2 schedule() below), this is where we'll
-	 * catch it.
-	 */
 	int wait_slot_p1 = ivh_wait_register(current, src_cpu, target_cpu, 1);
 	int sca_ret = set_cpus_allowed_ptr(current, cpumask_of(target_cpu));
 	ivh_wait_unregister(wait_slot_p1);
-
-	if (sca_ret == 0) {
-		/* Phase 2: the bare schedule() previously (and solely) instrumented. */
-		wait_slot = ivh_wait_register(current, src_cpu, target_cpu, 2);
-		schedule();
-		ivh_wait_unregister(wait_slot);
-	}
 	u64 wait_elapsed_ns = sched_clock() - wait_start_ns;
 
 	atomic_dec(&ivh_in_schedule);
@@ -13373,12 +13850,12 @@ void bpf_sched_pre_lock_migrate(void)
 			atomic_inc(&ivh_timeout_count);
 
 		trace_printk(
-			"ivh_bare_sched: comm=%s src=%d dst=%d landed=%d "
+			"ivh_sca_migrate: comm=%s src=%d dst=%d landed=%d "
 			"wait_elapsed_us=%llu dst_cap=%lu dst_heartbeat_age_us=%llu "
-			"actually_migrated=%s\n",
+			"sca_ret=%d actually_migrated=%s\n",
 			current->comm, src_cpu, target_cpu, landed_cpu,
 			wait_elapsed_ns / 1000,
-			dst_cap, heartbeat_age / 1000,
+			dst_cap, heartbeat_age / 1000, sca_ret,
 			migrated ? "yes" : "no_landed_elsewhere");
 	}
 
@@ -13392,15 +13869,161 @@ void bpf_sched_pre_lock_migrate(void)
 }
 EXPORT_SYMBOL_GPL(bpf_sched_pre_lock_migrate);
 
+#if defined(CONFIG_KVM_GUEST) && defined(CONFIG_PARAVIRT_SPINLOCKS)
+/* Live count of ivh_pv_wait() invocations, defined in arch/x86/kernel/kvm.c.
+ * Nonzero == the IVH non-halting PV spinlock wait path is actually running
+ * (i.e. real MCS queueing was restored and contended waiters reached it). */
+DECLARE_PER_CPU(u64, ivh_pv_wait_calls);
+#endif
+
 /* /proc/ivh_debug — snapshot all IVH counters for hang diagnosis */
 static int ivh_debug_show(struct seq_file *m, void *v)
 {
 	u64 prelock_calls = 0, prelock_skipped = 0;
-	int cpu;
+	u64 capacity_reject = 0, time_left_reject = 0;
+	u64 coldthread_skipped = 0, hotthread_passed = 0;
+	u64 mutex_spin_observed = 0, mutex_spin_owner_preempted = 0;
+	u64 pv_wait_calls = 0;
+	u64 obs_total_holds = 0, obs_stolen_holds = 0;
+	u64 obs_cs_time_ns = 0, obs_wait_ns = 0, obs_wait_events = 0;
+	u64 obs_cs_hist[IVH_OBS_CS_HIST_BUCKETS] = { 0 };
+	int cpu, b;
+#if defined(CONFIG_KVM_GUEST) && defined(CONFIG_PARAVIRT_SPINLOCKS)
+	u64 beat_agree_true = 0, beat_agree_false = 0;
+	u64 beat_false_pos = 0, beat_false_neg = 0, beat_publishes = 0;
+	u64 beat_checks;
+	s64 beat_min_age = S64_MAX;
+	/* Build 1: CS predicate, holder identity and the head-bail side effect. */
+	u64 cs_checks = 0, cs_publishes = 0, cs_clear_mismatch = 0;
+	u64 cs_agree_true = 0, cs_agree_false = 0;
+	u64 cs_false_pos = 0, cs_false_neg = 0;
+	/*
+	 * Heap, not stack, and the two pre-existing heartbeat histograms move
+	 * in here with the four new ones.  Six 32-entry u64 arrays is 1.5 KB;
+	 * on the stack that trips -Wframe-larger-than and, more to the point,
+	 * puts a multi-kilobyte frame under a /proc reader that can be entered
+	 * from an arbitrarily deep call chain.  One allocation for all of them
+	 * keeps the failure handling to a single branch: on failure the scalar
+	 * counters still print, only the distributions are dropped, and the
+	 * output says so explicitly rather than silently showing zeros -- an
+	 * all-zero histogram would otherwise read as a finding.
+	 */
+	struct ivh_cs_hists {
+		u64 beat_running[IVH_BEAT_AGE_HIST_BUCKETS];
+		u64 beat_preempted[IVH_BEAT_AGE_HIST_BUCKETS];
+		u64 age_running[IVH_CS_AGE_HIST_BUCKETS];
+		u64 age_preempted[IVH_CS_AGE_HIST_BUCKETS];
+		u64 hold[IVH_CS_HOLD_HIST_BUCKETS];
+		u64 bail_loop[IVH_CS_LOOP_HIST_BUCKETS];
+	} *hists = kzalloc(sizeof(*hists), GFP_KERNEL);
+	u64 hold_stamps = 0, hold_clears = 0;
+	u64 hold_unk_empty = 0, hold_unk_collision = 0;
+	u64 hold_raced = 0, hold_self = 0;
+	u64 bail_early = 0, lock_steals = 0;
+#endif
+	/* Build 1: decision-agreement comparators (sec 3.8). */
+	u64 dec_agree_go = 0, dec_agree_nogo = 0;
+	u64 dec_tsc_only = 0, dec_real_only = 0;
+	u64 cap_pass_both = 0, cap_pass_real = 0;
+	u64 cap_pass_tsc = 0, cap_pass_neither = 0;
+	/* vcap retirement (ivh_vcap_retirement_build_plan_2026-08-03.md sec 5). */
+	u64 dec_uc_agree_go = 0, dec_uc_agree_nogo = 0;
+	u64 dec_uc_only = 0, dec_uc_real_only = 0;
+	u64 uc_pass_both = 0, uc_pass_vcap_only = 0;
+	u64 uc_pass_uc_only = 0, uc_pass_neither = 0;
+	u64 destset_empty_vcap = 0, destset_empty_uc = 0, destset_empty_tsc = 0;
+	u64 uc_div_hist[IVH_UC_DIV_HIST_BUCKETS] = { 0 };
+	u64 uc_thr850_both = 0, uc_thr850_vcap_only = 0;
+	u64 uc_thr850_uc_only = 0, uc_thr850_neither = 0;
+	u64 uc_thr1010_both = 0, uc_thr1010_vcap_only = 0;
+	u64 uc_thr1010_uc_only = 0, uc_thr1010_neither = 0;
 
 	for_each_possible_cpu(cpu) {
+#if defined(CONFIG_KVM_GUEST) && defined(CONFIG_PARAVIRT_SPINLOCKS)
+		pv_wait_calls += per_cpu(ivh_pv_wait_calls, cpu);
+		cs_checks += per_cpu(ivh_cs_checks, cpu);
+		cs_publishes += per_cpu(ivh_cs_publishes, cpu);
+		cs_clear_mismatch += per_cpu(ivh_cs_clear_mismatch, cpu);
+		cs_agree_true += per_cpu(ivh_cs_agree_true, cpu);
+		cs_agree_false += per_cpu(ivh_cs_agree_false, cpu);
+		cs_false_pos += per_cpu(ivh_cs_false_pos, cpu);
+		cs_false_neg += per_cpu(ivh_cs_false_neg, cpu);
+		hold_stamps += per_cpu(ivh_holder_stamps, cpu);
+		hold_clears += per_cpu(ivh_holder_clears, cpu);
+		hold_unk_empty += per_cpu(ivh_holder_unknown_empty, cpu);
+		hold_unk_collision += per_cpu(ivh_holder_unknown_collision, cpu);
+		hold_raced += per_cpu(ivh_holder_raced, cpu);
+		hold_self += per_cpu(ivh_holder_self, cpu);
+		bail_early += per_cpu(ivh_head_bail_early, cpu);
+		lock_steals += per_cpu(ivh_lock_steals, cpu);
+		if (hists) {
+			for (b = 0; b < IVH_CS_AGE_HIST_BUCKETS; b++) {
+				hists->age_running[b] += per_cpu(ivh_cs_age_hist_running[b], cpu);
+				hists->age_preempted[b] += per_cpu(ivh_cs_age_hist_preempted[b], cpu);
+			}
+			for (b = 0; b < IVH_CS_HOLD_HIST_BUCKETS; b++)
+				hists->hold[b] += per_cpu(ivh_cs_hold_hist[b], cpu);
+			for (b = 0; b < IVH_CS_LOOP_HIST_BUCKETS; b++)
+				hists->bail_loop[b] += per_cpu(ivh_head_bail_loop_hist[b], cpu);
+		}
+		beat_agree_true += per_cpu(ivh_beat_agree_true, cpu);
+		beat_agree_false += per_cpu(ivh_beat_agree_false, cpu);
+		beat_false_pos += per_cpu(ivh_beat_false_pos, cpu);
+		beat_false_neg += per_cpu(ivh_beat_false_neg, cpu);
+		beat_publishes += per_cpu(ivh_beat_publishes, cpu);
+		if (per_cpu(ivh_beat_min_age, cpu) < beat_min_age)
+			beat_min_age = per_cpu(ivh_beat_min_age, cpu);
+		if (hists) {
+			for (b = 0; b < IVH_BEAT_AGE_HIST_BUCKETS; b++) {
+				hists->beat_running[b] += per_cpu(ivh_beat_age_hist_running[b], cpu);
+				hists->beat_preempted[b] += per_cpu(ivh_beat_age_hist_preempted[b], cpu);
+			}
+		}
+#endif
 		prelock_calls += per_cpu(ivh_prelock_calls, cpu);
 		prelock_skipped += per_cpu(ivh_prelock_cooldown_skipped, cpu);
+		capacity_reject += per_cpu(ivh_steal_imminent_capacity_reject, cpu);
+		time_left_reject += per_cpu(ivh_steal_imminent_time_left_reject, cpu);
+		coldthread_skipped += per_cpu(ivh_prelock_coldthread_skipped, cpu);
+		hotthread_passed += per_cpu(ivh_prelock_hotthread_passed, cpu);
+		mutex_spin_observed += per_cpu(ivh_mutex_spin_observed, cpu);
+		mutex_spin_owner_preempted += per_cpu(ivh_mutex_spin_owner_preempted, cpu);
+		obs_total_holds += per_cpu(ivh_obs_total_holds, cpu);
+		obs_stolen_holds += per_cpu(ivh_obs_stolen_holds, cpu);
+		obs_cs_time_ns += per_cpu(ivh_obs_cs_time_total_ns, cpu);
+		obs_wait_ns += per_cpu(ivh_obs_wait_total_ns, cpu);
+		obs_wait_events += per_cpu(ivh_obs_wait_events, cpu);
+		for (b = 0; b < IVH_OBS_CS_HIST_BUCKETS; b++)
+			obs_cs_hist[b] += per_cpu(ivh_obs_cs_hist[b], cpu);
+		dec_agree_go += per_cpu(ivh_dec_agree_go, cpu);
+		dec_agree_nogo += per_cpu(ivh_dec_agree_nogo, cpu);
+		dec_tsc_only += per_cpu(ivh_dec_tsc_only_go, cpu);
+		dec_real_only += per_cpu(ivh_dec_real_only_go, cpu);
+		cap_pass_both += per_cpu(ivh_cap_pass_both, cpu);
+		cap_pass_real += per_cpu(ivh_cap_pass_real_only, cpu);
+		cap_pass_tsc += per_cpu(ivh_cap_pass_tsc_only, cpu);
+		cap_pass_neither += per_cpu(ivh_cap_pass_neither, cpu);
+		dec_uc_agree_go += per_cpu(ivh_dec_uc_agree_go, cpu);
+		dec_uc_agree_nogo += per_cpu(ivh_dec_uc_agree_nogo, cpu);
+		dec_uc_only += per_cpu(ivh_dec_uc_only_go, cpu);
+		dec_uc_real_only += per_cpu(ivh_dec_uc_real_only_go, cpu);
+		uc_pass_both += per_cpu(ivh_uc_pass_both, cpu);
+		uc_pass_vcap_only += per_cpu(ivh_uc_pass_vcap_only, cpu);
+		uc_pass_uc_only += per_cpu(ivh_uc_pass_uc_only, cpu);
+		uc_pass_neither += per_cpu(ivh_uc_pass_neither, cpu);
+		destset_empty_vcap += per_cpu(ivh_destset_empty_vcap, cpu);
+		destset_empty_uc += per_cpu(ivh_destset_empty_uc, cpu);
+		destset_empty_tsc += per_cpu(ivh_destset_empty_tsc, cpu);
+		for (b = 0; b < IVH_UC_DIV_HIST_BUCKETS; b++)
+			uc_div_hist[b] += per_cpu(ivh_uc_div_hist[b], cpu);
+		uc_thr850_both += per_cpu(ivh_uc_thr850_both, cpu);
+		uc_thr850_vcap_only += per_cpu(ivh_uc_thr850_vcap_only, cpu);
+		uc_thr850_uc_only += per_cpu(ivh_uc_thr850_uc_only, cpu);
+		uc_thr850_neither += per_cpu(ivh_uc_thr850_neither, cpu);
+		uc_thr1010_both += per_cpu(ivh_uc_thr1010_both, cpu);
+		uc_thr1010_vcap_only += per_cpu(ivh_uc_thr1010_vcap_only, cpu);
+		uc_thr1010_uc_only += per_cpu(ivh_uc_thr1010_uc_only, cpu);
+		uc_thr1010_neither += per_cpu(ivh_uc_thr1010_neither, cpu);
 	}
 
 	seq_printf(m, "ivh_in_schedule:    %d\n", atomic_read(&ivh_in_schedule));
@@ -13414,6 +14037,539 @@ static int ivh_debug_show(struct seq_file *m, void *v)
 		seq_printf(m, "ivh_prelock_skip_pct:         %llu%%\n",
 			   prelock_skipped * 100 / prelock_calls);
 	seq_printf(m, "\n");
+	seq_printf(m, "ivh_time_left_source:   %lu\n", READ_ONCE(ivh_time_left_source));
+	seq_printf(m, "ivh_selection_trylock:  %lu\n", READ_ONCE(ivh_selection_trylock));
+	seq_printf(m, "ivh_migrate_mechanism:  %lu\n", READ_ONCE(ivh_migrate_mechanism));
+	seq_printf(m, "\n");
+	seq_printf(m, "ivh_hot_threads_enabled:       %lu\n", READ_ONCE(ivh_hot_threads_enabled));
+	seq_printf(m, "ivh_hot_preempt_gate_enabled:  %lu\n", READ_ONCE(ivh_hot_preempt_gate_enabled));
+	seq_printf(m, "ivh_hot_wait_threshold:        %lu\n", READ_ONCE(ivh_hot_wait_threshold));
+	seq_printf(m, "ivh_hot_preempt_threshold:     %lu\n", READ_ONCE(ivh_hot_preempt_threshold));
+	seq_printf(m, "ivh_hot_threads_ewma_k:        %lu\n", READ_ONCE(ivh_hot_threads_ewma_k));
+	seq_printf(m, "ivh_hot_wait_zero_n:           %lu\n", READ_ONCE(ivh_hot_wait_zero_n));
+	seq_printf(m, "ivh_hot_preempt_ewma_k_rise:   %lu\n", READ_ONCE(ivh_hot_preempt_ewma_k_rise));
+	seq_printf(m, "ivh_hot_preempt_ewma_k_fall:   %lu\n", READ_ONCE(ivh_hot_preempt_ewma_k_fall));
+	seq_printf(m, "ivh_prelock_coldthread_skipped: %llu\n", coldthread_skipped);
+	seq_printf(m, "ivh_prelock_hotthread_passed:   %llu\n", hotthread_passed);
+	seq_printf(m, "ivh_mutex_spin_observed:          %llu\n", mutex_spin_observed);
+	seq_printf(m, "ivh_mutex_spin_owner_preempted:   %llu\n", mutex_spin_owner_preempted);
+	seq_printf(m, "ivh_pv_wait_calls:                %llu\n", pv_wait_calls);
+	seq_printf(m, "ivh_steal_imminent_capacity_reject:  %llu\n", capacity_reject);
+	seq_printf(m, "ivh_steal_imminent_time_left_reject: %llu\n", time_left_reject);
+	seq_printf(m, "\n");
+	seq_printf(m, "ivh_obs_total_holds:  %llu\n", obs_total_holds);
+	seq_printf(m, "ivh_obs_stolen_holds: %llu\n", obs_stolen_holds);
+	if (obs_total_holds)
+		seq_printf(m, "ivh_obs_stolen_pct:   %llu.%04llu%%\n",
+			   obs_stolen_holds * 100 / obs_total_holds,
+			   (obs_stolen_holds * 1000000 / obs_total_holds) % 10000);
+	/* CS-hold time averages over every observed hold (total_holds); wait
+	 * time averages only over contended acquisitions (wait_events) --
+	 * uncontended fast-path acquisitions never reach the qspinlock
+	 * slowpath and are excluded, not counted as zero. The avg_ns lines are
+	 * for reading /proc directly; ivh_exec -v recomputes them from the
+	 * totals so it can average over its own before/after delta. */
+	seq_printf(m, "ivh_obs_cs_time_total_ns: %llu\n", obs_cs_time_ns);
+	if (obs_total_holds)
+		seq_printf(m, "ivh_obs_cs_time_avg_ns:   %llu\n",
+			   obs_cs_time_ns / obs_total_holds);
+	seq_printf(m, "ivh_obs_wait_events:      %llu\n", obs_wait_events);
+	seq_printf(m, "ivh_obs_wait_total_ns:    %llu\n", obs_wait_ns);
+	if (obs_wait_events)
+		seq_printf(m, "ivh_obs_wait_avg_ns:      %llu\n",
+			   obs_wait_ns / obs_wait_events);
+	/*
+	 * Raw log2-bucketed CS-hold-time histogram: one line, exactly
+	 * IVH_OBS_CS_HIST_BUCKETS space-separated counts in bucket order, so a
+	 * reader can take the whole distribution with one prefix match and a
+	 * strtoull walk rather than matching 32 differently-named keys. Bucket
+	 * i covers 2^i .. 2^(i+1)-1 ns; bucket 0 is 0-1 ns (it also absorbs
+	 * zero-length holds) and the last bucket saturates at >= 2^31 ns. The
+	 * counts sum to ivh_obs_total_holds. Deliberately raw -- percentiles
+	 * are computed in userspace (ivh_exec -v) off a before/after delta,
+	 * exactly like the averages above, because a lifetime percentile
+	 * computed here would be wrong for a scoped run.
+	 */
+	seq_printf(m, "# ivh_obs_cs_hist bucket i = 2^i..2^(i+1)-1 ns "
+		      "(i=0: 0-1 ns; i=%d: >= %llu ns, saturating)\n",
+		   IVH_OBS_CS_HIST_BUCKETS - 1,
+		   1ULL << (IVH_OBS_CS_HIST_BUCKETS - 1));
+	seq_printf(m, "ivh_obs_cs_hist:");
+	for (b = 0; b < IVH_OBS_CS_HIST_BUCKETS; b++)
+		seq_printf(m, " %llu", obs_cs_hist[b]);
+	seq_printf(m, "\n");
+	seq_printf(m, "\n");
+#if defined(CONFIG_KVM_GUEST) && defined(CONFIG_PARAVIRT_SPINLOCKS)
+	/*
+	 * IVH TSC heartbeat (arch/x86/include/asm/qspinlock.h). All of this is
+	 * fed only while ivh_pv_preempt_src != 0; at the default 0 the counters
+	 * stay at zero and the signal is not computed at all.
+	 *
+	 * Reading the agreement matrix: false_pos is "the heartbeat says
+	 * preempted, the host says running" -- at src == 2 that is an
+	 * unnecessary early bail out of the spin, the cheap failure. false_neg
+	 * is "the host says preempted, the heartbeat missed it" -- at src == 2
+	 * that is a missed early bail, i.e. exactly the stock non-IVH behavior.
+	 * Neither is a correctness problem; the caller's for(;;) re-checks
+	 * node->locked regardless.
+	 */
+	beat_checks = beat_agree_true + beat_agree_false +
+		      beat_false_pos + beat_false_neg;
+	seq_printf(m, "ivh_pv_preempt_src:       %lu\n", READ_ONCE(ivh_pv_preempt_src));
+	seq_printf(m, "ivh_pv_beat_threshold:    %lu (cycles)\n",
+		   READ_ONCE(ivh_pv_beat_threshold));
+	seq_printf(m, "ivh_pv_beat_publish_mask: 0x%lx\n",
+		   READ_ONCE(ivh_pv_beat_publish_mask));
+	seq_printf(m, "ivh_beat_publishes:       %llu\n", beat_publishes);
+	seq_printf(m, "ivh_beat_checks:          %llu\n", beat_checks);
+	seq_printf(m, "ivh_beat_agree_true:      %llu\n", beat_agree_true);
+	seq_printf(m, "ivh_beat_agree_false:     %llu\n", beat_agree_false);
+	seq_printf(m, "ivh_beat_false_pos:       %llu\n", beat_false_pos);
+	seq_printf(m, "ivh_beat_false_neg:       %llu\n", beat_false_neg);
+	if (beat_checks)
+		seq_printf(m, "ivh_beat_agree_pct:       %llu.%04llu%%\n",
+			   (beat_agree_true + beat_agree_false) * 100 / beat_checks,
+			   ((beat_agree_true + beat_agree_false) * 1000000 /
+			    beat_checks) % 10000);
+	/*
+	 * Cross-vCPU TSC drift guard (build plan sec 2.8). Minimum (now - beat)
+	 * ever observed, per READER CPU, in raw TSC cycles; one value per
+	 * possible CPU in CPU order. Signed -- a small negative value is the
+	 * expected offset-aligned case, not an error. A CPU that has never run
+	 * a check prints S64_MAX (9223372036854775807), which is "no samples",
+	 * not "drifted". WATCH THIS ACROSS A MULTI-HOUR RUN: a per-CPU minimum
+	 * that climbs monotonically is the drift signature, and drift is a
+	 * silent one-directional false-positive bias that will never announce
+	 * itself any other way. TSC comparability is NOT a closed question
+	 * until this line has been sat on for hours.
+	 */
+	seq_printf(m, "ivh_beat_min_age_all:     %lld\n", beat_min_age);
+	seq_printf(m, "ivh_beat_min_age_percpu:");
+	for_each_possible_cpu(cpu)
+		seq_printf(m, " %lld", per_cpu(ivh_beat_min_age, cpu));
+	seq_printf(m, "\n");
+	/*
+	 * The threshold-tuning pair. Raw log2 buckets of the heartbeat age in
+	 * TSC CYCLES (not ns): bucket i = 2^i..2^(i+1)-1 cycles, bucket 0 also
+	 * absorbs zero and negative ages, top bucket saturates. Split by what
+	 * the HOST said at the same instant, so _running is the false-positive
+	 * distribution and _preempted is the detection distribution.
+	 *
+	 * The threshold to pick is wherever they separate: <=1% of _running
+	 * above it while >=90% of _preempted stays above it. If the _running
+	 * tail overlaps the _preempted body, THAT IS THE ANSWER and the answer
+	 * is that the signal does not work at this write cadence. Getting that
+	 * from these two lines is cheaper and far more convincing than
+	 * rediscovering it from a throughput regression.
+	 */
+	if (!hists) {
+		seq_printf(m, "# ivh histograms omitted: accumulator allocation failed\n");
+		goto skip_cs_hists;
+	}
+	seq_printf(m, "# ivh_beat_age_hist bucket i = 2^i..2^(i+1)-1 TSC cycles "
+		      "(i=0: <=1 cyc and negatives; i=%d: >= %llu cyc, saturating)\n",
+		   IVH_BEAT_AGE_HIST_BUCKETS - 1,
+		   1ULL << (IVH_BEAT_AGE_HIST_BUCKETS - 1));
+	seq_printf(m, "ivh_beat_age_hist_running:");
+	for (b = 0; b < IVH_BEAT_AGE_HIST_BUCKETS; b++)
+		seq_printf(m, " %llu", hists->beat_running[b]);
+	seq_printf(m, "\n");
+	seq_printf(m, "ivh_beat_age_hist_preempted:");
+	for (b = 0; b < IVH_BEAT_AGE_HIST_BUCKETS; b++)
+		seq_printf(m, " %llu", hists->beat_preempted[b]);
+	seq_printf(m, "\n");
+	seq_printf(m, "\n");
+	/*
+	 * ===================================================================
+	 * Build 1: the CS predicate, holder identity, and the head-bail side
+	 * effect.  tools/bpf/docs/ivh_tsc_full_redesign_build_plan_2026-07-29.md
+	 * sec 3.7, and sec 3.9 for the review items each line blocks.
+	 * ===================================================================
+	 *
+	 * All of it is fed only while ivh_cs_preempt_src != 0 (plus
+	 * ivh_lock_steals, which is unconditional on purpose -- the steal rate
+	 * at src == 0 is the BASELINE the src 1 and 2 rates are compared
+	 * against, and a counter that only exists once the feature is on has
+	 * nothing to be compared to).
+	 *
+	 * REVIEW ITEM 5, "is holder identity trustworthy": read
+	 * unknown_empty, unknown_collision, raced and self as fractions of
+	 * ivh_cs_checks, and check stamps against clears.  unknown_empty is the
+	 * genuine handoff window and is irreducible; unknown_collision is table
+	 * geometry and is what the ivh_holder_bits sweep drives toward zero;
+	 * self should be ~0 and a real count means the table is lying.  A
+	 * stamps/clears gap that GROWS without bound under a steady workload
+	 * means an ownership-transfer site was missed -- the failure mode that
+	 * corrupts holder identity silently.
+	 *
+	 * REVIEW ITEM 8, "how much earlier does the pending bit drop": the
+	 * queue head bailing out of its spin runs clear_pending() early and
+	 * reopens the lock-stealing window.  SPIN_THRESHOLD is 1<<15 and the
+	 * loop counts DOWN, so a bail at loop L drops the bit L iterations
+	 * early: mass in the HIGH buckets of ivh_head_bail_loop_hist means the
+	 * bit is being released almost immediately and qspinlock's starvation
+	 * guarantee is effectively gone; mass near bucket 0 means the bail
+	 * happens just before the loop would have exhausted anyway and costs
+	 * nothing.  Read together with ivh_lock_steals at src 1 vs src 2.
+	 */
+	seq_printf(m, "ivh_cs_preempt_src:        %lu\n", READ_ONCE(ivh_cs_preempt_src));
+	seq_printf(m, "ivh_cs_predicate_form:     %lu  (0=CS-stamp age, 1=in-CS AND heartbeat stale, 2=heartbeat stale only)\n",
+		   READ_ONCE(ivh_cs_predicate_form));
+	seq_printf(m, "ivh_cs_beat_threshold:     %lu (cycles)\n",
+		   READ_ONCE(ivh_cs_beat_threshold));
+	seq_printf(m, "ivh_lock_holder_enabled:   %lu\n", READ_ONCE(ivh_lock_holder_enabled));
+	seq_printf(m, "ivh_holder_bits:           %lu  (%lu effective slots)\n",
+		   READ_ONCE(ivh_holder_bits), 1UL << READ_ONCE(ivh_holder_bits));
+	seq_printf(m, "ivh_cs_publishes:          %llu\n", cs_publishes);
+	seq_printf(m, "ivh_cs_clear_mismatch:     %llu  (unlock_bh clear-after-release hits)\n",
+		   cs_clear_mismatch);
+	seq_printf(m, "ivh_cs_checks:             %llu\n", cs_checks);
+	seq_printf(m, "ivh_cs_agree_true:         %llu\n", cs_agree_true);
+	seq_printf(m, "ivh_cs_agree_false:        %llu\n", cs_agree_false);
+	seq_printf(m, "ivh_cs_false_pos:          %llu\n", cs_false_pos);
+	seq_printf(m, "ivh_cs_false_neg:          %llu\n", cs_false_neg);
+	{
+		u64 cs_verdicts = cs_agree_true + cs_agree_false +
+				  cs_false_pos + cs_false_neg;
+		u64 cs_real_pos = cs_agree_true + cs_false_neg;
+
+		if (cs_verdicts)
+			seq_printf(m, "ivh_cs_agree_pct:          %llu.%04llu%%\n",
+				   (cs_agree_true + cs_agree_false) * 100 / cs_verdicts,
+				   ((cs_agree_true + cs_agree_false) * 1000000 /
+				    cs_verdicts) % 10000);
+		/*
+		 * SENSITIVITY, and it is printed because the agreement percentage
+		 * above is actively misleading on its own.  Host preemption is a
+		 * ~0.1%-of-samples event, so agree_false (nothing preempted, both
+		 * signals say so) dominates the ratio and drags it to 99.8%
+		 * regardless of whether the predicate detects anything at all.
+		 * The number that matters is the fraction of REAL positives the
+		 * predicate caught, and on 6.17.0-rseqport67 that was 123/1423 =
+		 * 8.6% while agree_pct read 99.8%.  Do not quote agree_pct
+		 * without this line beside it.
+		 */
+		if (cs_real_pos)
+			seq_printf(m, "ivh_cs_sensitivity_pct:    %llu.%04llu%%  (agree_true / (agree_true + false_neg); THE number, not agree_pct)\n",
+				   cs_agree_true * 100 / cs_real_pos,
+				   (cs_agree_true * 1000000 / cs_real_pos) % 10000);
+	}
+	seq_printf(m, "ivh_holder_stamps:         %llu\n", hold_stamps);
+	seq_printf(m, "ivh_holder_clears:         %llu\n", hold_clears);
+	seq_printf(m, "ivh_holder_unknown_empty:  %llu\n", hold_unk_empty);
+	seq_printf(m, "ivh_holder_unknown_collision: %llu\n", hold_unk_collision);
+	seq_printf(m, "ivh_holder_raced:          %llu\n", hold_raced);
+	seq_printf(m, "ivh_holder_self:           %llu  (~0 relative to checks AND to unknown_collision; 3 causes at the increment site)\n",
+		   hold_self);
+	seq_printf(m, "ivh_head_bail_early:       %llu\n", bail_early);
+	seq_printf(m, "ivh_lock_steals:           %llu  (unconditional; baseline at src=0)\n",
+		   lock_steals);
+	seq_printf(m, "# ivh_cs_age_hist bucket i = 2^i..2^(i+1)-1 TSC cycles "
+		      "(i=0: <=1 cyc, negatives and the not-in-a-CS sentinel; "
+		      "i=%d: >= %llu cyc, saturating)\n",
+		   IVH_CS_AGE_HIST_BUCKETS - 1,
+		   1ULL << (IVH_CS_AGE_HIST_BUCKETS - 1));
+	seq_printf(m, "ivh_cs_age_hist_running:");
+	for (b = 0; b < IVH_CS_AGE_HIST_BUCKETS; b++)
+		seq_printf(m, " %llu", hists->age_running[b]);
+	seq_printf(m, "\n");
+	seq_printf(m, "ivh_cs_age_hist_preempted:");
+	for (b = 0; b < IVH_CS_AGE_HIST_BUCKETS; b++)
+		seq_printf(m, " %llu", hists->age_preempted[b]);
+	seq_printf(m, "\n");
+	/*
+	 * The population-correct CS-hold-time distribution, in NANOSECONDS
+	 * (unlike the two age histograms above, which are cycles).  Fed from
+	 * every outermost release regardless of ivh_observe, which is exactly
+	 * what ivh_obs_cs_hist cannot do -- calibrating the CS-stamp threshold
+	 * from that one would calibrate against the benchmark's critical
+	 * sections rather than the kernel's.
+	 */
+	seq_printf(m, "# ivh_cs_hold_hist bucket i = 2^i..2^(i+1)-1 ns, all tasks "
+		      "(i=%d: >= %llu ns, saturating)\n",
+		   IVH_CS_HOLD_HIST_BUCKETS - 1,
+		   1ULL << (IVH_CS_HOLD_HIST_BUCKETS - 1));
+	seq_printf(m, "ivh_cs_hold_hist:");
+	for (b = 0; b < IVH_CS_HOLD_HIST_BUCKETS; b++)
+		seq_printf(m, " %llu", hists->hold[b]);
+	seq_printf(m, "\n");
+	seq_printf(m, "# ivh_head_bail_loop_hist bucket i = loop counter 2^i..2^(i+1)-1; "
+		      "SPIN_THRESHOLD is 1<<15 and the loop counts DOWN, so HIGH "
+		      "buckets == the pending bit dropped very early\n");
+	seq_printf(m, "ivh_head_bail_loop_hist:");
+	for (b = 0; b < IVH_CS_LOOP_HIST_BUCKETS; b++)
+		seq_printf(m, " %llu", hists->bail_loop[b]);
+	seq_printf(m, "\n");
+skip_cs_hists:
+	kfree(hists);
+	seq_printf(m, "\n");
+#endif
+	/*
+	 * =======================================================================
+	 * Build 1: IVH Part C -- the tick-only stamp, its preemption-event series
+	 * and its vcap-free capacity number, printed SIDE BY SIDE with the real
+	 * numbers they are candidates to replace.  Build plan sec 3.5 / 3.7.
+	 * =======================================================================
+	 *
+	 * WHY THE RAW DUMP IS HERE AND NOT ONLY IN THE MODULE: the module can
+	 * format this for free, but it needs a kernel accessor to read it, and
+	 * adding an accessor is a kernel build and therefore a reboot.
+	 * get_vact_compare() (kernel/sched/core.c) and this dump ship together
+	 * in Build 1 so that every later reformatting is an rmmod/insmod.  Same
+	 * lesson as get_inferred_steal()/get_real_steal().
+	 *
+	 * UNITS.  vact_last_preempt_ns is "ns SINCE the last detected preemption
+	 * event", not an absolute timestamp: rq->last_preemption is a
+	 * sched_clock() value and ivh_vact_last_preempt_tsc is a raw TSC, the
+	 * two clocks share no epoch, and printing both as absolutes would invite
+	 * exactly the comparison that is meaningless.  real_last_preempt_ns is
+	 * therefore also printed as an age, computed the same way, so the two
+	 * columns really are comparable.  Durations (last_active) and counts
+	 * (preemptions) compare directly.
+	 *
+	 * REVIEW ITEMS THIS BLOCKS (sec 3.9): 9, does the tick stamp reproduce
+	 * the real preemption series -- vact_preemptions against real_preemptions
+	 * per CPU, and vact_jumps against both.  10, is idle exclusion working --
+	 * vact_idle_explained should be non-zero on CPUs that idle, and there
+	 * should be no vact_jumps spike at idle->active transitions.  11, is the
+	 * halt-immunity claim true -- vact_jumps must NOT correlate with
+	 * ivh_ref_hlt_ns rising in the block below.  12, does the capacity number
+	 * track vcap's -- vcap_capacity against vact_capacity per CPU, and
+	 * ESPECIALLY around 850 (IVH_CAP_FLOOR) and 1010
+	 * (ivh_capacity_threshold), because agreement in the middle of the range
+	 * is worth nothing if the two disagree at the thresholds.
+	 */
+	seq_printf(m, "ivh_cap_source:            %lu  (0=vcap rq->cpu_capacity, 1=shadow, 2=rq->ivh_vact_capacity, 3=rq->ivh_uc_capacity)\n",
+		   READ_ONCE(ivh_cap_source));
+	seq_printf(m, "ivh_preempt_event_source:  %lu  (0=real steal last_preemption/last_active_time, 1=shadow, 2=Part C)\n",
+		   READ_ONCE(ivh_preempt_event_source));
+	seq_printf(m, "ivh_vact_jump_threshold:   %lu (cycles)\n",
+		   READ_ONCE(ivh_vact_jump_threshold));
+	seq_printf(m, "ivh_vact_window_ns:        %lu\n", READ_ONCE(ivh_vact_window_ns));
+	seq_printf(m, "ivh_vact_residual:         %lu  (0=sub-threshold gap counts wholly as executing, 1=remove idle then split at one tick + carry)\n",
+		   READ_ONCE(ivh_vact_residual));
+	seq_printf(m, "ivh_decision_shadow:       %lu\n", READ_ONCE(ivh_decision_shadow));
+	seq_printf(m, "# cpu real_last_preempt_ns vact_last_preempt_ns real_last_active_ns "
+		      "vact_last_active_ns real_preemptions vact_preemptions "
+		      "vcap_capacity vact_capacity vact_jumps vact_idle_explained\n");
+	{
+		u64 now_ns = sched_clock();
+		u64 now_c  = ivh_raw_tsc();
+
+		for_each_possible_cpu(cpu) {
+			struct rq *rq = cpu_rq(cpu);
+			u64 lp_c = READ_ONCE(rq->ivh_vact_last_preempt_tsc);
+			u64 lp_ns = READ_ONCE(rq->last_preemption);
+			u64 real_age = (lp_ns && now_ns > lp_ns) ? now_ns - lp_ns : 0;
+			u64 vact_age = (lp_c && (s64)(now_c - lp_c) > 0) ?
+				ivh_tsc_cycles_to_ns(now_c - lp_c) : 0;
+
+			seq_printf(m, "ivh_vact_cpu: %d %llu %llu %llu %llu %llu %llu %lu %lu %llu %llu\n",
+				   cpu, real_age, vact_age,
+				   READ_ONCE(rq->last_active_time),
+				   ivh_tsc_cycles_to_ns(READ_ONCE(rq->ivh_vact_last_active_c)),
+				   READ_ONCE(rq->preemptions),
+				   READ_ONCE(rq->ivh_vact_preemptions),
+				   rq->cpu_capacity, READ_ONCE(rq->ivh_vact_capacity),
+				   READ_ONCE(rq->ivh_vact_jumps),
+				   READ_ONCE(rq->ivh_vact_idle_explained));
+		}
+	}
+	/*
+	 * vcap retirement (ivh_vcap_retirement_build_plan_2026-08-03.md sec
+	 * 5.1): a NEW line, not an extension of ivh_vact_cpu: above, because
+	 * that format is consumed by existing scripts.  vcap_custom is
+	 * rq->cpu_capacity_custom (what vcap writes) sampled at THIS uc
+	 * window's close, separately from vcap_cpu_capacity
+	 * (rq->cpu_capacity, what Gate 1 actually reads); the two differ
+	 * because cpu_capacity only refreshes from cpu_capacity_custom at
+	 * load-balance cadence (update_cpu_capacity()), while ivh_uc_capacity
+	 * is fresh at window cadence -- a genuine behaviour difference that
+	 * must be attributable in the data rather than mistaken for
+	 * estimator divergence.
+	 */
+	seq_printf(m, "ivh_uc_enabled:            %lu\n", READ_ONCE(ivh_uc_enabled));
+	seq_printf(m, "ivh_uc_window_ns:          %lu\n", READ_ONCE(ivh_uc_window_ns));
+	seq_printf(m, "ivh_uc_duty_ns:            %lu\n", READ_ONCE(ivh_uc_duty_ns));
+	seq_printf(m, "ivh_uc_ema_alpha_q16:      %lu\n", READ_ONCE(ivh_uc_ema_alpha_q16));
+	seq_printf(m, "ivh_uc_used_source:        %lu  (0=WALL production, 1=ACCT validation-only)\n",
+		   READ_ONCE(ivh_uc_used_source));
+	seq_printf(m, "ivh_uc_shadow:             %lu\n", READ_ONCE(ivh_uc_shadow));
+	seq_printf(m, "ivh_uc_avgcap_enabled:     %lu\n", READ_ONCE(ivh_uc_avgcap_enabled));
+	/*
+	 * Idle-keepalive state and cost.  Printed beside the uc block rather
+	 * than in one of its own because the only question worth asking about
+	 * the keepalive is answered by reading the two together: whether the
+	 * probes it paid for actually moved the "windows" column below off the
+	 * near-zero it sits at on an idle vCPU without them.
+	 *
+	 * duty_pct vs ivh_uc_min_avail_pct is the comparison that decides
+	 * whether they did -- an idle vCPU's entire avail comes from the probe,
+	 * so a duty cycle under the min-avail threshold leaves every window
+	 * EXTENDED and publishes nothing however reliably the probes fire.
+	 */
+	seq_printf(m, "ivh_ka_enabled:            %lu\n", READ_ONCE(ivh_ka_enabled));
+	seq_printf(m, "ivh_ka_interval_ns:        %lu\n", READ_ONCE(ivh_ka_interval_ns));
+	seq_printf(m, "ivh_ka_probe_ns:           %lu  (duty %lu%%, vs ivh_uc_min_avail_pct %lu)\n",
+		   READ_ONCE(ivh_ka_probe_ns),
+		   READ_ONCE(ivh_ka_probe_ns) * 100 /
+			max(READ_ONCE(ivh_ka_interval_ns), 1UL),
+		   READ_ONCE(ivh_uc_min_avail_pct));
+	seq_printf(m, "# cpu ka_probes ka_skipped_fresh ka_aborted ka_spin_ms ka_misdispatched\n");
+	for_each_possible_cpu(cpu) {
+		u64 probes, skipped_fresh, aborted, spin_ns, misdispatched;
+
+		get_ka_compare(cpu, &probes, &skipped_fresh, &aborted,
+			       &spin_ns, &misdispatched);
+		seq_printf(m, "ivh_ka_cpu: %d %llu %llu %llu %llu %llu\n",
+			   cpu, probes, skipped_fresh, aborted,
+			   spin_ns / 1000000, misdispatched);
+	}
+	seq_printf(m, "# cpu vcap_custom vcap_cpu_capacity uc_capacity uc_wall uc_acct raw_wall raw_acct "
+		      "win_avail_c win_stolen_c windows extended skipped vact_capacity\n");
+	for_each_possible_cpu(cpu) {
+		struct rq *rq = cpu_rq(cpu);
+
+		seq_printf(m, "ivh_uc_cpu: %d %lu %lu %lu %lu %lu %llu %llu %llu %llu %llu %llu %llu %lu\n",
+			   cpu, READ_ONCE(rq->cpu_capacity_custom), rq->cpu_capacity,
+			   READ_ONCE(rq->ivh_uc_capacity),
+			   READ_ONCE(rq->ivh_uc_capacity_wall),
+			   READ_ONCE(rq->ivh_uc_capacity_acct),
+			   READ_ONCE(rq->ivh_uc_raw_wall), READ_ONCE(rq->ivh_uc_raw_acct),
+			   READ_ONCE(rq->ivh_uc_win_avail_c), READ_ONCE(rq->ivh_uc_win_stolen_c),
+			   READ_ONCE(rq->ivh_uc_windows), READ_ONCE(rq->ivh_uc_extended),
+			   READ_ONCE(rq->ivh_uc_skipped), READ_ONCE(rq->ivh_vact_capacity));
+	}
+	/*
+	 * The two decision-agreement 2x2s (sec 3.8), fed only while
+	 * ivh_decision_shadow is on.  These are the ONLY lines here that answer
+	 * "does IVH make the same MIGRATION DECISIONS with the TSC signal as
+	 * with the real one" -- every other counter in this file answers a
+	 * question about a raw signal, and constraint #2 is explicit that raw
+	 * signal agreement is not decision agreement.
+	 *
+	 * ivh_dec_* is the Gate 1+2 verdict evaluated twice on the same rq at
+	 * the same instant.  ivh_cap_pass_* is per candidate CPU per
+	 * evaluation, so its denominator is roughly (evaluations x online
+	 * CPUs) and it is not comparable in magnitude to ivh_dec_*; compare
+	 * each set against ITSELF.
+	 */
+	seq_printf(m, "ivh_dec_agree_go:          %llu\n", dec_agree_go);
+	seq_printf(m, "ivh_dec_agree_nogo:        %llu\n", dec_agree_nogo);
+	seq_printf(m, "ivh_dec_tsc_only_go:       %llu\n", dec_tsc_only);
+	seq_printf(m, "ivh_dec_real_only_go:      %llu\n", dec_real_only);
+	seq_printf(m, "ivh_cap_pass_both:         %llu\n", cap_pass_both);
+	seq_printf(m, "ivh_cap_pass_real_only:    %llu\n", cap_pass_real);
+	seq_printf(m, "ivh_cap_pass_tsc_only:     %llu\n", cap_pass_tsc);
+	seq_printf(m, "ivh_cap_pass_neither:      %llu\n", cap_pass_neither);
+	seq_printf(m, "\n");
+	/*
+	 * vcap retirement (ivh_vcap_retirement_build_plan_2026-08-03.md sec
+	 * 5.4): same {agree,pass,destset_empty} shape as the real-vs-tsc set
+	 * above, modelling {real,uc} instead.  Compare each set against
+	 * ITSELF, same discipline as the comment on ivh_dec_* above.
+	 */
+	seq_printf(m, "ivh_dec_uc_agree_go:       %llu\n", dec_uc_agree_go);
+	seq_printf(m, "ivh_dec_uc_agree_nogo:     %llu\n", dec_uc_agree_nogo);
+	seq_printf(m, "ivh_dec_uc_only_go:        %llu\n", dec_uc_only);
+	seq_printf(m, "ivh_dec_uc_real_only_go:   %llu\n", dec_uc_real_only);
+	seq_printf(m, "ivh_uc_pass_both:          %llu\n", uc_pass_both);
+	seq_printf(m, "ivh_uc_pass_vcap_only:     %llu\n", uc_pass_vcap_only);
+	seq_printf(m, "ivh_uc_pass_uc_only:       %llu\n", uc_pass_uc_only);
+	seq_printf(m, "ivh_uc_pass_neither:       %llu\n", uc_pass_neither);
+	seq_printf(m, "ivh_destset_empty_vcap:    %llu\n", destset_empty_vcap);
+	seq_printf(m, "ivh_destset_empty_uc:      %llu\n", destset_empty_uc);
+	seq_printf(m, "ivh_destset_empty_tsc:     %llu\n", destset_empty_tsc);
+	seq_printf(m, "ivh_uc_thr850_both:        %llu\n", uc_thr850_both);
+	seq_printf(m, "ivh_uc_thr850_vcap_only:   %llu\n", uc_thr850_vcap_only);
+	seq_printf(m, "ivh_uc_thr850_uc_only:     %llu\n", uc_thr850_uc_only);
+	seq_printf(m, "ivh_uc_thr850_neither:     %llu\n", uc_thr850_neither);
+	seq_printf(m, "ivh_uc_thr1010_both:       %llu\n", uc_thr1010_both);
+	seq_printf(m, "ivh_uc_thr1010_vcap_only:  %llu\n", uc_thr1010_vcap_only);
+	seq_printf(m, "ivh_uc_thr1010_uc_only:    %llu\n", uc_thr1010_uc_only);
+	seq_printf(m, "ivh_uc_thr1010_neither:    %llu\n", uc_thr1010_neither);
+	seq_printf(m, "# ivh_uc_div_hist: signed (uc_capacity - vcap_capacity), 16 buckets, "
+		      "b0 <=-512 .. b7 -8..0 | b8 0..8 .. b15 >=+512\n");
+	seq_printf(m, "ivh_uc_div_hist:");
+	for (b = 0; b < IVH_UC_DIV_HIST_BUCKETS; b++)
+		seq_printf(m, " %llu", uc_div_hist[b]);
+	seq_printf(m, "\n");
+	seq_printf(m, "\n");
+/* CONFIG_PERF_EVENTS as well as CONFIG_X86: ivh_ref_steal_enabled and the
+ * whole inference live inside that same #if in kernel/sched/core.c. */
+#if defined(CONFIG_X86) && defined(CONFIG_PERF_EVENTS)
+	/*
+	 * IVH inferred steal time and the lock-path halt correction
+	 * (kernel/sched/core.c ivh_ref_accumulate(); root cause writeup on
+	 * struct ivh_lock_halt in <asm/ivh_tsc_beat.h>).
+	 *
+	 * HOW TO READ THIS BLOCK, which is the whole reason it exists:
+	 *
+	 *   hlt_ns and poll_ns are time this vCPU spent halted or napping
+	 *   *inside the qspinlock slowpath*, i.e. outside the idle loop.  Every
+	 *   one of those nanoseconds is invisible to get_cpu_idle_time_us(), so
+	 *   at ivh_ref_halt_correct=0 every one of them is inside steal_ns as
+	 *   well.  Take a before/after delta across a benchmark run and compare
+	 *   d(hlt_ns)+d(poll_ns) against d(steal_ns): if they are the same order
+	 *   of magnitude, the inferred steal this configuration feeds vcap is
+	 *   mostly the mechanism measuring itself, not host preemption.
+	 *
+	 *   Cross-check against /proc/vcap_steal_compare's delta_ppm, which
+	 *   compares inferred against paravirt_steal_clock().  The design note
+	 *   in core.c says delta_ppm is expected NEGATIVE and that a persistently
+	 *   POSITIVE delta means idle is being under-subtracted -- lock-path
+	 *   halts are exactly that under-subtraction, so a strongly positive
+	 *   delta_ppm here is the confirmation, and it collapsing when
+	 *   ivh_ref_halt_correct is raised is the proof.
+	 *
+	 *   skipped rising with samples flat is a different failure (fixed
+	 *   counter 2 lost/multiplexed), NOT this one.  It is printed here so
+	 *   the two are never confused.
+	 *
+	 * Per-CPU, not just summed: a divergence that lives on two vCPUs looks
+	 * like mild noise in a 16-CPU total.
+	 */
+	{
+		u64 t_steal = 0, t_hlt = 0, t_poll = 0, t_samp = 0, t_skip = 0;
+
+		seq_printf(m, "ivh_ref_steal_enabled:  %lu\n", READ_ONCE(ivh_ref_steal_enabled));
+		seq_printf(m, "ivh_steal_source:       %lu  (0=paravirt_steal_clock, 1=inferred REF_TSC)\n",
+			   READ_ONCE(ivh_steal_source));
+		seq_printf(m, "ivh_ref_halt_correct:   %lu  (0=none, 1=HLT, 2=HLT+poll)\n",
+			   READ_ONCE(ivh_ref_halt_correct));
+		seq_printf(m, "ivh_ref_carry:          %lu  (0=discard negative residual, 1=carry bounded)\n",
+			   READ_ONCE(ivh_ref_carry));
+		seq_printf(m, "ivh_ref_trace:          %lu\n", READ_ONCE(ivh_ref_trace));
+		seq_printf(m, "ivh_ref_method:         %lu  (0=today's estimator, 1=exit-overhead deadband shadow, 2=deadband authoritative)\n",
+			   READ_ONCE(ivh_ref_method));
+		seq_printf(m, "ivh_ref_exit_loc_ns:    %lu\n", READ_ONCE(ivh_ref_exit_loc_ns));
+		seq_printf(m, "ivh_ref_exit_oth_ns:    %lu\n", READ_ONCE(ivh_ref_exit_oth_ns));
+		seq_printf(m, "# cpu steal_ns hlt_ns poll_ns hlt_events poll_events samples skipped "
+			      "steal_raw_ns steal2_ns ovh_ns debt2_c\n");
+		for_each_possible_cpu(cpu) {
+			struct rq *rq = cpu_rq(cpu);
+			struct ivh_lock_halt *h = &per_cpu(ivh_lock_halt, cpu);
+
+			t_steal += rq->ivh_ref_steal_ns;
+			t_hlt   += rq->ivh_ref_hlt_ns;
+			t_poll  += rq->ivh_ref_poll_ns;
+			t_samp  += rq->ivh_ref_samples;
+			t_skip  += rq->ivh_ref_skipped;
+			seq_printf(m, "ivh_ref_cpu: %d %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %lld\n",
+				   cpu, rq->ivh_ref_steal_ns, rq->ivh_ref_hlt_ns,
+				   rq->ivh_ref_poll_ns, h->hlt_events, h->poll_events,
+				   rq->ivh_ref_samples, rq->ivh_ref_skipped,
+				   rq->ivh_ref_steal_raw_ns, rq->ivh_ref_steal2_ns,
+				   rq->ivh_ref_ovh_ns, rq->ivh_ref_debt2_c);
+		}
+		seq_printf(m, "ivh_ref_steal_ns_total: %llu\n", t_steal);
+		seq_printf(m, "ivh_ref_hlt_ns_total:   %llu\n", t_hlt);
+		seq_printf(m, "ivh_ref_poll_ns_total:  %llu\n", t_poll);
+		seq_printf(m, "ivh_ref_samples_total:  %llu\n", t_samp);
+		seq_printf(m, "ivh_ref_skipped_total:  %llu\n", t_skip);
+		seq_printf(m, "\n");
+	}
+#endif
 	seq_printf(m, "# If in_schedule > 0 during a hang:\n");
 	seq_printf(m, "#   threads are stuck in schedule() waiting for vCPU on target\n");
 	seq_printf(m, "# If timeout_count is rising:\n");

@@ -1453,6 +1453,95 @@ struct task_struct {
 	u64				last_cs_ns;
 
 	/*
+	 * cs_beat_lock: the raw_spinlock_t whose outermost hold published this
+	 * CPU's ivh_cs_beat stamp (Build 1, tools/bpf/docs/
+	 * ivh_tsc_full_redesign_build_plan_2026-07-29.md sec 3.2.2).  Written
+	 * only when ivh_cs_preempt_src != 0; NULL otherwise and by default.
+	 *
+	 * It exists to close one specific live-wrong-answer hole, not for
+	 * bookkeeping.  _raw_spin_unlock_bh() (kernel/locking/spinlock.c) runs
+	 * its cs_exit() AFTER the real unlock -- there is an in-tree comment
+	 * saying so -- so between the release and the cs_exit() this CPU may
+	 * already have entered a DIFFERENT critical section.  An unconditional
+	 * stamp clear there would wipe the new hold's stamp and make a genuinely
+	 * held lock read as "nobody is in a critical section".  Clearing only
+	 * when the recorded lock pointer still matches turns that into a no-op,
+	 * and ivh_cs_clear_mismatch counts how often the ordering actually
+	 * bites -- which is a number this project has never had.
+	 *
+	 * A void * rather than raw_spinlock_t * because it is only ever
+	 * compared for identity and never dereferenced, and because
+	 * <linux/sched.h> has no business depending on the spinlock type here.
+	 */
+	void				*cs_beat_lock;
+
+	/*
+	 * Hot Threads per-task contention/preemption classifier (see
+	 * linux/bpf_sched.h, kernel/locking/spinlock.c). Two independent,
+	 * event-driven EWMAs in IVH_HOTLOCK_SCALE fixed point (0..1<<SCALE):
+	 * ivh_wait_decay:    fed SCALE once per contended-wait event
+	 *                    (qspinlock slowpath enter), and an occasional
+	 *                    (1-in-N release events) 0-sample from cs_exit()
+	 *                    so it reflects RECENT rather than lifetime
+	 *                    contention -- see ivh_hot_wait_decay_sample_zero()
+	 *                    in kernel/locking/spinlock.c. Single writer = self.
+	 * ivh_preempt_decay: fed 0/SCALE once per outermost CS exit, SCALE iff
+	 *                    the vCPU's cumulative steal-ns advanced by more
+	 *                    than IVH_HOT_STEAL_FLOOR_NS across the hold.
+	 * ivh_wait_zero_ctr: scratch: 1-in-N sampling counter for the
+	 *                    wait_decay 0-feed above.
+	 * cs_steal_start:    scratch: vCPU cumulative steal-ns snapshot taken at
+	 *                    outermost cs_enter(), diffed at cs_exit().
+	 * All written only in process context by the task itself.
+	 */
+	u16				ivh_wait_decay;
+	u16				ivh_preempt_decay;
+	u16				ivh_wait_zero_ctr;
+	/*
+	 * ivh_wait_latched: sticky one-way latch (0/1). When the optional
+	 * ivh_hot_wait_latch_enabled sysctl is set, this is armed the first
+	 * time ivh_wait_decay ever exceeds ivh_hot_wait_threshold and never
+	 * cleared for the life of the task, so a sustained lock-holder whose
+	 * decayed EWMA later dips below threshold is still treated as hot. A
+	 * task that never contends never arms it. Single writer = self.
+	 */
+	u8				ivh_wait_latched;
+
+	/*
+	 * ivh_observe: sticky "observe only" bit (0/1), independent of
+	 * PF_IVH_ELIGIBLE. Set via prctl(PR_SET_IVH_ELIGIBLE, 2, ...)
+	 * (kernel/sys.c). Widens cs_enter()/cs_exit()'s outermost-CS steal
+	 * tracking to run for this task even when it is NOT migration-
+	 * eligible, feeding ivh_obs_total_holds/ivh_obs_stolen_holds
+	 * (kernel/locking/spinlock.c) without ever influencing the Hot
+	 * Threads EWMAs or triggering a migration. Lets a wrapper (ivh_exec
+	 * -v -n) measure a process's real host-preemption exposure with IVH
+	 * genuinely turned off for it, using the same cheap, always-compiled
+	 * cs_enter()/cs_exit() bookkeeping the eligible path already pays
+	 * for, instead of a separate BPF trampoline attachment on the whole
+	 * system's raw-spinlock fast path.
+	 */
+	u8				ivh_observe;
+
+	/*
+	 * ivh_exclude: sticky per-task "opt out" bit (0/1). 2026-07-20:
+	 * added when ivh_universal_eligible became the sole eligibility
+	 * gate (PF_IVH_ELIGIBLE no longer consulted anywhere) -- without
+	 * this, a single global switch had no way to exclude one specific
+	 * process, which is exactly what ivh_exec -v -n needs (measure a
+	 * workload's real host-preemption exposure with IVH genuinely off
+	 * for it, while the rest of the system may still have
+	 * ivh_universal_eligible on). Checked as
+	 * `READ_ONCE(ivh_universal_eligible) && !current->ivh_exclude`
+	 * everywhere the sysctl gates behavior. Set via
+	 * prctl(PR_SET_IVH_ELIGIBLE, 3, ...) (kernel/sys.c). Independent of
+	 * ivh_observe -- excluding a task from migration eligibility does
+	 * not stop it from being observed if ivh_observe is also set.
+	 */
+	u8				ivh_exclude;
+	u64				cs_steal_start;
+
+	/*
 	 * On-CPU (active) time accounting.
 	 * sched_in_stamp: ktime_get_ns() recorded in finish_task_switch() when
 	 *   this task is scheduled in.  0 when the task is off-CPU.

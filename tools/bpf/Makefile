@@ -129,7 +129,7 @@ resolve_btfids_clean:
 .PHONY: all install clean bpftool bpftool_install bpftool_clean \
 	runqslower runqslower_clean \
 	resolve_btfids resolve_btfids_clean \
-	ivh_atc lhp_movable lhp_cstime lhp_waittime MY_ivh_atc
+	ivh_atc lhp_movable lhp_cstime lhp_waittime MY_ivh_atc ivh_exec
 
 # --- ivh_atc self-contained build ---
 IVH_BPFTOOL  := bpftool
@@ -196,6 +196,25 @@ lhp_cstime.skel.h: lhp_cstime.bpf.o
 	$(IVH_BPFTOOL) gen skeleton $< name lhp_cstime > $@
 
 lhp_cstime.bpf.o: lhp_cstime.bpf.c
+	clang -O2 -g -target bpf -D__TARGET_ARCH_$(IVH_ARCH) \
+		-I$(srctree) -I./include \
+		-c $< -o $@
+
+# --- ivh_exec (IVH-eligible wrapper + optional -v BPF steal-during-CS stats) ---
+# The ivh_exec binary lives at the repo root; its BPF program + skeleton live
+# here under tools/bpf following the same convention as MY_ivh_atc.
+ivh_exec: ../../ivh_exec.c ivh_exec_stats.skel.h
+	cc -O2 \
+		-I$(srctree)/tools/include/uapi \
+		-I$(IVH_LIBBPF_INC) \
+		-I. \
+		-o ../../$@ $< \
+		$(IVH_LIBBPF_LIB)/libbpf.a -lelf -lz
+
+ivh_exec_stats.skel.h: ivh_exec_stats.bpf.o
+	$(IVH_BPFTOOL) gen skeleton $< name ivh_exec_stats > $@
+
+ivh_exec_stats.bpf.o: ivh_exec_stats.bpf.c
 	clang -O2 -g -target bpf -D__TARGET_ARCH_$(IVH_ARCH) \
 		-I$(srctree) -I./include \
 		-c $< -o $@

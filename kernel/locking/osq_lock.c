@@ -115,13 +115,6 @@ bool osq_lock(struct optimistic_spin_queue *lock)
 	node->prev = prev;
 
 	/*
-	 * Lock is contended; optimistic spinning begins here.
-	 * wait_depth > 0 until spinning ends (acquisition or bail to sleep).
-	 * OSQ is always called in process context so no in_interrupt() guard.
-	 */
-	current->wait_depth++;
-
-	/*
 	 * osq_lock()			unqueue
 	 *
 	 * node->prev = prev		osq_wait_next()
@@ -151,11 +144,8 @@ bool osq_lock(struct optimistic_spin_queue *lock)
 	 * polling, be careful.
 	 */
 	if (smp_cond_load_relaxed(&node->locked, VAL || need_resched() ||
-				  vcpu_is_preempted(node_cpu(node->prev)))) {
-		/* lock handed to us; spinning done */
-		current->wait_depth--;
+				  vcpu_is_preempted(node_cpu(node->prev))))
 		return true;
-	}
 
 	/* unqueue */
 	/*
@@ -180,11 +170,8 @@ bool osq_lock(struct optimistic_spin_queue *lock)
 		 * in which case we should observe @node->locked becoming
 		 * true.
 		 */
-		if (smp_load_acquire(&node->locked)) {
-			/* lock acquired during unqueue step-A; spinning done */
-			current->wait_depth--;
+		if (smp_load_acquire(&node->locked))
 			return true;
-		}
 
 		cpu_relax();
 
@@ -203,11 +190,8 @@ bool osq_lock(struct optimistic_spin_queue *lock)
 	 */
 
 	next = osq_wait_next(lock, node, prev->cpu);
-	if (!next) {
-		/* dequeued cleanly; bail to sleep */
-		current->wait_depth--;
+	if (!next)
 		return false;
-	}
 
 	/*
 	 * Step - C -- unlink
@@ -220,8 +204,6 @@ bool osq_lock(struct optimistic_spin_queue *lock)
 	WRITE_ONCE(next->prev, prev);
 	WRITE_ONCE(prev->next, next);
 
-	/* dequeued and handed off to next; bail to sleep */
-	current->wait_depth--;
 	return false;
 }
 

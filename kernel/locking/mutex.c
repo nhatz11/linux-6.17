@@ -30,9 +30,20 @@
 #include <linux/debug_locks.h>
 #include <linux/osq_lock.h>
 #include <linux/hung_task.h>
+#include <linux/bpf_sched.h>
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/lock.h>
+
+#ifdef CONFIG_BPF_SYSCALL
+/*
+ * IVH mutex optimistic-spin observability counters (see linux/bpf_sched.h).
+ * Incremented only in mutex_spin_on_owner() below, only for PF_IVH_ELIGIBLE
+ * tasks; summed and printed by /proc/ivh_debug in kernel/sched/fair.c.
+ */
+DEFINE_PER_CPU(u64, ivh_mutex_spin_observed);
+DEFINE_PER_CPU(u64, ivh_mutex_spin_owner_preempted);
+#endif
 
 #ifndef CONFIG_PREEMPT_RT
 #include "mutex.h"
@@ -341,6 +352,31 @@ bool mutex_spin_on_owner(struct mutex *lock, struct task_struct *owner,
 			 struct ww_acquire_ctx *ww_ctx, struct mutex_waiter *waiter)
 {
 	bool ret = true;
+#ifdef CONFIG_BPF_SYSCALL
+	/*
+	 * IVH Hotlock observability: this owner-watch loop is the mutex
+	 * analogue of the qspinlock MCS/pending spin already tracked in
+	 * kernel/locking/qspinlock.c, and is the real LHP-sensitive spin
+	 * point for mutex-serialised workloads (e.g. hackbench's pipe->mutex)
+	 * that the raw-spinlock Hotlock hooks never observe.
+	 * Count each eligible entry, and — when the loop below bails because the
+	 * holder's vCPU is preempted (owner_on_cpu() == false) — count that too.
+	 * Cheap per-CPU increments only; no allocation, no locking, no control-
+	 * flow change.  Purely observability: nothing migrates off this path.
+	 * 2026-07-20: PF_IVH_ELIGIBLE no longer consulted here --
+	 * ivh_universal_eligible is the sole gate now, not an ivh_exec-wrapper
+	 * opt-in. bool ivh_track = current->flags & PF_IVH_ELIGIBLE;
+	 * ivh_exclude (per-task opt-out) added same day -- this tracks the
+	 * eligible population's mutex behavior, so an excluded task is
+	 * excluded from it too, same as everywhere else eligibility is
+	 * checked (unlike ivh_observe, which is a separate, independent
+	 * opt-in and stays unaffected by ivh_exclude).
+	 */
+	bool ivh_track = READ_ONCE(ivh_universal_eligible) && !current->ivh_exclude;
+
+	if (ivh_track)
+		this_cpu_inc(ivh_mutex_spin_observed);
+#endif
 
 	lockdep_assert_preemption_disabled();
 
@@ -359,6 +395,12 @@ bool mutex_spin_on_owner(struct mutex *lock, struct task_struct *owner,
 		 * Use vcpu_is_preempted to detect lock holder preemption issue.
 		 */
 		if (!owner_on_cpu(owner) || need_resched()) {
+#ifdef CONFIG_BPF_SYSCALL
+			/* Attribute the bail to holder-vCPU preemption (LHP)
+			 * specifically, vs. a plain need_resched(). */
+			if (ivh_track && !owner_on_cpu(owner))
+				this_cpu_inc(ivh_mutex_spin_owner_preempted);
+#endif
 			ret = false;
 			break;
 		}

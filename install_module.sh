@@ -35,8 +35,13 @@ ORIG_UTS=$(cat "$UTS_FILE" 2>/dev/null || echo "")
 echo "$TARGET_VER" > "$RELEASE_FILE"
 printf '#define UTS_RELEASE "%s"\n' "$TARGET_VER" > "$UTS_FILE"
 
-make -C "$BASE/custom_modules" clean 2>/dev/null || true
-make -C "$BASE/custom_modules"
+# Use the explicit M= external-module form rather than `make -C
+# custom_modules`: the latter needs a wrapper Makefile inside
+# custom_modules/ that only exists once something has generated it, and
+# custom_modules/ is otherwise gitignored like any other build directory —
+# a fresh clone won't have that wrapper. M= needs nothing pre-existing.
+make -C "$BASE" M="$BASE/custom_modules" clean 2>/dev/null || true
+make -C "$BASE" M="$BASE/custom_modules" modules
 
 # Restore
 [ -n "$ORIG_RELEASE" ] && echo "$ORIG_RELEASE" > "$RELEASE_FILE"

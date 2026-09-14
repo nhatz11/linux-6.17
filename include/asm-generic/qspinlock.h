@@ -41,6 +41,16 @@
 
 #include <asm-generic/qspinlock_types.h>
 #include <linux/atomic.h>
+/*
+ * IVH lock-holder identity.  Deliberately a standalone header whose entire
+ * dependency set is <linux/compiler.h> + <linux/types.h>, and deliberately
+ * NOT <asm/ivh_tsc_beat.h> where the rest of the IVH lock instrumentation
+ * lives -- see the include-order writeup in <linux/ivh_lock_holder.h>.  Every
+ * ivh_lock_*_holder() below compiles to nothing at all off x86/KVM/PV, and to
+ * a single predicted branch on a read-mostly global when
+ * ivh_lock_holder_enabled is 0, which is the default.
+ */
+#include <linux/ivh_lock_holder.h>
 
 #ifndef queued_spin_is_locked
 /**
@@ -94,7 +104,25 @@ static __always_inline int queued_spin_trylock(struct qspinlock *lock)
 	if (unlikely(val))
 		return 0;
 
-	return likely(atomic_try_cmpxchg_acquire(&lock->val, &val, _Q_LOCKED_VAL));
+	if (likely(atomic_try_cmpxchg_acquire(&lock->val, &val, _Q_LOCKED_VAL))) {
+		/*
+		 * IVH ownership-transfer site A2 (build plan sec 3.3.4).
+		 * Distinct from A6: inside kernel/locking/qspinlock.c this name
+		 * is #define'd to pv_hybrid_queued_unfair_trylock()
+		 * (kernel/locking/qspinlock_paravirt.h), so the PV slowpath's
+		 * trylocks never reach this function and are stamped there
+		 * instead.  This one covers every OTHER caller of
+		 * queued_spin_trylock() in the kernel.
+		 *
+		 * Strictly AFTER the acquiring cmpxchg; see
+		 * __ivh_lock_set_holder() for why the ordering argument is
+		 * store->store under x86-TSO and not "the locked RMW fences it".
+		 */
+		ivh_lock_set_holder(lock);
+		return 1;
+	}
+
+	return 0;
 }
 
 extern void queued_spin_lock_slowpath(struct qspinlock *lock, u32 val);
@@ -108,8 +136,21 @@ static __always_inline void queued_spin_lock(struct qspinlock *lock)
 {
 	int val = 0;
 
-	if (likely(atomic_try_cmpxchg_acquire(&lock->val, &val, _Q_LOCKED_VAL)))
+	if (likely(atomic_try_cmpxchg_acquire(&lock->val, &val, _Q_LOCKED_VAL))) {
+		/*
+		 * IVH ownership-transfer site A1 (build plan sec 3.3.4): the
+		 * uncontended fast path, and THE cost that decides whether any
+		 * of this can ship.  This is the hottest lock site in the
+		 * kernel -- a single LOCK CMPXCHG today -- so the whole
+		 * "is a gated store on the ownership path affordable" question
+		 * (build plan sec 1.1) is really a question about this line.
+		 * It is answered by A/B'ing ivh_lock_holder_enabled 0 vs 1 on
+		 * the same workload inside one boot, which is why the gate is a
+		 * sysctl and not a Kconfig.
+		 */
+		ivh_lock_set_holder(lock);
 		return;
+	}
 
 	queued_spin_lock_slowpath(lock, val);
 }
@@ -122,6 +163,21 @@ static __always_inline void queued_spin_lock(struct qspinlock *lock)
  */
 static __always_inline void queued_spin_unlock(struct qspinlock *lock)
 {
+	/*
+	 * IVH release site R1 (build plan sec 3.3.4), strictly BEFORE the
+	 * releasing store.  smp_store_release() orders every prior store ahead
+	 * of itself, so the plain WRITE_ONCE inside cannot be moved past the
+	 * release and no extra barrier is needed -- but it must be here rather
+	 * than after, because the moment the lock byte clears another CPU may
+	 * already own this lock and a clear placed after would wipe ITS stamp.
+	 * That is the same failure that disqualifies _raw_spin_unlock_bh()'s
+	 * cs_exit() as a holder-identity site (see <linux/ivh_lock_holder.h>).
+	 *
+	 * Note this generic body is NOT the live one on x86 with
+	 * CONFIG_PARAVIRT_SPINLOCKS: <asm/qspinlock.h> overrides
+	 * queued_spin_unlock and routes to R2/R3/R4 instead.
+	 */
+	ivh_lock_clear_holder(lock);
 	/*
 	 * unlock() needs release semantics:
 	 */

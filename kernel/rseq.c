@@ -15,6 +15,7 @@
 #include <linux/types.h>
 #include <linux/ratelimit.h>
 #include <linux/sysctl.h>
+#include <linux/bpf_sched.h>
 #include <asm/ptrace.h>
 
 #define CREATE_TRACE_POINTS
@@ -167,6 +168,16 @@ static int rseq_update_cpu_node_id(struct task_struct *t)
 	u32 node_id = cpu_to_node(cpu_id);
 	u32 mm_cid = task_mm_cid(t);
 	u32 sched_state = RSEQ_SCHED_STATE_FLAG_ON_CPU;
+
+	/*
+	 * Advisory IVH danger bit -- see RSEQ_SCHED_STATE_FLAG_IVH_DANGER
+	 * (include/uapi/linux/rseq.h) and ivh_task_rq_in_danger()
+	 * (kernel/sched/fair.c). ivh_task_rq_in_danger() itself short-circuits
+	 * in one branch (READ_ONCE(ivh_universal_eligible)) when IVH is off,
+	 * which is the overwhelmingly common case system-wide.
+	 */
+	if (ivh_task_rq_in_danger(t))
+		sched_state |= RSEQ_SCHED_STATE_FLAG_IVH_DANGER;
 
 	/*
 	 * Validate read-only rseq fields.
