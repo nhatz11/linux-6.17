@@ -96,6 +96,15 @@ struct pv_node {
 	struct mcs_spinlock	mcs;
 	int			cpu;
 	u8			state;
+	/*
+	 * Phase 0b. Deposited by our promoter just before it hands us the MCS
+	 * baton, read by us at acquisition. Lives in the 3-byte padding hole
+	 * after ->state, so sizeof(struct pv_node) stays exactly 32 and
+	 * ->head_ctl stays at offset 24 -- the BUILD_BUG_ON against
+	 * sizeof(struct qnode) below still holds and no cacheline layout
+	 * changes. Written only under ivh_pv_rot_probe.
+	 */
+	u8			rot_flags;
 	u64			head_ctl;
 };
 
@@ -137,6 +146,18 @@ static inline bool pv_hybrid_queued_unfair_trylock(struct qspinlock *lock)
 		if (!(val & _Q_LOCKED_PENDING_MASK) &&
 		    try_cmpxchg_acquire(&lock->locked, &old, _Q_LOCKED_VAL)) {
 			lockevent_inc(pv_lock_stealing);
+			/*
+			 * Phase 0b: CONFIG_LOCK_EVENT_COUNTS is off in this
+			 * build, so pv_lock_stealing above compiles away. This
+			 * is the same event, counted unconditionally because a
+			 * steal is already rare relative to the cmpxchg that
+			 * just succeeded, and because it is the control the
+			 * whole rotation question turns on: a steal here is a
+			 * dead head's cost ALREADY being recovered.
+			 */
+			if (unlikely(READ_ONCE(ivh_pv_rot_probe)) &&
+			    (val & _Q_TAIL_MASK))
+				this_cpu_inc(ivh_rot_steals);
 			return true;
 		}
 		if (!(val & _Q_TAIL_MASK) || (val & _Q_PENDING_MASK))
@@ -635,6 +656,13 @@ static void pv_init_node(struct mcs_spinlock *node)
 	pn->cpu = smp_processor_id();
 	pn->state = VCPU_RUNNING;
 	pn->head_ctl = HC(0, 0, HEAD_IDLE);
+	/*
+	 * Per-tenure reset, unconditional: every node runs pv_init_node() on
+	 * queue entry, so this is the exact point that guarantees we never read
+	 * a flag deposited during a previous, unrelated occupancy of this
+	 * qnodes[] slot -- including across a toggle of ivh_pv_rot_probe.
+	 */
+	pn->rot_flags = 0;
 
 	/*
 	 * IVH heartbeat cold-start seed (build plan sec 2.2, "a second hole").
@@ -931,6 +959,535 @@ static void pv_kick_node(struct qspinlock *lock, struct mcs_spinlock *node)
 }
 
 /*
+ * ============================================================================
+ * pv_handoff_rotate() -- handoff-time rotation
+ * ============================================================================
+ *
+ * Called by the thread that has JUST ACQUIRED the lock (set_locked() at
+ * kernel/locking/qspinlock.c:447), immediately before it promotes its
+ * successor via arch_mcs_spin_unlock_contended(&next->locked).
+ *
+ * Why this call site: at that point the caller (a) holds the lock, so it has
+ * mutual exclusion, and (b) has not yet run __this_cpu_dec(qnodes[0].mcs.count),
+ * so it still owns its qnode slot and is still a queue member. That is exactly
+ * the position CNA's cna_order_queue() splices from, and it is what makes a
+ * forward walk of ->next safe here in a way it would not be from the unlock
+ * path. See tools/bpf/docs/ivh_handoff_rotation_feasibility_2026-09-13.md.
+ *
+ * TWO KNOBS, AND THE DISTINCTION IS THE WHOLE SAFETY POSTURE:
+ *
+ *   ivh_pv_rot_probe  -- PHASE 0, DETECT ONLY. Walks the queue and counts.
+ *       The only thing it writes is the promoted successor's own rot_flags
+ *       byte, which the successor reads back in ivh_rot_ack(); no ->next
+ *       pointer and no *nextp is ever touched, so the queue is byte-for-byte
+ *       what upstream would have built.
+ *         ivh_rot_preempted / ivh_rot_handoffs  -- how often is the promotion
+ *             target preempted, i.e. how often would promoting it create a
+ *             "dead head"?
+ *         ivh_rot_depth_hist[]  -- when it is, how far back is the first live
+ *             waiter? Bucket 0 = successor was live (common case). Bucket
+ *             IVH_ROT_HOP_CAP = no live node among the first HOP_CAP nodes.
+ *         ivh_rot_splice_ok  -- and of those, how many were actually LEGAL to
+ *             splice. This is the real addressable number; the histogram
+ *             above overstates it, because it does not check the live node's
+ *             own ->next.
+ *
+ *   ivh_pv_rot_enable -- PHASE 1. The only setting under which any ->next
+ *       pointer is rewritten. See <asm/ivh_tsc_beat.h> for the full safety
+ *       argument (the two facts about ->next that make the splice legal, why
+ *       every node behind us is frozen, why no barrier beyond the caller's
+ *       existing smp_store_release is needed, and how starvation is bounded).
+ *       Each individual store is justified again at its own site below.
+ *
+ * BOTH REQUIRE ivh_pv_preempt_src == 2. At any other value the liveness test
+ * degrades to vcpu_is_preempted(), hardwired false on a host with no real
+ * steal-time page (this one), so every node reads live, the probe correctly
+ * reports "never preempted", and rotation is self-disabling -- it can never
+ * fire on a signal it does not have.
+ */
+static __always_inline bool ivh_rot_stale(struct mcs_spinlock *n, unsigned long src,
+					  u64 thr, u64 now)
+{
+	struct pv_node *pn = (struct pv_node *)n;
+
+	/*
+	 * Deliberately NOT is_wait_preempted(): that function has mandatory
+	 * counter side effects on both paths (tier2 == true bumps
+	 * ivh_beat_tier2_checked/_fired and ivh_beat_age_hist_raw; tier2 ==
+	 * false bumps the ivh_tier1_confirm_* set, and either writes
+	 * ivh_beat_min_age). This probe is a THIRD question -- "is the
+	 * promotion target preempted" -- and folding it into either population
+	 * would corrupt that population's own fire-rate measurement, exactly
+	 * the hazard is_wait_preempted()'s own comment warns about.
+	 *
+	 * The src test mirrors is_wait_preempted() EXACTLY, including that
+	 * src == 1 falls back to the KVM bit rather than the heartbeat: at
+	 * src == 1 the kernel acts on vcpu_is_preempted(), so a probe that
+	 * reported the heartbeat instead would count rotations that Phase 1
+	 * would never actually perform.
+	 */
+	if (src != 2)
+		return vcpu_is_preempted(pn->cpu);
+
+	return (s64)(now - READ_ONCE(per_cpu(ivh_tsc_beat, pn->cpu).stamp)) > (s64)thr;
+}
+
+/*
+ * What the forward walk found, so pv_handoff_rotate() does not have to walk
+ * the chain a second time to rediscover it.
+ *
+ * @live is the first non-stale node behind the immediate successor, and @prev
+ * is the node immediately in front of it. @prev is exactly the node whose
+ * ->next we read to reach @live, so @prev->next is KNOWN non-NULL -- that is
+ * what makes it legal to overwrite (see rule (1) in <asm/ivh_tsc_beat.h>), and
+ * it is why the walk hands back the predecessor rather than making the caller
+ * re-derive it.
+ */
+struct ivh_rot_pick {
+	struct mcs_spinlock	*prev;
+	struct mcs_spinlock	*live;
+};
+
+/*
+ * noinline, and every loop invariant hoisted: this runs between set_locked()
+ * and the promotion store, i.e. inside the lock hold with preemption off.
+ *
+ * ONE rdtsc for the whole walk, not one per hop -- matching the discipline
+ * is_wait_preempted() states for itself ("ONE rdtsc, not two"). A single
+ * timestamp is also more correct: it yields a consistent snapshot of the
+ * queue rather than one smeared across up to HOP_CAP readings. src and the
+ * threshold are likewise read once, not re-loaded per hop.
+ *
+ * noinline keeps the PV slowpath's hot path down to the gate's own load +
+ * test + not-taken branch, instead of inlining the whole walk into an already
+ * very large function and perturbing its register allocation.
+ *
+ * Phase 1 changed the signature but NOT the counters: @probe carries
+ * ivh_pv_rot_probe down so every pre-existing Phase 0 counter keeps its
+ * original meaning of "counted iff the probe is on", even though the walk now
+ * also runs when only ivh_pv_rot_enable is set. Mixing enable-only traffic
+ * into ivh_rot_handoffs would silently change that denominator under every
+ * Phase 0 measurement already taken.
+ */
+static noinline u8 ivh_rot_probe_walk(struct mcs_spinlock *next, bool probe,
+				      struct ivh_rot_pick *pick)
+{
+	unsigned long src = READ_ONCE(ivh_pv_preempt_src);
+	u64 thr = READ_ONCE(ivh_pv_beat_threshold);
+	u64 now = rdtsc();
+	struct mcs_spinlock *prev = next;
+	struct mcs_spinlock *n = next;
+	int hop;
+
+	pick->prev = NULL;
+	pick->live = NULL;
+
+	if (probe)
+		this_cpu_inc(ivh_rot_handoffs);
+
+	if (!ivh_rot_stale(n, src, thr, now)) {
+		if (probe)
+			this_cpu_inc(ivh_rot_depth_hist[0]);
+		return 0;
+	}
+	if (probe)
+		this_cpu_inc(ivh_rot_preempted);
+
+	/*
+	 * Forward scan, READ-ONLY, hard hop cap. Cannot fault: every ->next is
+	 * NULL or a qnodes[] slot belonging to a CPU currently queued behind us,
+	 * and qspinlock's MCS queue is strictly FIFO with no abort path, so no
+	 * node behind us can be released before we store next->locked. The cap
+	 * is defensive rather than strictly required (that same FIFO property
+	 * rules out a cycle), but it is cheap and this code runs with the lock
+	 * held -- an unbounded walk here would be a hard hang.
+	 *
+	 * Note hop < HOP_CAP, not <=: a live waiter at depth exactly HOP_CAP is
+	 * reported in the "none found" bucket. Bucket HOP_CAP therefore means
+	 * "no live node among the first HOP_CAP nodes", not "none within reach".
+	 */
+	for (hop = 1; hop < IVH_ROT_HOP_CAP; hop++) {
+		struct mcs_spinlock *nn = READ_ONCE(n->next);
+
+		if (!nn) {
+			/*
+			 * Reads as the tail. Counted separately so the analysis
+			 * can distinguish "the queue was only this deep" from
+			 * "HOP_CAP consecutive preempted waiters" -- completely
+			 * different findings for Phase 1's economics, and the
+			 * histogram alone cannot separate them.
+			 *
+			 * Not a reliable tail test: an enqueuer that has done
+			 * xchg_tail() but not yet WRITE_ONCE(prev->next, node)
+			 * leaves prev->next transiently NULL, so this over-counts
+			 * genuine tails. Harmless -- and for Phase 1 the
+			 * conservative "never splice a node whose next reads
+			 * NULL" rule is correct regardless of the reason.
+			 */
+			if (probe)
+				this_cpu_inc(ivh_rot_tail_stop);
+			goto none_found;
+		}
+		/*
+		 * @prev trails @n by one hop. We have just read nn out of
+		 * n->next and found it non-NULL, so once we step forward
+		 * prev->next is a pointer we are allowed to overwrite.
+		 */
+		prev = n;
+		n = nn;
+		if (!ivh_rot_stale(n, src, thr, now)) {
+			if (probe)
+				this_cpu_inc(ivh_rot_depth_hist[hop]);
+			/*
+			 * Stale target AND a live node behind it: the only
+			 * shape Phase 1 could actually act on.
+			 */
+			pick->prev = prev;
+			pick->live = n;
+			return IVH_ROT_F_STALE | IVH_ROT_F_SKIPPABLE;
+		}
+	}
+
+none_found:
+	if (probe) {
+		this_cpu_inc(ivh_rot_no_live);
+		this_cpu_inc(ivh_rot_depth_hist[IVH_ROT_HOP_CAP]);
+	}
+	return IVH_ROT_F_STALE;
+}
+
+static __always_inline void pv_handoff_rotate(struct qspinlock *lock,
+					      struct mcs_spinlock *node,
+					      struct mcs_spinlock **nextp)
+{
+	unsigned long probe = READ_ONCE(ivh_pv_rot_probe);
+	unsigned long enable = READ_ONCE(ivh_pv_rot_enable);
+	struct mcs_spinlock *succ, *after;
+	struct ivh_rot_pick pick;
+	unsigned long cap;
+	unsigned int skips;
+	u8 flags, sf;
+
+	/* lock/node unused: rotation needs neither, by design. */
+	(void)lock;
+	(void)node;
+
+	/*
+	 * Both knobs off == upstream, to the instruction: one load of each
+	 * read-mostly global, an or, and a not-taken branch.
+	 */
+	if (likely(!(probe | enable)))
+		return;
+
+	/*
+	 * *nextp is provably non-NULL here: the call site spins on
+	 * smp_cond_load_relaxed(&node->next, (VAL)) until it is. Defensive
+	 * only -- but it is also what lets everything below dereference @succ
+	 * unconditionally.
+	 */
+	succ = *nextp;
+	if (!succ)
+		return;
+
+	flags = ivh_rot_probe_walk(succ, probe, &pick);
+
+	if (!pick.live)
+		goto promote_succ;
+
+	/*
+	 * THE SAFETY GATE. We are about to write pick.prev->next and
+	 * pick.live->next. pick.prev->next is already known non-NULL (the walk
+	 * read pick.live out of it). pick.live->next has not been looked at
+	 * yet, so read it here, once, and refuse the whole rotation if it is
+	 * NULL.
+	 *
+	 * A NULL here means pick.live is the queue tail, or that an enqueuer
+	 * has already claimed pick.live's tail code via xchg_tail() and is
+	 * about to store itself into pick.live->next (qspinlock.c:380). In the
+	 * first case splicing would detach the tail from the lock word; in the
+	 * second our store and the enqueuer's would race, and whichever lost
+	 * would leave a node in the queue that no predecessor will ever set
+	 * ->locked on -- a permanently stuck queue. There is no way to
+	 * distinguish the two cases and no need to: refuse both.
+	 *
+	 * Conversely, non-NULL is conclusive. Exactly one waiter ever obtains a
+	 * given tail code, so a non-NULL ->next has already taken its one and
+	 * only in-queue write and has no second writer pending; and because
+	 * neither spliced node is the tail, and the tail code only ever moves
+	 * on to later arrivals, no future enqueue can target them either.
+	 */
+	after = READ_ONCE(pick.live->next);
+	if (!after) {
+		this_cpu_inc(ivh_rot_splice_blocked_tail);
+		goto promote_succ;
+	}
+	this_cpu_inc(ivh_rot_splice_ok);
+
+	if (!enable)
+		goto promote_succ;
+
+	/*
+	 * Starvation bound. bits 2-7 of the successor's rot_flags count how
+	 * many times it has already been rotated past during THIS tenure
+	 * (pv_init_node() zeroes rot_flags on every queue entry). At the cap we
+	 * promote it regardless, which is what makes the whole scheme
+	 * starvation-free -- see <asm/ivh_tsc_beat.h> for the bound.
+	 *
+	 * Clamped rather than trusted: the sysctl is an unbounded unsigned
+	 * long, and a value above IVH_ROT_SKIP_MAX would let skips + 1 overflow
+	 * bit 7 and corrupt the IVH_ROT_F_* class bits in bits 0-1.
+	 */
+	cap = READ_ONCE(ivh_pv_rot_skip_max);
+	if (cap > IVH_ROT_SKIP_MAX)
+		cap = IVH_ROT_SKIP_MAX;
+
+	sf = READ_ONCE(((struct pv_node *)succ)->rot_flags);
+	skips = sf >> IVH_ROT_SKIP_SHIFT;
+	if (skips >= cap) {
+		this_cpu_inc(ivh_rot_splice_blocked_starve);
+		goto promote_succ;
+	}
+
+	/*
+	 * ------------------------------------------------------------------
+	 * THE SPLICE.  us -> succ -> ... -> prev -> live -> after -> ... -> T
+	 *         becomes  us -> live -> succ -> ... -> prev -> after -> T
+	 * ------------------------------------------------------------------
+	 *
+	 * Store 1, pick.prev->next = after: pick.prev->next was read as
+	 * pick.live (non-NULL) inside the walk, so by rule (1) it has no
+	 * pending second writer and no future enqueue can target it. pick.prev
+	 * is frozen -- it is queued behind us and cannot leave its tenure until
+	 * we set its ->locked, which only its own (new) predecessor ever does.
+	 * In the depth-1 case pick.prev == succ and this is exactly
+	 * "A->next = C".
+	 *
+	 * Store 2, pick.live->next = succ: pick.live->next was just read as
+	 * @after, non-NULL, so the same argument applies verbatim. pick.live is
+	 * likewise frozen.
+	 *
+	 * Neither store touches a node whose ->next is NULL, neither touches
+	 * the tail, and neither touches the lock word's tail field. The queue
+	 * remains one simple acyclic list ending at the same tail node T, so
+	 * the next xchg_tail() enqueue links onto T exactly as before.
+	 *
+	 * No barrier between or after these two stores is needed or added: the
+	 * caller's very next statement is
+	 * arch_mcs_spin_unlock_contended(&next->locked), an smp_store_release,
+	 * which orders both of them before any waiter can observe ->locked == 1
+	 * through the matching smp_cond_load_acquire. The release/acquire chain
+	 * carries them transitively onward -- @succ sees its rewritten ->next
+	 * when pick.live later releases it.
+	 */
+	WRITE_ONCE(pick.prev->next, after);
+	WRITE_ONCE(pick.live->next, succ);
+
+	/*
+	 * Store 3, the skipped successor's flags. Same freeze argument: @succ
+	 * cannot end its tenure before we set its ->locked, and nothing else
+	 * writes rot_flags -- pv_init_node() only runs at the start of a
+	 * tenure, and only the holder of THIS lock ever runs pv_handoff_rotate()
+	 * against a node queued on THIS lock. rot_flags is a distinct byte from
+	 * ->state, which @succ's own CPU may be storing to concurrently; byte
+	 * stores do not tear into each other on x86, and this header is x86-only
+	 * (see the <asm/ivh_tsc_beat.h> include at the top).
+	 *
+	 * Bumping the skip count here and nowhere else is what bounds
+	 * starvation; the class bits record that @succ was found stale and
+	 * skippable, and are overwritten with fresh ones the moment @succ is
+	 * finally promoted.
+	 */
+	WRITE_ONCE(((struct pv_node *)succ)->rot_flags,
+		   (u8)(IVH_ROT_F_STALE | IVH_ROT_F_SKIPPABLE |
+			((skips + 1) << IVH_ROT_SKIP_SHIFT)));
+
+	/*
+	 * Store 4, the promotion target. @nextp is the caller's own on-stack
+	 * `next`, not shared state; the caller reads it for both
+	 * arch_mcs_spin_unlock_contended() and pv_kick_node(), so this single
+	 * store redirects the MCS baton AND the PV kick/hash bookkeeping to
+	 * pick.live together. They must not diverge: hashing one node and
+	 * releasing another would put a node into pv_hash() that nobody will
+	 * ever unhash.
+	 */
+	*nextp = pick.live;
+	this_cpu_inc(ivh_rot_splice_done);
+
+	/*
+	 * Store 5, the promoted node's class. pick.live was LIVE at the moment
+	 * the decision was taken, so its Phase 0b class is 0 -- NOT the walk's
+	 * @flags, which describe @succ. Depositing @flags here would label a
+	 * healthy new head as stale and corrupt ivh_rot_idle_hist[]. This also
+	 * resets pick.live's own skip counter, which is correct: it is being
+	 * promoted.
+	 */
+	WRITE_ONCE(((struct pv_node *)pick.live)->rot_flags, 0);
+	return;
+
+promote_succ:
+	/*
+	 * No rotation. @succ is promoted, so deposit the walk's verdict about
+	 * @succ in @succ -- unchanged Phase 0b behaviour, and it zeroes @succ's
+	 * skip counter, which is the "reset on promotion" half of the
+	 * starvation bound. Free: arch_mcs_spin_unlock_contended() is about to
+	 * store ->locked in this same cacheline and pv_kick_node() RMWs ->state
+	 * in it immediately after, so the line is taken exclusive here either
+	 * way.
+	 */
+	WRITE_ONCE(((struct pv_node *)succ)->rot_flags, flags);
+}
+
+/*
+ * Phase 0b -- LOCK IDLE TIME: how long @lock sits released-but-unclaimed
+ * because the waiter it was handed to is not running.
+ *
+ * Stamps the slot of the TARGET (@node, the waiter being released to), not of
+ * the releasing CPU. Keying by releaser would prove only "the last hashed
+ * release that CPU performed was on a lock at this address", which is a
+ * different claim: a lock is released many times, and every release taking
+ * the asm fast path leaves the previous stamp standing, so a match can span
+ * an unbounded number of intervening tenures. Keying by target makes the
+ * pairing unambiguous by construction -- __pv_queued_spin_unlock_slowpath()
+ * has already done pv_unhash(lock) and so holds the exact pv_node it is about
+ * to wake -- and lets the reader consume its OWN local slot, with no remote
+ * load on the acquisition path at all.
+ *
+ * COVERAGE LIMIT, stated rather than papered over: on x86-64
+ * __pv_queued_spin_unlock() is hand-written assembly (PV_UNLOCK_ASM in
+ * <asm/qspinlock_paravirt.h>), so only the hashed _Q_SLOW_VAL release path is
+ * reachable from C at all. A release is hashed only when pv_kick_node()'s
+ * cmpxchg(&pn->state, VCPU_HALTED, VCPU_HASHED) succeeded -- that is, only
+ * when the successor had ALREADY halted. Every sample here is therefore a
+ * halted head. A head the host descheduled mid-spin never halts, is never
+ * hashed, and is invisible to this measurement. See the ivh_rot_idle_hist[]
+ * note in <asm/ivh_tsc_beat.h> for what this does and does not license.
+ */
+static __always_inline void ivh_rot_stamp_release(struct qspinlock *lock,
+						  struct pv_node *node)
+{
+	struct ivh_rot_rel *r;
+
+	if (likely(!READ_ONCE(ivh_pv_rot_probe)))
+		return;
+
+	r = &per_cpu(ivh_rot_rel, node->cpu);
+	r->tsc = rdtsc();
+	/*
+	 * ->tsc must be visible before ->lock. ->lock is the validity flag the
+	 * target tests, and the pair is read on a different CPU; without this
+	 * the reader can pair a matching ->lock with a stale ->tsc and report a
+	 * wildly wrong -- or negative -- interval.
+	 */
+	smp_wmb();
+	WRITE_ONCE(r->lock, lock);
+}
+
+/*
+ * Called by a queue head the instant it has observed @lock free and is about
+ * to claim it. @prev is the node that handed us the MCS baton, or NULL if we
+ * were the first node queued and so have nothing to attribute an interval to.
+ *
+ * idle = now - (moment our predecessor released the lock), bucketed by class
+ * so that class 0 -- our promoter did NOT consider us stale -- is the
+ * baseline. An absolute idle time means nothing on its own; only the excess
+ * of the stale classes over class 0 is the time rotation could recover.
+ */
+static noinline void ivh_rot_ack_slow(struct qspinlock *lock,
+				      struct mcs_spinlock *node)
+{
+	/*
+	 * FIRST statement, before any load: this runs ahead of set_locked(), so
+	 * with the probe on the lock really is still free for the whole of this
+	 * function, and anything charged after a cold miss here lands in the
+	 * interval being reported.
+	 */
+	u64 now = rdtsc();
+	struct pv_node *pn = (struct pv_node *)node;
+	struct ivh_rot_rel *r = this_cpu_ptr(&ivh_rot_rel);
+	u64 idle, cap;
+	u8 cls;
+	int bucket;
+
+	if (READ_ONCE(r->lock) != lock) {
+		this_cpu_inc(ivh_rot_idle_unknown);
+		return;
+	}
+	smp_rmb();			/* pairs with smp_wmb() in stamp_release */
+	idle = now - r->tsc;
+
+	/*
+	 * Single-use. Leaving the stamp set would let a later acquisition of
+	 * the same lock match a long-dead release and report an interval
+	 * spanning every tenure in between.
+	 */
+	WRITE_ONCE(r->lock, NULL);
+
+	cls = READ_ONCE(pn->rot_flags) & (IVH_ROT_F_STALE | IVH_ROT_F_SKIPPABLE);
+
+	if ((s64)idle < 0) {
+		/*
+		 * Backwards, and this is real rather than hypothetical: the
+		 * stamp is written just after smp_store_release(&lock->locked,
+		 * 0), and a head woken by something other than that kick can
+		 * acquire inside the window. Counted, never silently dropped --
+		 * the discards are preferentially the SHORT intervals, so
+		 * dropping them quietly would shift every mean upward.
+		 */
+		this_cpu_inc(ivh_rot_idle_backward);
+		return;
+	}
+
+	/*
+	 * A qspinlock lives in memory that can be freed and reallocated --
+	 * __pv_queued_spin_unlock_slowpath() says so itself. A new lock at a
+	 * recycled address can match a surviving stamp and yield an interval of
+	 * milliseconds or seconds. ivh_rot_idle_cycles[] is a SUM, so a single
+	 * such artifact swamps a million genuine samples: cap it rather than
+	 * trust it, and count what was capped.
+	 */
+	cap = READ_ONCE(ivh_pv_beat_threshold) * 100;
+	if (cap && idle > cap) {
+		this_cpu_inc(ivh_rot_idle_capped);
+		return;
+	}
+
+	bucket = idle ? ilog2(idle) : 0;
+	if (bucket >= IVH_BEAT_AGE_HIST_BUCKETS)
+		bucket = IVH_BEAT_AGE_HIST_BUCKETS - 1;
+
+	this_cpu_inc(ivh_rot_idle_hist[cls][bucket]);
+	this_cpu_add(ivh_rot_idle_cycles[cls], idle);
+	this_cpu_inc(ivh_rot_idle_events[cls]);
+}
+
+/*
+ * Gate only. The body above is deliberately noinline: it is several loads, a
+ * remote per-CPU read and an ilog2, and inlining all of that into
+ * queued_spin_lock_slowpath() would grow the PV slowpath's I-cache footprint
+ * for every acquisition even when the probe is off. With the probe off this
+ * costs one predictable load and a not-taken branch.
+ */
+static __always_inline void ivh_rot_ack(struct qspinlock *lock,
+					struct mcs_spinlock *node)
+{
+	if (likely(!READ_ONCE(ivh_pv_rot_probe)))
+		return;
+
+	ivh_rot_ack_slow(lock, node);
+}
+
+/*
+ * Phase 0b hook, mirroring pv_handoff_rotate()'s shape so the two stay
+ * symmetric: rotate() runs at the promotion end of a handoff, ack() at the
+ * acquisition end of the same handoff, one queue position later.
+ */
+static __always_inline void pv_handoff_ack(struct qspinlock *lock,
+					   struct mcs_spinlock *node)
+{
+	ivh_rot_ack(lock, node);
+}
+
+/*
  * Wait for l->locked to become clear and acquire the lock;
  * halt the vcpu after a short spin.
  * __pv_queued_spin_unlock() will wake us.
@@ -1174,6 +1731,8 @@ __pv_queued_spin_unlock_slowpath(struct qspinlock *lock, u8 locked)
 	 * vCPU is harmless other than the additional latency in completing
 	 * the unlock.
 	 */
+	ivh_rot_stamp_release(lock, node);
+
 	lockevent_inc(pv_kick_unlock);
 	pv_kick(node->cpu);
 }
@@ -1187,6 +1746,13 @@ __visible __lockfunc void __pv_queued_spin_unlock(struct qspinlock *lock)
 	 * We must not unlock if SLOW, because in that case we must first
 	 * unhash. Otherwise it would be possible to have multiple @lock
 	 * entries, which would be BAD.
+	 */
+	/*
+	 * No Phase 0b stamp here, and none is possible: nothing was hashed, so
+	 * there is no target node to key one to. This path is also dead on
+	 * x86-64, where <asm/qspinlock_paravirt.h> defines
+	 * __pv_queued_spin_unlock and the whole function is #ifndef'd out in
+	 * favour of PV_UNLOCK_ASM.
 	 */
 	if (try_cmpxchg_release(&lock->locked, &locked, 0))
 		return;

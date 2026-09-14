@@ -1361,6 +1361,30 @@ EXPORT_PER_CPU_SYMBOL_GPL(ivh_tsc_beat);
 
 unsigned long ivh_pv_preempt_src = 0UL;		/* 0 = KVM bit (default) */
 unsigned long ivh_pv_tier1_confirm = 0UL;		/* 0 = upstream tier-1, bit-identical */
+
+/*
+ * Handoff-time rotation probe (lock skipping), PHASE 0 -- DETECT ONLY.
+ * 0 = off, costs one predicted branch. 1 = count handoffs, whether the target
+ * looked preempted, and how deep the first live waiter was. NOTHING is ever
+ * rotated or written at either setting; see <asm/ivh_tsc_beat.h>.
+ */
+unsigned long ivh_pv_rot_probe = 0UL;
+
+/*
+ * Handoff-time rotation, PHASE 1 -- the knob that actually rewrites ->next
+ * pointers. Deliberately separate from ivh_pv_rot_probe above: 0 means the
+ * lock is bit-identical to Phase 0, and with both at 0 pv_handoff_rotate()
+ * returns on its first branch. See the safety argument in <asm/ivh_tsc_beat.h>.
+ */
+unsigned long ivh_pv_rot_enable = 0UL;
+
+/*
+ * Starvation bound: how many times one waiter may be rotated past before it is
+ * promoted regardless. 0 disables rotation entirely; clamped to
+ * IVH_ROT_SKIP_MAX (63) at use, since the count lives in bits 2-7 of
+ * pv_node.rot_flags and must not overflow into the class bits.
+ */
+unsigned long ivh_pv_rot_skip_max = 4UL;
 /*
  * 3,300,000 cycles = 1.5 ms at 2200 MHz -- is_cpu_preempted()'s existing
  * 1,500,000 ns threshold (kernel/sched/cputime.c) expressed in cycles, so
@@ -1454,6 +1478,29 @@ DEFINE_PER_CPU(u64, ivh_tier1_confirm_checked);
 DEFINE_PER_CPU(u64, ivh_tier1_confirm_agreed);
 DEFINE_PER_CPU(u64, ivh_tier1_confirm_disagreed);
 DEFINE_PER_CPU(u64, ivh_tier1_suppressed);
+
+/* Handoff-time rotation probe (Phase 0, detect-only) -- see ivh_tsc_beat.h */
+DEFINE_PER_CPU(u64, ivh_rot_handoffs);
+DEFINE_PER_CPU(u64, ivh_rot_preempted);
+DEFINE_PER_CPU(u64, ivh_rot_no_live);
+DEFINE_PER_CPU(u64, ivh_rot_tail_stop);
+DEFINE_PER_CPU(u64, ivh_rot_depth_hist[IVH_ROT_HOP_CAP + 1]);
+
+/* Phase 0b: lock-idle-time measurement. See <asm/ivh_tsc_beat.h>. */
+DEFINE_PER_CPU_ALIGNED(struct ivh_rot_rel, ivh_rot_rel);
+DEFINE_PER_CPU(u64, ivh_rot_idle_hist[IVH_ROT_NR_CLASS][IVH_BEAT_AGE_HIST_BUCKETS]);
+DEFINE_PER_CPU(u64, ivh_rot_idle_cycles[IVH_ROT_NR_CLASS]);
+DEFINE_PER_CPU(u64, ivh_rot_idle_events[IVH_ROT_NR_CLASS]);
+DEFINE_PER_CPU(u64, ivh_rot_idle_unknown);
+DEFINE_PER_CPU(u64, ivh_rot_idle_backward);
+DEFINE_PER_CPU(u64, ivh_rot_idle_capped);
+DEFINE_PER_CPU(u64, ivh_rot_steals);
+
+/* Phase 1: rotation decision outcomes. See <asm/ivh_tsc_beat.h>. */
+DEFINE_PER_CPU(u64, ivh_rot_splice_ok);
+DEFINE_PER_CPU(u64, ivh_rot_splice_done);
+DEFINE_PER_CPU(u64, ivh_rot_splice_blocked_tail);
+DEFINE_PER_CPU(u64, ivh_rot_splice_blocked_starve);
 
 /*
  * IVH Idea 4 Stage 0: attribution for the ivh_wait_irqoff_nohalt population.
@@ -1865,6 +1912,27 @@ static const struct ctl_table ivh_pv_sysctls[] = {
 	{
 		.procname	= "ivh_pv_tier1_enable",
 		.data		= &ivh_pv_tier1_enable,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_pv_rot_probe",
+		.data		= &ivh_pv_rot_probe,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_pv_rot_enable",
+		.data		= &ivh_pv_rot_enable,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_pv_rot_skip_max",
+		.data		= &ivh_pv_rot_skip_max,
 		.maxlen		= sizeof(unsigned long),
 		.mode		= 0644,
 		.proc_handler	= proc_doulongvec_minmax,

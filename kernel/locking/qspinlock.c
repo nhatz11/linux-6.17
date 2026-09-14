@@ -155,6 +155,11 @@ static __always_inline void __pv_kick_node(struct qspinlock *lock,
 static __always_inline u32  __pv_wait_head_or_lock(struct qspinlock *lock,
 						   struct mcs_spinlock *node)
 						   { return 0; }
+static __always_inline void __pv_handoff_rotate(struct qspinlock *lock,
+						struct mcs_spinlock *node,
+						struct mcs_spinlock **nextp) { }
+static __always_inline void __pv_handoff_ack(struct qspinlock *lock,
+					     struct mcs_spinlock *node) { }
 
 #define pv_enabled()		false
 
@@ -162,6 +167,8 @@ static __always_inline u32  __pv_wait_head_or_lock(struct qspinlock *lock,
 #define pv_wait_node		__pv_wait_node
 #define pv_kick_node		__pv_kick_node
 #define pv_wait_head_or_lock	__pv_wait_head_or_lock
+#define pv_handoff_rotate	__pv_handoff_rotate
+#define pv_handoff_ack		__pv_handoff_ack
 
 #ifdef CONFIG_PARAVIRT_SPINLOCKS
 #define queued_spin_lock_slowpath	native_queued_spin_lock_slowpath
@@ -414,6 +421,14 @@ pv_queue:
 
 locked:
 	/*
+	 * Phase 0b: we have just observed @lock free (or already own it via a
+	 * steal) and are about to claim it. This is the acquisition end of the
+	 * interval whose release end was stamped in
+	 * __pv_queued_spin_unlock_slowpath(); see ivh_rot_ack().
+	 */
+	pv_handoff_ack(lock, node);
+
+	/*
 	 * claim the lock:
 	 *
 	 * n,0,0 -> 0,0,1 : lock, uncontended
@@ -452,6 +467,23 @@ locked:
 	if (!next)
 		next = smp_cond_load_relaxed(&node->next, (VAL));
 
+	/*
+	 * Handoff-time rotation. Under ivh_pv_rot_probe this only counts; under
+	 * ivh_pv_rot_enable it MAY REWRITE ->next POINTERS IN THE QUEUE and
+	 * substitute @next, promoting a live waiter ahead of a preempted one.
+	 * Both sysctls default to 0, in which case this is a predicted
+	 * not-taken branch and behaviour is identical to upstream.
+	 *
+	 * Placed before the single promotion store below, which is the only
+	 * point where the acquirer still holds both the lock and its own qnode
+	 * slot, and where every node behind us is provably frozen: a queued
+	 * waiter cannot leave between WRITE_ONCE(prev->next, node) above and
+	 * its arch_mcs_spin_lock_contended(), and only we can end that wait.
+	 * See pv_handoff_rotate() in qspinlock_paravirt.h for the per-store
+	 * safety argument.
+	 */
+	pv_handoff_rotate(lock, node, &next);
+
 	arch_mcs_spin_unlock_contended(&next->locked);
 	pv_kick_node(lock, next);
 
@@ -482,6 +514,8 @@ EXPORT_SYMBOL(queued_spin_lock_slowpath);
 #undef pv_wait_node
 #undef pv_kick_node
 #undef pv_wait_head_or_lock
+#undef pv_handoff_rotate
+#undef pv_handoff_ack
 
 #undef  queued_spin_lock_slowpath
 #define queued_spin_lock_slowpath	__pv_queued_spin_lock_slowpath
