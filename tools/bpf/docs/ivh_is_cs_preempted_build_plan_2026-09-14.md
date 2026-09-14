@@ -86,17 +86,32 @@ reboot and is only moved to 220 000 by `spin_mode 2`/`4`. Anything that reads it
 gets a different answer before and after `spin_mode` runs. The predicate
 specified below deliberately **does not read `ivh_pv_beat_threshold` at all**.
 
-The brief's predicate — call it **form 2** — is the correct fix and supersedes
-both:
+The corrected predicate — **form 2** — supersedes both:
 
 ```
-held_for    = now - lock_acq_tsc
-missed_tick = holder_beat < lock_acq_tsc     /* no beat since acquisition */
-fire        = held_for > OWED_TICKS * TICK_PERIOD && missed_tick
+held_for  = now - lock_acq_tsc
+beat_age  = now - holder_beat                 /* silence, measured to NOW */
+fire      = held_for > OWED_TICKS * TICK_PERIOD
+         && beat_age > OWED_TICKS * TICK_PERIOD
 ```
 
-It is immune to long healthy critical sections by construction, and its
-threshold is a property of `HZ` and `tsc_khz`, not of a tuned staleness knob.
+It is immune to long healthy critical sections by construction (a running holder
+ticks, so `beat_age` never exceeds ~1 tick), and its threshold is a property of
+`HZ` and `tsc_khz`, not of a tuned staleness knob.
+
+> **Amendment 2026-09-14 (user review).** The brief's first draft of form 2 used
+> `missed_tick = holder_beat < lock_acq_tsc` ("no beat since acquisition"). That
+> is a **false negative for every holder preempted after its first tick**: a
+> holder that acquires, ticks once, and is then host-preempted has
+> `beat > acq` forever, so it is never flagged, no matter how long it stays
+> preempted. For a CS long enough to matter that is the common case, not a
+> corner. Comparing the beat against the *acquisition* only asks whether a beat
+> ever happened; the question is whether beats have *stopped*, so the beat must be
+> aged against *now*. With that change `held_for` is nearly redundant (a vCPU
+> that was running at `acq` beats within one tick, so `beat_age > 2 ticks`
+> already implies `held_for > 1 tick`); it is kept because it is free and it
+> defines the `ivh_cs_long_hold` audit population. The tag compare, not
+> `held_for`, is what establishes that the silent CPU is still the holder.
 
 ### 0.4 `CONFIG_NO_HZ_FULL=y` is real but runtime-inert on this boot — and the brief's assumption about *why* is wrong
 
@@ -275,11 +290,15 @@ happen **before W**, and there is a common path on which one does:
 6. With no release-side clear, `prev`'s slot still reads `->lock == lock`. The
    tag check passes on a stale stamp.
 
-The false positive still needs `missed_tick`. `prev` just ran the unlock slowpath
-and so was running, so it fires only if `prev` is host-preempted shortly after
-acquiring without ticking. That population is the same size class as the true
-positives, so it would **directly pollute** Stage A's duration and
-false-positive numbers. Verdict: **the coordinator's report holds.** One
+The false positive still needs the beat-age term. `prev` just ran the unlock
+slowpath and so was running, so it fires only if `prev` is host-preempted
+*after releasing* and stays silent past `ivh_cs_owed_ticks` ticks. (With the
+amended now-aged predicate, §0.3, this is somewhat *more* reachable than under
+the withdrawn `beat < acq` draft, which additionally required that `prev` never
+ticked during its hold. That makes the gates below more necessary, not less.)
+That population is the same size class as the true positives — any vCPU is as
+likely to be preempted just after a release as just before one — so it would
+**directly pollute** Stage A's duration and false-positive numbers. Verdict: **the coordinator's report holds.** One
 refinement: in case (ii), a tick-woken H enters HASHED while `prev` still holds.
 Blanket-abstaining on HASHED would throw those tenures away needlessly, and the
 witness below keeps them.
@@ -540,8 +559,9 @@ what its denominator is. Append after `ivh_tsc_beat.h:705`.
  * ivh_cs_long_hold is the FORM-0 population -- "this hold is longer than
  * ivh_cs_owed_ticks ticks" with no liveness term -- and exists solely as the
  * denominator of the false-positive audit. ivh_cs_healthy_long is the holds
- * that were long AND had ticked since acquiring, i.e. the ones form 0 would
- * have fired on and form 2 correctly exonerates. If
+ * that were long AND whose holder beat within the last ivh_cs_owed_ticks
+ * ticks, i.e. the ones form 0 would have fired on and form 2 correctly
+ * exonerates. If
  * ivh_cs_healthy_long / ivh_cs_long_hold is near zero, the tick term is inert
  * and this predicate has silently degenerated into form 0. See
  * ivh_tsc_full_redesign_build_plan_2026-07-29.md sec 1.2 for why that matters.
@@ -949,8 +969,8 @@ same placement rule.
  * Is the CURRENT HOLDER of @lock -- not our predecessor-as-a-waiter, which is
  * what pv_wait_early()'s tier 1 and tier 2 answer -- host-preempted?
  *
- * The test is "did the holder miss a tick it owed us", NOT "is the holder's
- * heartbeat stale". The distinction is the whole point and the earlier
+ * The test is "has the holder gone silent for more than ivh_cs_owed_ticks
+ * ticks", NOT "is the holder's heartbeat stale by the waiter threshold". The distinction is the whole point and the earlier
  * specification got it wrong:
  *
  *   ivh_tsc_full_redesign_build_plan_2026-07-29.md sec 1.2 proposed
@@ -963,11 +983,17 @@ same placement rule.
  *   generator here. It is NOT one at the compiled default of 3300000 cycles
  *   (1.5 ms), which is why the earlier plan's reasoning looked sound.
  *
- * So: deliberately DO NOT read ivh_pv_beat_threshold. A holder that acquired
- * at time T and is running must publish by T + one tick period. If it has not
- * published by T + ivh_cs_owed_ticks periods, it is not running. A holder in a
+ * So: deliberately DO NOT read ivh_pv_beat_threshold. A running CPU publishes
+ * at least once per tick period. If the holder's newest beat is older than
+ * ivh_cs_owed_ticks periods AS OF NOW, it is not running. A holder in a
  * five-millisecond critical section still ticks, and is exonerated. That is
  * the property this predicate exists to have.
+ *
+ * The silence is aged against NOW, never against the acquisition TSC. An
+ * earlier draft tested beat < acq ("no beat since acquiring"), which never
+ * fires on a holder that ticked once and was THEN preempted -- the common
+ * case for any hold long enough to matter. The acquisition stamp's jobs are
+ * the tag (is prev still the holder) and the held_for guard, not liveness.
  *
  * Reaction time is floored at ivh_cs_owed_ticks ticks, ~2-3 ms at the default.
  * That is SLOWER than ivh_pv_spin_threshold's ~45 us at 32768 iterations, and
@@ -1086,15 +1112,28 @@ static inline bool is_cs_preempted(struct qspinlock *lock, struct pv_node *prev,
 		this_cpu_inc(ivh_cs_abstain_retag);
 		return false;
 	}
-	if ((s64)(beat - acq) >= 0) {
+	/*
+	 * Age the beat against NOW, signed like held above so a beat stamped a
+	 * hair after our rdtsc() on a skewed vCPU reads as fresh, not huge.
+	 * NOT (beat - acq): that only asks whether the holder ever ticked since
+	 * acquiring, and misses every holder preempted after its first tick.
+	 */
+	if ((s64)(now - beat) <= (s64)(READ_ONCE(ivh_cs_tick_period) *
+				       READ_ONCE(ivh_cs_owed_ticks))) {
 		/*
-		 * It HAS ticked since acquiring. Long, but alive. This is the
-		 * population form 0 would have fired on and this predicate
-		 * correctly exonerates; ivh_cs_healthy_long / ivh_cs_long_hold
-		 * is the false-positive audit ratio. Note the holder also
-		 * publishes from ivh_beat_publish_in_spin() and pv_init_node()
-		 * when it is itself contending on some inner lock, which can
-		 * only move samples INTO this branch -- the safe direction.
+		 * Beat is recent. Long hold, but alive. This is the population
+		 * form 0 would have fired on and this predicate correctly
+		 * exonerates; ivh_cs_healthy_long / ivh_cs_long_hold is the
+		 * false-positive audit ratio. Note the holder also publishes
+		 * from ivh_beat_publish_in_spin() and pv_init_node() when it is
+		 * itself contending on some inner lock, which can only move
+		 * samples INTO this branch -- the safe direction.
+		 *
+		 * The one way a holder goes silent while NOT host-preempted is
+		 * halting in pv_wait() on an inner lock it is contending for.
+		 * That fires, deliberately: the holder is not making progress
+		 * on @lock either way, and for the head's decision stale means
+		 * act. Size it with ivh_halt_* if it ever matters.
 		 */
 		this_cpu_inc(ivh_cs_healthy_long);
 		return false;
@@ -1776,8 +1815,9 @@ long critical sections, because a holder running a 5 ms CS still ticks."*
 
 - `ivh_cs_long_hold` is every hold older than the margin — i.e. exactly what
   form 0 (`ivh_tsc_full_redesign_build_plan_2026-07-29.md` §1.2) would fire on.
-- `ivh_cs_healthy_long` is the subset that had ticked since acquiring — the ones
-  form 2 exonerates and form 0 would have got wrong.
+- `ivh_cs_healthy_long` is the subset whose holder beat within the last
+  `ivh_cs_owed_ticks` ticks — the ones form 2 exonerates and form 0 would have
+  got wrong.
 - **`ivh_cs_healthy_long / ivh_cs_long_hold` is the false-positive rate this
   predicate removes.** It must be materially above zero. A value near 0 means
   either (a) long healthy holds do not exist on this workload — implausible under
