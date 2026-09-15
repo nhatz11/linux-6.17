@@ -1,7 +1,8 @@
 # IVH+AS slows down under sustained load: finding and capacity test plan, 2026-09-15
 
-**Status: finding measured, cause NOT confirmed.** Nothing in this doc has been
-tested beyond the three runs in §1. §3 is the plan to find the cause.
+**Status: mechanism of the within-run drift identified (§6). A 60 s wait does NOT
+make IVH+AS numbers stable (§6.4). Data-collection rules are in §7.** §3-§4 are
+the original plan, kept for the record.
 
 ## 1. What was measured
 
@@ -134,3 +135,119 @@ in-guest steal readings.
   long loaded stretch is biased by this effect.
 - The G-LOCK-29 cross-kernel check uses run B as its reference, compared round by
   round.
+
+
+## 6. Results (investigated the same night, G-LOCK-28, co-runner on)
+
+Tools: `/root/ivh_tools/drift_snap.py` (per-CPU `ivh_uc_capacity` and
+`cpu_capacity` via `/proc/kcore`, `reject_reasons` and `last_migration` from
+MY_ivh_atc, `/proc/stat`), `drift_t1.sh` (rounds + 5 s sampler + idle tail),
+`wait_capacity_settled.sh`, `drift_validate_wait.sh`. Data:
+`drift_t1_003400.*`, `drift_pv_004510.*`, `drift_validate_wait_005201.log`.
+
+### 6.1 IVH+AS, 8 rounds with the gate instrumented (T1)
+
+| round | time (s) | capacity mean (min) | migrations/s | CAP_LOW rejects/s | accepted T1/s |
+|---|---|---|---|---|---|
+| 1 | 23.5 | 739 (650) | 4,861 | 63,781 | 9,330 |
+| 2 | 26.7 | 698 (586) | 6,124 | 139,826 | 8,290 |
+| 3 | 28.7 | 670 (572) | 4,160 | 181,787 | 5,580 |
+| 4 | 30.7 | 660 (579) | 3,894 | 197,784 | 4,950 |
+| 5 | 34.7 | 651 (578) | 2,448 | 282,736 | 2,991 |
+| 6 | 37.2 | 665 (601) | 2,797 | 350,415 | 3,053 |
+| 7 | 37.6 | 666 (596) | 2,816 | 366,778 | 3,007 |
+| 8 | 36.7 | 661 (566) | 2,895 | 332,475 | 3,185 |
+
+Capacity at the start (after ~9 min idle) was 848 mean, 807 min.
+
+- **Mechanism of the drift:** as the in-kernel capacity estimate sinks, the
+  destination capacity gate in MY_ivh_atc rejects more candidates
+  (`REJ_CAPACITY_LOW` ×5.5; the gate is the absolute rail
+  `IVH_CAP_HARDFLOOR` = 600 plus the relative `IVH_CAP_TOPBAND` = 50,
+  `MY_ivh_atc.bpf.c:600-625`, and the minimum CPU sits right at the rail).
+  Accepted migrations fall by about two thirds and hackbench slows by 60% in
+  lockstep. Share of evaluations accepted: ~9% in round 1, ~0.8% by round 7.
+- **The drift plateaus** once capacity stops falling (rounds 6-8, 36.7-37.6 s,
+  within 1.2%). Run B also levelled off by rounds 7-8 (49.9, 50.2 s).
+- **H2 (vcap) is out:** `cpu_capacity` read 1024 on every CPU in every sample.
+- **H4 (per-vCPU load concentration) not supported by utilisation:** guest busy%
+  on CPUs 0-7 vs 8-15 stayed within a few points (60-62% vs 56-62%). This does not
+  exclude host-side effects, which the guest cannot see.
+
+### 6.2 PV, 5 rounds with the same instrumentation
+
+| round | time (s) | capacity mean (min) |
+|---|---|---|
+| start | — | 769 (693) |
+| 1 | 52.7 | 601 (562) |
+| 2 | 52.3 | 597 (576) |
+| 3 | 52.4 | 600 (570) |
+| 4 | 52.6 | 587 (568) |
+| 5 | 55.6 | 567 (555) |
+
+**Capacity sinks under PV load too, and further** (PV spins more, so the vCPUs
+are busier for the host to steal from). So the capacity drop is **not caused by
+IVH**. `ivh_uc_capacity` = 1024 × (busy − stolen) / busy per 200 ms window
+(`kernel/sched/core.c:540-600`, EMA at `:340-400`): it is measuring host
+contention under load. IVH's gate reacts to it; PV has no gate, so PV times stay
+flat. PV is stable across runs: mean 52.97 s, sd 0.50 s (0.95%) over 9 rounds
+from two runs.
+
+### 6.3 Recovery during idle
+
+Both idle tails show the same shape:
+- **fast part, 30-60 s:** capacity climbs back to ~760-780 (IVH tail: 661 →
+  770 by +62 s; PV tail: 576 → 770 by +32 s, 783 by +48 s). Consistent with the
+  EMA's ~15 s time constant.
+- **slow part, many minutes:** after 6 min of idle the IVH tail was still flat at
+  ~765-777, below the 848 seen after ~9 min idle. Cause not identified.
+
+### 6.4 Does "wait a minute" fix it? No.
+
+`drift_validate_wait.sh`: 6 cycles of (wait until capacity has held steady for
+15 s, minimum 60 s; then ONE IVH+AS round).
+
+| cycle | settled capacity | time (s) |
+|---|---|---|
+| 1 | 759 | 39.4 |
+| 2 | 776 | 22.8 |
+| 3 | 774 | 32.1 |
+| 4 | 785 | 33.9 |
+| 5 | 778 | 28.9 |
+| 6 | 769 | 28.6 |
+
+The wait works as designed (settled in 62-63 s every time, at 759-785), but the
+round times are **31.0 s mean, sd 5.6 s, CV 18%**, range 22.8-39.4 s, with no
+useful correlation to the settled capacity (r = −0.43 over 6 points). Compare PV
+at 0.95%.
+
+So there are **two separate problems**:
+1. **Within-run drift** (sustained load → capacity sinks → gate rejects →
+   IVH slows). A ~60 s idle gap removes this, and it is understood.
+2. **Round-to-round IVH+AS variance of ~18% even from the same starting
+   capacity.** Not explained by anything measured here. Between-run offsets are
+   large too (run B round 1 = 35.1 s, T1 round 1 = 23.5 s; plateaus 50 s vs 37 s)
+   while PV repeats to 1%. Leading guess: the host co-runner's placement or
+   intensity changes which vCPUs are worth migrating to, which matters to IVH and
+   not to PV. That needs host-side data to test (T4).
+
+## 7. Rules for data collection until problem 2 is understood
+
+1. **Never compare IVH numbers across separate sessions, runs or reboots.** Only
+   paired, interleaved comparisons within one session are trustworthy.
+2. **Interleave arms in short ABBA blocks** so every arm sees the same host state,
+   and **run PV as a control inside every block**. Report paired differences and
+   medians over many blocks, not means of separate runs.
+3. **Put a capacity-settled gap before every measured round:**
+   `QUIET=1 /root/ivh_tools/wait_capacity_settled.sh` (typically ~60 s). This
+   removes the within-run drift. It does not remove problem 2, so rules 1-2 still
+   apply.
+4. **Use enough rounds for an 18% CV.** Detecting a 5% difference at 80% power
+   with paired rounds needs roughly (2.8 × 18 / 5)² ≈ 100 rounds if pairing
+   removes nothing; pairing within ABBA blocks should remove the shared host
+   component, so measure the paired-difference SD from the first blocks and size
+   the run from that.
+5. **Neutrality checks of new kernel code should run in PV mode** (CV ~1%, stable
+   across runs), not IVH+AS. For G-LOCK-29 the stamp, the unlock-path gate and the
+   head-halt timing are all mode-independent, so PV measures their cost. PV
+   reference on G-LOCK-28: 52.97 s, sd 0.50 s.
