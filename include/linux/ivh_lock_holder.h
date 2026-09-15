@@ -142,11 +142,60 @@ static __always_inline void ivh_lock_clear_holder(struct qspinlock *lock)
 	__ivh_lock_clear_holder(lock);
 }
 
+/*
+ * IVH critical-section owner stamp -- a SECOND, independent mechanism from the
+ * holder side table above, and deliberately not built on it.
+ *
+ * The table answers "who holds an arbitrary lock" and pays for that generality
+ * with a hash, a collision mode, and a stamp on queued_spin_lock()'s
+ * uncontended fastpath (site A1). is_cs_preempted() does not need that
+ * generality: the queue head already holds a pointer to its predecessor, and
+ * its predecessor is the holder under the conditions of build plan sec 1.2. So this is a single per-CPU slot,
+ * written at exactly one site on the CONTENDED path, and it costs the
+ * uncontended ACQUIRE fastpath nothing; the release side costs one gate
+ * branch with ivh_cs_owner_clear == 0 (build plan sec 1.4).
+ *
+ * Storage and the worker bodies: arch/x86/kernel/ivh_lock_holder.c.
+ * The predicate that reads them: kernel/locking/qspinlock_paravirt.h.
+ * The proof that one stamp site suffices:
+ * tools/bpf/docs/ivh_is_cs_preempted_build_plan_2026-09-14.md sec 1.
+ */
+extern unsigned long ivh_cs_owner_enable;
+extern unsigned long ivh_cs_owner_clear;
+
+void __ivh_cs_owner_stamp(struct qspinlock *lock);
+void __ivh_cs_owner_clear(struct qspinlock *lock);
+
+static __always_inline void ivh_cs_owner_stamp(struct qspinlock *lock)
+{
+	if (likely(!READ_ONCE(ivh_cs_owner_enable)))
+		return;
+	__ivh_cs_owner_stamp(lock);
+}
+
+/*
+ * Compiled in from Stage A (default off; build plan sec 1.4 -- it is the only
+ * airtight close of the RUNNING-at-handoff race), and gated on its OWN sysctl
+ * rather than on ivh_cs_owner_enable, because this is the one call that lands on the
+ * uncontended unlock fastpath and its cost must be separable from the stamp's.
+ * Placement rule is inherited unchanged from R1/R2/R2b: STRICTLY BEFORE the
+ * releasing store, never after -- the instant the lock byte clears, another
+ * CPU may already own the lock, and a clear placed after would wipe ITS stamp.
+ */
+static __always_inline void ivh_cs_owner_release(struct qspinlock *lock)
+{
+	if (likely(!READ_ONCE(ivh_cs_owner_clear)))
+		return;
+	__ivh_cs_owner_clear(lock);
+}
+
 #else /* !(x86 && KVM guest && PV spinlocks) */
 
 static inline void ivh_lock_set_holder(struct qspinlock *lock) { }
 static inline void ivh_lock_clear_holder(struct qspinlock *lock) { }
 static inline int  ivh_lock_holder_cpu(struct qspinlock *lock) { return -1; }
+static inline void ivh_cs_owner_stamp(struct qspinlock *lock) { }
+static inline void ivh_cs_owner_release(struct qspinlock *lock) { }
 
 #endif
 

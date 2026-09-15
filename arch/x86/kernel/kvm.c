@@ -1396,6 +1396,26 @@ unsigned long ivh_pv_beat_threshold = 3300000UL;
 #define IVH_BEAT_THRESHOLD_US	1500ULL
 unsigned long ivh_pv_beat_publish_mask = 0xfffUL;
 
+/*
+ * is_cs_preempted() knobs. All default 0 / inert: at these values the feature
+ * is one predicted branch at the stamp site and one at the probe site, and
+ * nothing else in the kernel changes.
+ */
+unsigned long ivh_cs_owner_enable = 0UL;	/* arm the stamp at qspinlock.c:462 */
+unsigned long ivh_cs_owner_clear  = 0UL;	/* arm the unlock-path clear; compiled in Stage A (sec 1.4) */
+unsigned long ivh_cs_head_probe   = 0UL;	/* arm the head-side detect + count */
+unsigned long ivh_cs_head_bail    = 0UL;	/* Stage B: THE only behaviour knob */
+unsigned long ivh_cs_owed_ticks   = 2UL;
+/*
+ * Compiled default assumes 2.2 GHz at HZ=1000; overwritten at late_initcall
+ * from the live tsc_khz, exactly as ivh_pv_beat_threshold is (:1556).
+ */
+unsigned long ivh_cs_tick_period  = 2200000UL;
+#define IVH_CS_PROMPT_US	9ULL
+unsigned long ivh_cs_prompt_cycles = 19800UL;	/* 9 us at 2.2 GHz; recalibrated below */
+EXPORT_SYMBOL_GPL(ivh_cs_owner_enable);
+EXPORT_SYMBOL_GPL(ivh_cs_owner_clear);
+
 DEFINE_PER_CPU(u64, ivh_beat_agree_true);
 DEFINE_PER_CPU(u64, ivh_beat_agree_false);
 DEFINE_PER_CPU(u64, ivh_beat_false_pos);
@@ -1502,6 +1522,48 @@ DEFINE_PER_CPU(u64, ivh_rot_splice_done);
 DEFINE_PER_CPU(u64, ivh_rot_splice_blocked_tail);
 DEFINE_PER_CPU(u64, ivh_rot_splice_blocked_starve);
 
+/* is_cs_preempted() -- see <asm/ivh_tsc_beat.h> for what each measures. */
+DEFINE_PER_CPU_ALIGNED(struct ivh_cs_owner, ivh_cs_owner);
+EXPORT_PER_CPU_SYMBOL_GPL(ivh_cs_owner);
+DEFINE_PER_CPU(u64, ivh_cs_stamps);
+DEFINE_PER_CPU(u64, ivh_cs_clears);
+DEFINE_PER_CPU(u64, ivh_cs_stamp_overwrote);
+DEFINE_PER_CPU(u64, ivh_cs_check_calls);
+DEFINE_PER_CPU(u64, ivh_cs_abstain_noprev);
+DEFINE_PER_CPU(u64, ivh_cs_abstain_rot);
+DEFINE_PER_CPU(u64, ivh_cs_abstain_tag);
+DEFINE_PER_CPU(u64, ivh_cs_abstain_skew);
+DEFINE_PER_CPU(u64, ivh_cs_abstain_young);
+DEFINE_PER_CPU(u64, ivh_cs_abstain_nohz);
+DEFINE_PER_CPU(u64, ivh_cs_long_hold);
+DEFINE_PER_CPU(u64, ivh_cs_healthy_long);
+DEFINE_PER_CPU(u64, ivh_cs_fired);
+DEFINE_PER_CPU(u64, ivh_cs_ep_events);
+DEFINE_PER_CPU(u64, ivh_cs_ep_events_by_end[IVH_CS_EP_NR]);
+DEFINE_PER_CPU(u64, ivh_cs_ep_cycles[IVH_CS_EP_NR]);
+DEFINE_PER_CPU(u64, ivh_cs_ep_hist[IVH_CS_EP_NR][IVH_BEAT_AGE_HIST_BUCKETS]);
+DEFINE_PER_CPU(u64, ivh_cs_tenure_cycles[2]);
+DEFINE_PER_CPU(u64, ivh_cs_tenure_hist[2][IVH_BEAT_AGE_HIST_BUCKETS]);
+DEFINE_PER_CPU(u64, ivh_cs_prev_hold_hist[IVH_BEAT_AGE_HIST_BUCKETS]);
+DEFINE_PER_CPU(u64, ivh_cs_abstain_tenure);
+DEFINE_PER_CPU(u64, ivh_cs_abstain_hashed);
+DEFINE_PER_CPU(u64, ivh_cs_abstain_late);
+DEFINE_PER_CPU(u64, ivh_cs_abstain_retag);
+DEFINE_PER_CPU(u64, ivh_cs_tenure0_enter);
+DEFINE_PER_CPU(u64, ivh_cs_tenure0_hashed);
+DEFINE_PER_CPU(u64, ivh_cs_tenure0_hashed_released);
+DEFINE_PER_CPU(u64, ivh_cs_tenure0_late);
+DEFINE_PER_CPU(u64, ivh_cs_shadow_gate_pass_released);
+DEFINE_PER_CPU(u64, ivh_cs_prompt_hist[IVH_BEAT_AGE_HIST_BUCKETS]);
+
+/* is_cs_preempted() Stage B -- head early bail and head-halt-by-cause. */
+DEFINE_PER_CPU(u64, ivh_cs_head_bailed);
+DEFINE_PER_CPU(u64, ivh_head_spin_iters_bail_sum);
+DEFINE_PER_CPU(u64, ivh_head_spin_bail_attempts);
+DEFINE_PER_CPU(u64, ivh_head_halt_cycles[IVH_CS_HALT_NR]);
+DEFINE_PER_CPU(u64, ivh_head_halt_events[IVH_CS_HALT_NR]);
+DEFINE_PER_CPU(u64, ivh_head_halt_hist[IVH_CS_HALT_NR][IVH_BEAT_AGE_HIST_BUCKETS]);
+
 /*
  * IVH Idea 4 Stage 0: attribution for the ivh_wait_irqoff_nohalt population.
  * Small fixed per-CPU table, not a real hash table -- the build-plan doc's
@@ -1565,6 +1627,31 @@ static int __init ivh_pv_beat_calibrate(void)
 	return 0;
 }
 late_initcall(ivh_pv_beat_calibrate);
+
+/*
+ * One tick in raw TSC cycles. tsc_khz * 1000 / HZ = cycles-per-second / HZ.
+ * At tsc_khz = 2200000, HZ = 1000: 2 200 000 cycles.
+ *
+ * Derived rather than hardcoded for the same reason ivh_pv_beat_threshold is:
+ * the knob has to survive a different host. If tsc_khz is 0 here the compiled
+ * 2.2 GHz default stands and the pr_info says so -- a wrong tick period makes
+ * the predicate more eager or more conservative, never unsafe, because the
+ * liveness term is what decides and this only decides when to consult it.
+ */
+static int __init ivh_cs_tick_calibrate(void)
+{
+	if (tsc_khz)
+	{
+		ivh_cs_tick_period = (unsigned long)((u64)tsc_khz * 1000ULL / HZ);
+		ivh_cs_prompt_cycles = (unsigned long)((u64)tsc_khz *
+					IVH_CS_PROMPT_US / 1000ULL);
+	}
+
+	pr_info("IVH: CS tick period = %lu cycles (HZ=%d, tsc_khz=%u), owed-tick margin = %lu\n",
+		ivh_cs_tick_period, HZ, tsc_khz, ivh_cs_owed_ticks);
+	return 0;
+}
+late_initcall(ivh_cs_tick_calibrate);
 
 #ifdef CONFIG_SYSCTL
 /*
@@ -1859,6 +1946,135 @@ static int ivh_pv_proc_beat_publish_mask(const struct ctl_table *table, int writ
 static unsigned long ivh_spin_thresh_min = 1UL;
 static unsigned long ivh_spin_thresh_max = 1UL << 24;
 
+static unsigned long ivh_cs_owed_min = 1UL;
+static unsigned long ivh_cs_owed_max = 64UL;
+/*
+ * A tick period is a physical constant of the boot, not a free parameter; the
+ * sysctl is writable only so a sweep can deliberately detune it. Floor at
+ * 1000 cycles so a typo cannot turn the predicate into "fire always".
+ */
+static unsigned long ivh_cs_tick_min = 1000UL;
+static unsigned long ivh_cs_tick_max = 1UL << 32;
+/* Promptness bound: floor so a typo cannot abstain on everything, ceiling at
+ * one tick (beyond that the gate is meaningless next to ivh_cs_owed_ticks). */
+static unsigned long ivh_cs_prompt_min = 100UL;
+static unsigned long ivh_cs_prompt_max = 2200000UL;
+
+/*
+ * ivh_cs_head_probe: arming the head-side detector is refused unless the
+ * owner stamp is armed (otherwise every check abstains on the tag and the run
+ * measures nothing) and refused while handoff rotation is enabled
+ * (pv_handoff_rotate() rewrites ->next, so `prev` would not name the holder).
+ * The rotation half of that interlock is ivh_pv_proc_rot_enable() below.
+ */
+static int ivh_cs_proc_head_probe(const struct ctl_table *table, int write,
+				  void *buffer, size_t *lenp, loff_t *ppos)
+{
+	unsigned long val = READ_ONCE(ivh_cs_head_probe);
+	struct ctl_table tmp = *table;
+	int ret;
+
+	tmp.data = &val;
+	ret = proc_doulongvec_minmax(&tmp, write, buffer, lenp, ppos);
+	if (ret || !write)
+		return ret;
+
+	if (val > 1) {
+		pr_err("IVH: refusing ivh_cs_head_probe=%lu: valid values are 0 (off) and 1 (detect and count only)\n",
+		       val);
+		return -EINVAL;
+	}
+
+	if (val && READ_ONCE(ivh_cs_owner_enable) != 1) {
+		pr_err("IVH: refusing ivh_cs_head_probe=1: requires ivh_cs_owner_enable=1 -- without the owner stamp every check abstains on the tag and the run measures nothing.\n");
+		return -EINVAL;
+	}
+
+	if (val && READ_ONCE(ivh_pv_rot_enable)) {
+		pr_err("IVH: refusing ivh_cs_head_probe=1 while ivh_pv_rot_enable=%lu: handoff rotation rewrites ->next, so the queue head's prev need not be the lock holder.\n",
+		       READ_ONCE(ivh_pv_rot_enable));
+		return -EINVAL;
+	}
+
+	WRITE_ONCE(ivh_cs_head_probe, val);
+	return 0;
+}
+
+/*
+ * ivh_cs_head_bail (Stage B): the only knob in this feature that changes
+ * behaviour. Refused unless the detector is armed (ivh_cs_head_probe=1) --
+ * bail acts on its verdicts and is gated on it at runtime anyway -- and unless
+ * ivh_adaptive_mode == IVH_MODE_ADAPTIVE, the only mode whose head halt path
+ * this was designed and measured against. Refused while rotation is enabled,
+ * for the same prev-is-the-holder reason as ivh_cs_head_probe.
+ */
+static int ivh_cs_proc_head_bail(const struct ctl_table *table, int write,
+				 void *buffer, size_t *lenp, loff_t *ppos)
+{
+	unsigned long val = READ_ONCE(ivh_cs_head_bail);
+	struct ctl_table tmp = *table;
+	int ret;
+
+	tmp.data = &val;
+	ret = proc_doulongvec_minmax(&tmp, write, buffer, lenp, ppos);
+	if (ret || !write)
+		return ret;
+
+	if (val > 1) {
+		pr_err("IVH: refusing ivh_cs_head_bail=%lu: valid values are 0 (detect only) and 1 (halt early on a fired is_cs_preempted())\n",
+		       val);
+		return -EINVAL;
+	}
+
+	if (val && READ_ONCE(ivh_cs_head_probe) != 1) {
+		pr_err("IVH: refusing ivh_cs_head_bail=1: requires ivh_cs_head_probe=1 -- bail acts on the detector's verdicts and does nothing without it.\n");
+		return -EINVAL;
+	}
+
+	if (val && READ_ONCE(ivh_adaptive_mode) != IVH_MODE_ADAPTIVE) {
+		pr_err("IVH: refusing ivh_cs_head_bail=1 while ivh_adaptive_mode=%lu: requires ivh_adaptive_mode=2 (ADAPTIVE).\n",
+		       READ_ONCE(ivh_adaptive_mode));
+		return -EINVAL;
+	}
+
+	if (val && READ_ONCE(ivh_pv_rot_enable)) {
+		pr_err("IVH: refusing ivh_cs_head_bail=1 while ivh_pv_rot_enable=%lu: handoff rotation rewrites ->next, so the queue head's prev need not be the lock holder.\n",
+		       READ_ONCE(ivh_pv_rot_enable));
+		return -EINVAL;
+	}
+
+	WRITE_ONCE(ivh_cs_head_bail, val);
+	return 0;
+}
+
+/*
+ * ivh_pv_rot_enable: new validating wrapper on an existing knob. It is the
+ * other half of the is_cs_preempted() rotation interlock: refuse to enable
+ * rotation while the head-side detector is armed, so the two cannot be raced
+ * into a configuration where `prev` silently stops naming the holder.
+ */
+static int ivh_pv_proc_rot_enable(const struct ctl_table *table, int write,
+				  void *buffer, size_t *lenp, loff_t *ppos)
+{
+	unsigned long val = READ_ONCE(ivh_pv_rot_enable);
+	struct ctl_table tmp = *table;
+	int ret;
+
+	tmp.data = &val;
+	ret = proc_doulongvec_minmax(&tmp, write, buffer, lenp, ppos);
+	if (ret || !write)
+		return ret;
+
+	if (val && (READ_ONCE(ivh_cs_head_probe) || READ_ONCE(ivh_cs_head_bail))) {
+		pr_err("IVH: refusing ivh_pv_rot_enable=%lu while ivh_cs_head_probe=%lu / ivh_cs_head_bail=%lu: rotation rewrites ->next, which breaks is_cs_preempted()'s prev-is-the-holder premise. Set both to 0 first.\n",
+		       val, READ_ONCE(ivh_cs_head_probe), READ_ONCE(ivh_cs_head_bail));
+		return -EINVAL;
+	}
+
+	WRITE_ONCE(ivh_pv_rot_enable, val);
+	return 0;
+}
+
 static const struct ctl_table ivh_pv_sysctls[] = {
 	{
 		.procname	= "ivh_adaptive_mode",
@@ -1928,7 +2144,7 @@ static const struct ctl_table ivh_pv_sysctls[] = {
 		.data		= &ivh_pv_rot_enable,
 		.maxlen		= sizeof(unsigned long),
 		.mode		= 0644,
-		.proc_handler	= proc_doulongvec_minmax,
+		.proc_handler	= ivh_pv_proc_rot_enable,
 	},
 	{
 		.procname	= "ivh_pv_rot_skip_max",
@@ -1959,6 +2175,61 @@ static const struct ctl_table ivh_pv_sysctls[] = {
 		.maxlen		= sizeof(unsigned long),
 		.mode		= 0644,
 		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_cs_owner_enable",
+		.data		= &ivh_cs_owner_enable,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_cs_owner_clear",
+		.data		= &ivh_cs_owner_clear,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_cs_head_probe",
+		.data		= &ivh_cs_head_probe,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= ivh_cs_proc_head_probe,
+	},
+	{
+		.procname	= "ivh_cs_head_bail",
+		.data		= &ivh_cs_head_bail,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= ivh_cs_proc_head_bail,
+	},
+	{
+		.procname	= "ivh_cs_owed_ticks",
+		.data		= &ivh_cs_owed_ticks,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+		.extra1		= &ivh_cs_owed_min,
+		.extra2		= &ivh_cs_owed_max,
+	},
+	{
+		.procname	= "ivh_cs_tick_period",
+		.data		= &ivh_cs_tick_period,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+		.extra1		= &ivh_cs_tick_min,
+		.extra2		= &ivh_cs_tick_max,
+	},
+	{
+		.procname	= "ivh_cs_prompt_cycles",
+		.data		= &ivh_cs_prompt_cycles,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+		.extra1		= &ivh_cs_prompt_min,
+		.extra2		= &ivh_cs_prompt_max,
 	},
 	{
 		/*

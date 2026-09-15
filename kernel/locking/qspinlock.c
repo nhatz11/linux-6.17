@@ -22,6 +22,7 @@
 #include <linux/mutex.h>
 #include <linux/prefetch.h>
 #include <linux/sched/clock.h>
+#include <linux/tick.h>	/* tick_nohz_full_cpu(), is_cs_preempted() */
 #include <asm/byteorder.h>
 #include <asm/qspinlock.h>
 #include <trace/events/lock.h>
@@ -153,7 +154,8 @@ static __always_inline void __pv_wait_node(struct mcs_spinlock *node,
 static __always_inline void __pv_kick_node(struct qspinlock *lock,
 					   struct mcs_spinlock *node) { }
 static __always_inline u32  __pv_wait_head_or_lock(struct qspinlock *lock,
-						   struct mcs_spinlock *node)
+						   struct mcs_spinlock *node,
+						   struct mcs_spinlock *prev)
 						   { return 0; }
 static __always_inline void __pv_handoff_rotate(struct qspinlock *lock,
 						struct mcs_spinlock *node,
@@ -199,7 +201,15 @@ static __always_inline void __pv_handoff_ack(struct qspinlock *lock,
  */
 void __lockfunc queued_spin_lock_slowpath(struct qspinlock *lock, u32 val)
 {
-	struct mcs_spinlock *prev, *next, *node;
+	/*
+	 * prev is NULL-initialised, not merely declared: it is now passed to
+	 * pv_wait_head_or_lock() below, and the `if (old & _Q_TAIL_MASK)`
+	 * branch that assigns it is not always taken (the first thread to
+	 * queue has no predecessor). NULL is the "no identity" value that
+	 * is_cs_preempted() abstains on. Dead-store-eliminated in the native
+	 * build, where __pv_wait_head_or_lock() ignores the argument.
+	 */
+	struct mcs_spinlock *prev = NULL, *next, *node;
 	/* G-LOCK-23: entry here IS the point of genuine contention -- the
 	 * inline fast-path cmpxchg has already failed. See ivh_slowpath_wait_begin()
 	 * in <asm/qspinlock.h> for the mode-agnostic design rationale. */
@@ -414,7 +424,7 @@ pv_queue:
 	 * If PV isn't active, 0 will be returned instead.
 	 *
 	 */
-	if ((val = pv_wait_head_or_lock(lock, node)))
+	if ((val = pv_wait_head_or_lock(lock, node, prev)))
 		goto locked;
 
 	val = atomic_cond_read_acquire(&lock->val, !(VAL & _Q_LOCKED_PENDING_MASK));
@@ -450,8 +460,18 @@ locked:
 	 *       PENDING will make the uncontended transition fail.
 	 */
 	if ((val & _Q_TAIL_MASK) == tail) {
-		if (atomic_try_cmpxchg_relaxed(&lock->val, &val, _Q_LOCKED_VAL))
+		if (atomic_try_cmpxchg_relaxed(&lock->val, &val, _Q_LOCKED_VAL)) {
+			/*
+			 * Site A4. See the A5 comment below; relaxed cmpxchg,
+			 * so the same store->store argument applies. An A4
+			 * acquirer has no MCS successor and so is never anyone's
+			 * prev; stamped for completeness, because with
+			 * ivh_cs_owner_clear == 1 tenure >= 1 heads may read the
+			 * slot of a CPU that acquired this way.
+			 */
+			ivh_cs_owner_stamp(lock);
 			goto release; /* No contention */
+		}
 	}
 
 	/*
@@ -460,6 +480,31 @@ locked:
 	 * ensuring we'll see a @next.
 	 */
 	set_locked(lock);
+	/*
+	 * IVH ownership stamp for is_cs_preempted(). Site A5, and the ONLY
+	 * site that matters: every predecessor that ever hands an MCS baton to
+	 * a successor passes through here, including the PV queue head that
+	 * acquired via trylock_clear_pending() (A7) or via the
+	 * xchg(_Q_SLOW_VAL)==0 race (A8) -- both of those `goto gotlock`,
+	 * return nonzero, land at `locked:` above, fail the :452 uncontended
+	 * cmpxchg because the successor is the tail, and fall through to here.
+	 * See the 2026-09-14 build plan sec 1(b).
+	 *
+	 * Placement is AFTER the acquiring store and BEFORE the successor's
+	 * release at :487. The ordering argument is STORE->STORE UNDER x86-TSO,
+	 * not "the locked RMW fences it": set_locked() is a plain WRITE_ONCE
+	 * (kernel/locking/qspinlock.h:196-199), not an RMW. :487's
+	 * arch_mcs_spin_unlock_contended() is an smp_store_release, so any
+	 * successor that has observed node->locked == 1 is guaranteed to see
+	 * this stamp. No barrier is required here.
+	 *
+	 * Cost at the default ivh_cs_owner_enable == 0 is one READ_ONCE of a
+	 * read-mostly global plus one perfectly-predicted branch -- the same
+	 * posture as ivh_beat_publish_in_spin() and ivh_lock_set_holder(). The
+	 * uncontended fastpath is NOT touched: this is reached only after the
+	 * MCS queue has actually formed.
+	 */
+	ivh_cs_owner_stamp(lock);
 
 	/*
 	 * contended path; wait for next if not observed yet, release.

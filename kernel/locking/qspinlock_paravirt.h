@@ -478,6 +478,377 @@ static inline bool is_wait_preempted(int cpu, bool tier2)
 }
 
 /*
+ * Is the CURRENT HOLDER of @lock -- not our predecessor-as-a-waiter, which is
+ * what pv_wait_early()'s tier 1 and tier 2 answer -- host-preempted?
+ *
+ * The test is "has the holder gone silent for more than ivh_cs_owed_ticks
+ * ticks", NOT "is the holder's heartbeat stale by the waiter threshold". The distinction is the whole point and the earlier
+ * specification got it wrong:
+ *
+ *   ivh_tsc_full_redesign_build_plan_2026-07-29.md sec 1.2 proposed
+ *   `cs_stamp != 0 && ivh_beat_stale(holder_cpu)` ("form 1"), arguing that the
+ *   tick is a hardirq and fires through preempt_disable(), so a running holder
+ *   stays fresh. True -- but fresh at TICK cadence, 1 ms, while
+ *   ivh_pv_beat_threshold is 220000 cycles = 100 us in the tuned configuration
+ *   this box actually runs (spin_mode 2). A perfectly healthy holder therefore
+ *   reads stale for ~90% of every tick period. Form 1 is a false-positive
+ *   generator here. It is NOT one at the compiled default of 3300000 cycles
+ *   (1.5 ms), which is why the earlier plan's reasoning looked sound.
+ *
+ * So: deliberately DO NOT read ivh_pv_beat_threshold. A running CPU publishes
+ * at least once per tick period. If the holder's newest beat is older than
+ * ivh_cs_owed_ticks periods AS OF NOW, it is not running. A holder in a
+ * five-millisecond critical section still ticks, and is exonerated. That is
+ * the property this predicate exists to have.
+ *
+ * The silence is aged against NOW, never against the acquisition TSC. An
+ * earlier draft tested beat < acq ("no beat since acquiring"), which never
+ * fires on a holder that ticked once and was THEN preempted -- the common
+ * case for any hold long enough to matter. The acquisition stamp's jobs are
+ * the tag (is prev still the holder) and the held_for guard, not liveness.
+ *
+ * Reaction time is floored at ivh_cs_owed_ticks ticks, ~2-3 ms at the default.
+ * That is SLOWER than ivh_pv_spin_threshold's ~45 us at 32768 iterations, and
+ * that is fine: the two are not competitors, see the head loop below.
+ *
+ * Returns true and fills *acq_out / *held_out only on a fire.
+ */
+static inline bool is_cs_preempted(struct qspinlock *lock, struct pv_node *prev,
+				   u64 *acq_out, u64 *held_out)
+{
+	struct ivh_cs_owner *o;
+	u64 acq, beat, now;
+	s64 held;
+
+	/* ivh_cs_check_calls is counted by the caller, ivh_cs_head_probe_one(),
+	 * so the tenure-gate abstains fall inside the same partition. */
+	if (!prev) {
+		/* Role B: first thread queued, xchg_tail() returned no prior
+		 * tail, so there is no predecessor and no identity. Structural,
+		 * not a bug -- counted so its size is known rather than
+		 * assumed. See ivh_head_waiter_adaptive_spinning_design
+		 * _2026-09-14.md sec 1 role B. */
+		this_cpu_inc(ivh_cs_abstain_noprev);
+		return false;
+	}
+
+	/*
+	 * Hard interlock with handoff rotation. pv_handoff_rotate() REWRITES
+	 * ->next pointers in the queue, so under ivh_pv_rot_enable the node
+	 * that released our MCS baton need not be the node we linked behind,
+	 * and `prev` is then not the holder. The sysctl handlers refuse the
+	 * combination in both directions; this is the belt to that braces,
+	 * because the two knobs can in principle be raced against each other.
+	 */
+	if (unlikely(READ_ONCE(ivh_pv_rot_enable))) {
+		this_cpu_inc(ivh_cs_abstain_rot);
+		return false;
+	}
+
+	o = &per_cpu(ivh_cs_owner, prev->cpu);
+
+	/*
+	 * prev->cpu is safe to read at ANY time, and this is worth stating
+	 * because it is the one place a stale pointer could have bitten:
+	 * qnodes[] is DEFINE_PER_CPU_ALIGNED (qspinlock.c:138) and
+	 * pv_init_node() stores pn->cpu = smp_processor_id(), so the ->cpu
+	 * field of the node at (cpu, idx) is that cpu, permanently, across
+	 * every reuse of the slot. It cannot go stale in a harmful direction.
+	 * The only real staleness question -- "is that CPU still the holder" --
+	 * is answered by the tag compare on the next line.
+	 */
+	if (READ_ONCE(o->lock) != (void *)lock) {
+		this_cpu_inc(ivh_cs_abstain_tag);
+		return false;
+	}
+	smp_rmb();		/* pairs with __ivh_cs_owner_stamp()'s smp_wmb() */
+	acq = READ_ONCE(o->tsc);
+
+	now  = rdtsc();
+	held = (s64)(now - acq);
+
+	/*
+	 * SIGNED, for the same reason ivh_beat_age() is: a small negative
+	 * cross-vCPU TSC skew must read as "too young", not wrap to an enormous
+	 * positive and fire instantly.
+	 */
+	if (held <= 0) {
+		this_cpu_inc(ivh_cs_abstain_skew);
+		return false;
+	}
+	if ((u64)held <= (u64)READ_ONCE(ivh_cs_tick_period) *
+			 READ_ONCE(ivh_cs_owed_ticks)) {
+		this_cpu_inc(ivh_cs_abstain_young);
+		return false;
+	}
+
+	/* FORM-0 population: long hold, liveness not yet consulted. */
+	this_cpu_inc(ivh_cs_long_hold);
+
+	/*
+	 * NO_HZ_FULL guard, unconditional and not a command-line assumption.
+	 *
+	 * On an adaptive-ticks CPU the absence of a beat proves nothing. The
+	 * tick-stop decision is taken at tick_nohz_irq_exit()
+	 * (kernel/time/tick-sched.c:1295), reached from tick_irq_exit()
+	 * (kernel/softirq.c:639-650) whose only context gate is !in_hardirq() --
+	 * it tests HARDIRQ_MASK and says nothing about PREEMPT_MASK. And
+	 * can_stop_full_tick() (tick-sched.c:358-375) checks six tick_dep bits
+	 * and has no preempt_count() or lockdep check at all. So a nohz_full
+	 * CPU CAN hold a contended spinlock with the tick stopped:
+	 * Documentation/timers/no_hz.rst:139-142, "transitioning to kernel mode
+	 * does not automatically change the mode".
+	 *
+	 * On THIS boot it cannot: /proc/cmdline carries neither nohz_full= nor
+	 * dynticks (it carries nohz=off), tick_nohz_full_running is false, and
+	 * tick_nohz_full_cpu() is a NOP-patched read-only static branch
+	 * (context_tracking_key, DEFINE_STATIC_KEY_FALSE_RO) -- free. It is
+	 * here so the predicate does not depend on that staying true, and
+	 * ivh_cs_abstain_nohz must read exactly 0 in every run on this host.
+	 */
+	if (unlikely(tick_nohz_full_cpu(prev->cpu))) {
+		this_cpu_inc(ivh_cs_abstain_nohz);
+		return false;
+	}
+
+	beat = READ_ONCE(per_cpu(ivh_tsc_beat, prev->cpu).stamp);
+
+	/*
+	 * Second tag read. Under ivh_cs_owner_clear == 1 the clear commits
+	 * ->lock = NULL before the releasing store, so a tag that still reads
+	 * @lock HERE means the whole {lock, tsc, beat} observation was taken
+	 * inside the hold (build plan sec 1.2 d). Under clear == 0 it is
+	 * harmless and catches a nested re-stamp that raced the reads.
+	 */
+	if (READ_ONCE(o->lock) != (void *)lock) {
+		this_cpu_inc(ivh_cs_abstain_retag);
+		return false;
+	}
+	/*
+	 * Age the beat against NOW, signed like held above so a beat stamped a
+	 * hair after our rdtsc() on a skewed vCPU reads as fresh, not huge.
+	 * NOT (beat - acq): that only asks whether the holder ever ticked since
+	 * acquiring, and misses every holder preempted after its first tick.
+	 */
+	if ((s64)(now - beat) <= (s64)(READ_ONCE(ivh_cs_tick_period) *
+				       READ_ONCE(ivh_cs_owed_ticks))) {
+		/*
+		 * Beat is recent. Long hold, but alive. This is the population
+		 * form 0 would have fired on and this predicate correctly
+		 * exonerates; ivh_cs_healthy_long / ivh_cs_long_hold is the
+		 * false-positive audit ratio. Note the holder also publishes
+		 * from ivh_beat_publish_in_spin() and pv_init_node() when it is
+		 * itself contending on some inner lock, which can only move
+		 * samples INTO this branch -- the safe direction.
+		 *
+		 * The one way a holder goes silent while NOT host-preempted is
+		 * halting in pv_wait() on an inner lock it is contending for.
+		 * That fires, deliberately: the holder is not making progress
+		 * on @lock either way, and for the head's decision stale means
+		 * act. Size it with ivh_halt_* if it ever matters.
+		 */
+		this_cpu_inc(ivh_cs_healthy_long);
+		return false;
+	}
+
+	*acq_out  = acq;
+	*held_out = (u64)held;
+	this_cpu_inc(ivh_cs_fired);
+	return true;
+}
+
+/* Shared log2 bucketing, same convention as ivh_beat_age_hist_raw. */
+static __always_inline int ivh_cs_bucket(u64 v)
+{
+	int b = v ? ilog2(v) : 0;
+
+	return b >= IVH_BEAT_AGE_HIST_BUCKETS ? IVH_BEAT_AGE_HIST_BUCKETS - 1 : b;
+}
+
+/*
+ * Close the open episode, if any. Keyed on the holder's acquisition TSC in
+ * *ep_acq: that key is what makes re-sampling harmless. Zeroes the key.
+ */
+static __always_inline void ivh_cs_ep_close(u64 *ep_acq, u64 ep_start, u64 now,
+					    int why)
+{
+	u64 d;
+
+	if (!*ep_acq)
+		return;
+	d = now - ep_start;
+	this_cpu_add(ivh_cs_ep_cycles[why], d);
+	this_cpu_inc(ivh_cs_ep_events_by_end[why]);
+	this_cpu_inc(ivh_cs_ep_hist[why][ivh_cs_bucket(d)]);
+	*ep_acq = 0;
+}
+
+/*
+ * Whole-tenure CONTROL sample (see ivh_cs_tenure_hist in <asm/ivh_tsc_beat.h>):
+ * index 1 if at least one detection fired during this tenure, else 0. Closed
+ * at the same exits as the episode.
+ */
+static __always_inline void ivh_cs_tenure_record(u64 start, u64 now, bool det)
+{
+	u64 d = now - start;
+	int i = det ? 1 : 0;
+
+	this_cpu_add(ivh_cs_tenure_cycles[i], d);
+	this_cpu_inc(ivh_cs_tenure_hist[i][ivh_cs_bucket(d)]);
+}
+
+/*
+ * Per-tenure soundness gate (build plan sec 1.2). Called ONCE per head tenure,
+ * immediately after set_pending(), only when ivh_cs_head_probe is armed.
+ * Returns the verdict ivh_cs_head_probe_one() applies to every sampled check
+ * in the tenure.
+ */
+#define IVH_CS_GATE_OK		0
+#define IVH_CS_GATE_TENURE	1	/* waitcnt >= 1, no clear */
+#define IVH_CS_GATE_HASHED	2	/* halted at handoff, prev already released */
+#define IVH_CS_GATE_LATE	3	/* running at handoff, promptness gate failed */
+
+static noinline u8 ivh_cs_tenure_gate(struct qspinlock *lock,
+				      struct pv_node *prev, int waitcnt,
+				      bool entered_hashed)
+{
+	bool clr = READ_ONCE(ivh_cs_owner_clear);
+	s64 prompt = (s64)READ_ONCE(ivh_cs_prompt_cycles);
+	struct ivh_cs_owner *o;
+	void *tag;
+	s64 age;
+
+	/*
+	 * W: commit our pending store. set_pending() is a plain WRITE_ONCE
+	 * (_Q_PENDING_BITS == 8); until it drains from our store buffer, a
+	 * stealer's atomic_read() in pv_hybrid_queued_unfair_trylock() on
+	 * another CPU can still see pending == 0. On x86-64 smp_mb() is
+	 * `lock addl $0,-4(%rsp)` (arch/x86/include/asm/barrier.h:53), a
+	 * serialising instruction. Paid once per tenure, only with the probe
+	 * armed; acceptance check A7 includes it.
+	 */
+	smp_mb();
+
+	/* No identity, or rotation: is_cs_preempted() abstains and counts. */
+	if (!prev || READ_ONCE(ivh_pv_rot_enable))
+		return IVH_CS_GATE_OK;
+
+	if (waitcnt)
+		return clr ? IVH_CS_GATE_OK : IVH_CS_GATE_TENURE;
+
+	this_cpu_inc(ivh_cs_tenure0_enter);
+
+	if (entered_hashed) {
+		/*
+		 * Halted at handoff. pv_kick_node() wrote _Q_SLOW_VAL and did
+		 * NOT wake us; we were woken either by prev's unlock-slowpath
+		 * pv_kick() (AFTER its release -- a steal may have happened) or
+		 * by an unrelated interrupt (IF=1 HLT; prev may still hold).
+		 * _Q_SLOW_VAL is written only by prev's pv_kick_node() for THIS
+		 * handoff and cleared only by prev's release, so reading it
+		 * after W proves prev still holds and, pending now being
+		 * committed, will until we acquire. Airtight. Sec 1.2 c-HASHED.
+		 */
+		this_cpu_inc(ivh_cs_tenure0_hashed);
+		if (READ_ONCE(lock->locked) != _Q_SLOW_VAL) {
+			this_cpu_inc(ivh_cs_tenure0_hashed_released);
+			return clr ? IVH_CS_GATE_OK : IVH_CS_GATE_HASHED;
+		}
+		return IVH_CS_GATE_OK;
+	}
+
+	/*
+	 * Running at handoff. No lock-byte witness exists (_Q_LOCKED_VAL both
+	 * before and after a steal), so bound the window instead. NOT airtight:
+	 * a hold shorter than the bound can complete and be stolen inside it.
+	 * Tag first, then tsc: the stamp writes tsc then tag.
+	 */
+	o   = &per_cpu(ivh_cs_owner, prev->cpu);
+	tag = READ_ONCE(o->lock);
+	age = (s64)(rdtsc() - READ_ONCE(o->tsc));
+
+	if (tag == (void *)lock) {
+		this_cpu_inc(ivh_cs_prompt_hist[ivh_cs_bucket(age > 0 ? (u64)age : 0)]);
+		if (age > prompt) {
+			this_cpu_inc(ivh_cs_tenure0_late);
+			return clr ? IVH_CS_GATE_OK : IVH_CS_GATE_LATE;
+		}
+		return IVH_CS_GATE_OK;
+	}
+
+	/*
+	 * Tag already cleared at W under clr == 1: prev released before our
+	 * pending committed. If the promptness gate would have PASSED this,
+	 * it is exactly a tenure the clr == 0 configuration would have
+	 * admitted with a stale stamp. Shadow-count it (sec 1.4).
+	 */
+	if (clr && !tag && age <= prompt)
+		this_cpu_inc(ivh_cs_shadow_gate_pass_released);
+
+	return IVH_CS_GATE_OK;	/* is_cs_preempted() abstains on the tag */
+}
+
+/*
+ * One sampled probe. noinline on purpose: the head's spin loop is the hottest
+ * loop in the kernel under contention and must stay small in icache. Returns
+ * true if the predicate fired (Stage B acts on that; Stage A ignores it).
+ */
+static noinline bool ivh_cs_head_probe_one(struct qspinlock *lock,
+					   struct pv_node *prev, u8 gate,
+					   u64 *ep_acq, u64 *ep_start,
+					   bool *ep_any)
+{
+	u64 acq = 0, held = 0, now;
+
+	this_cpu_inc(ivh_cs_check_calls);
+
+	/*
+	 * Apply the per-tenure soundness verdict (ivh_cs_tenure_gate()). Any
+	 * non-OK verdict means `prev` may no longer be the holder while its
+	 * stamp tag still names @lock -- a potential FALSE POSITIVE, the bad
+	 * direction -- so the whole tenure abstains.
+	 */
+	switch (gate) {
+	case IVH_CS_GATE_TENURE:
+		this_cpu_inc(ivh_cs_abstain_tenure);
+		return false;
+	case IVH_CS_GATE_HASHED:
+		this_cpu_inc(ivh_cs_abstain_hashed);
+		return false;
+	case IVH_CS_GATE_LATE:
+		this_cpu_inc(ivh_cs_abstain_late);
+		return false;
+	}
+
+	if (!is_cs_preempted(lock, prev, &acq, &held)) {
+		/*
+		 * Not firing does NOT close the episode -- a single sampled
+		 * miss inside a genuine stall (say the holder briefly ticked
+		 * from an inner lock's spin loop) would otherwise fragment one
+		 * episode into several and re-inflate exactly the event count
+		 * this design exists to deflate. Only an ACQUIRE, a holder
+		 * change, or tenure exit closes an episode.
+		 */
+		return false;
+	}
+
+	now = rdtsc();
+
+	if (*ep_acq && *ep_acq != acq) {
+		/* The holder changed under us: close the old episode as an
+		 * upper bound and open a new one. */
+		ivh_cs_ep_close(ep_acq, *ep_start, now, IVH_CS_EP_HOLDER_CHANGED);
+	}
+	if (!*ep_acq) {
+		*ep_acq   = acq;
+		*ep_start = now;
+		*ep_any   = true;
+		this_cpu_inc(ivh_cs_ep_events);
+	}
+	return true;
+}
+
+/*
  * Phase 2 publish: stamp our own heartbeat from inside the qspinlock spin
  * loops, at microsecond-or-better cadence rather than the 1 ms tick cadence.
  * While we spin on node->locked our MCS predecessor is itself still
@@ -1495,20 +1866,46 @@ static __always_inline void pv_handoff_ack(struct qspinlock *lock,
  * The current value of the lock will be returned for additional processing.
  */
 static u32
-pv_wait_head_or_lock(struct qspinlock *lock, struct mcs_spinlock *node)
+pv_wait_head_or_lock(struct qspinlock *lock, struct mcs_spinlock *node,
+		     struct mcs_spinlock *prev)
 {
 	struct pv_node *pn = (struct pv_node *)node;
+	struct pv_node *pp = (struct pv_node *)prev;	/* may be NULL */
 	struct qspinlock **lp = NULL;
 	int waitcnt = 0;
 	unsigned long loop;
 	unsigned long threshold;
+	/*
+	 * ALL episode state is in locals. struct pv_node stays exactly 32
+	 * bytes with head_ctl at offset 24 and rot_flags in the 3-byte hole at
+	 * 21; nothing here touches it. That is not incidental -- the head is a
+	 * single thread running a single loop, so its detection state has no
+	 * reason to be visible to anyone else.
+	 */
+	u64 ep_acq = 0, ep_start = 0, tenure_start = 0;
+	bool ep_any = false, probe, entered_hashed = false;
+	u8 cs_gate = IVH_CS_GATE_OK;
+	/*
+	 * Stage B: `bail` is the only thing that turns a fired detection into
+	 * a control-flow change, read once per tenure alongside `probe`; `cause`
+	 * says which exit led to the head halt below, for the per-cause halt
+	 * accounting. Both are re-initialised at the top of every tenure.
+	 */
+	bool bail = false;
+	int cause = IVH_CS_HALT_EXHAUST;
+	u64 halt_tsc;
 
 	/*
 	 * If pv_kick_node() already advanced our state, we don't need to
 	 * insert ourselves into the hash table anymore.
 	 */
 	if (READ_ONCE(pn->state) == VCPU_HASHED)
+	{
 		lp = (struct qspinlock **)1;
+		/* sec 1.2: was halted at handoff; prev may already have
+		 * released before we could set pending. */
+		entered_hashed = true;
+	}
 
 	/*
 	 * Tracking # of slowpath locking operations
@@ -1540,12 +1937,36 @@ pv_wait_head_or_lock(struct qspinlock *lock, struct mcs_spinlock *node)
 		 */
 		WRITE_ONCE(pn->head_ctl, HC(0, 0, HEAD_SPINNING));
 		this_cpu_inc(ivh_head_spin_enter);
+		/*
+		 * Read the gate ONCE per tenure, not per iteration -- the same
+		 * rule the G-LOCK-21-spin comments impose on
+		 * ivh_pv_spin_threshold two lines below, and for the same
+		 * reason: a live sysctl flip must not take effect mid-spin, or
+		 * the per-tenure accounting stops being internally consistent.
+		 */
+		probe = READ_ONCE(ivh_cs_head_probe);
+		bail = probe && READ_ONCE(ivh_cs_head_bail) &&
+		       READ_ONCE(ivh_adaptive_mode) == IVH_MODE_ADAPTIVE;
+		cause = IVH_CS_HALT_EXHAUST;
+		ep_acq = 0;
+		ep_any = false;
+		if (probe)
+			tenure_start = rdtsc();
 
 		/*
 		 * Set the pending bit in the active lock spinning loop to
 		 * disable lock stealing before attempting to acquire the lock.
 		 */
 		set_pending(lock);
+		/*
+		 * Soundness gate, once per tenure, BEFORE the first sampled
+		 * check: commits the pending store and decides whether `prev`
+		 * is provably still the holder (build plan sec 1.2). Behaviour-
+		 * neutral: no control flow depends on cs_gate outside the probe.
+		 */
+		if (unlikely(probe))
+			cs_gate = ivh_cs_tenure_gate(lock, pp, waitcnt,
+						     entered_hashed);
 		/* G-LOCK-21-spin: read once per attempt, see pv_wait_node(). */
 		threshold = READ_ONCE(ivh_pv_spin_threshold);
 		for (loop = threshold; loop; loop--) {
@@ -1559,6 +1980,44 @@ pv_wait_head_or_lock(struct qspinlock *lock, struct mcs_spinlock *node)
 			 * for the whole time it holds that role.
 			 */
 			ivh_beat_publish_in_spin(loop);
+			/*
+			 * IVH head adaptive check. With ivh_cs_head_bail == 0
+			 * (STAGE A, the default) this is DETECT-ONLY: `bail`
+			 * is false for the whole tenure, so the one break
+			 * below is unreachable, nothing else here stores
+			 * outside this_cpu counters and stack locals, and the
+			 * loop's trip count is bit-identical to before. That is
+			 * the behaviour-neutrality proof, and it is checkable:
+			 * ivh_head_spin_iters_sum / ivh_head_spin_attempts must
+			 * still equal ivh_pv_spin_threshold exactly.
+			 *
+			 * STAGE B (ivh_cs_head_bail == 1): a fired detection
+			 * breaks out into the existing, already-audited
+			 * clear_pending() -> pv_hash() -> xchg(_Q_SLOW_VAL) ->
+			 * pv_wait() sequence, exactly as exhaustion does. No
+			 * new mechanism, no new state, no new failure mode.
+			 *
+			 * Sampled on PV_PREV_CHECK_MASK, the same cadence as
+			 * pv_wait_early()'s tier 2, for the same cacheline
+			 * reason -- every evaluation pulls a remote line
+			 * (prev's ivh_cs_owner, then prev's ivh_tsc_beat).
+			 *
+			 * At the default ivh_cs_head_probe == 0 this is one
+			 * already-loaded register test and one predicted
+			 * not-taken branch.
+			 */
+			if (unlikely(probe) &&
+			    (loop & PV_PREV_CHECK_MASK) == 0) {
+				bool hit = ivh_cs_head_probe_one(lock, pp,
+						cs_gate, &ep_acq, &ep_start,
+						&ep_any);
+
+				if (hit && bail) {
+					this_cpu_inc(ivh_cs_head_bailed);
+					cause = IVH_CS_HALT_CS;
+					break;
+				}
+			}
 			cpu_relax();
 		}
 		clear_pending(lock);
@@ -1571,8 +2030,29 @@ pv_wait_head_or_lock(struct qspinlock *lock, struct mcs_spinlock *node)
 		 * mechanism. A sanity check on the accounting, not a variable
 		 * under test.
 		 */
-		this_cpu_add(ivh_head_spin_iters_sum, threshold - loop);
-		this_cpu_inc(ivh_head_spin_attempts);
+		/*
+		 * Stage B introduces the first early exit this loop has ever
+		 * had, which falsifies the "loop == 0 here" invariant this
+		 * block was built on. Split rather than blended: the
+		 * exhaustion accumulators keep meaning exactly what they meant
+		 * (and keep averaging exactly SPIN_THRESHOLD, which is still
+		 * the accounting sanity check), and the bail population gets
+		 * its own pair. Behaviour-identical when ivh_cs_head_bail == 0,
+		 * because loop is then always 0 here.
+		 */
+		if (loop) {
+			this_cpu_add(ivh_head_spin_iters_bail_sum, threshold - loop);
+			this_cpu_inc(ivh_head_spin_bail_attempts);
+		} else {
+			this_cpu_add(ivh_head_spin_iters_sum, threshold - loop);
+			this_cpu_inc(ivh_head_spin_attempts);
+		}
+		if (unlikely(probe)) {
+			u64 now = rdtsc();
+
+			ivh_cs_ep_close(&ep_acq, ep_start, now, IVH_CS_EP_EXHAUST);
+			ivh_cs_tenure_record(tenure_start, now, ep_any);
+		}
 
 		if (!lp) { /* ONCE */
 			lp = pv_hash(lock, pn);
@@ -1624,7 +2104,23 @@ pv_wait_head_or_lock(struct qspinlock *lock, struct mcs_spinlock *node)
 		 * site identity that is Stage 0's acceptance check.
 		 */
 		WRITE_ONCE(pn->head_ctl, HC(0, 0, HEAD_ARMED));
+		/*
+		 * Stage B: measure the halt, do not assume it helped. Bracketed
+		 * exactly as pv_wait_node() brackets its own pv_wait(), and
+		 * recorded by cause, so a CS-caused halt that is systematically
+		 * LONGER than an exhaustion halt (the head slept past the
+		 * release; the wake path is the problem, not the detector) is
+		 * visible. Records only; nothing reads these back.
+		 */
+		halt_tsc = ivh_raw_tsc();
 		pv_wait(&lock->locked, _Q_SLOW_VAL);
+		{
+			u64 d = ivh_raw_tsc() - halt_tsc;
+
+			this_cpu_add(ivh_head_halt_cycles[cause], d);
+			this_cpu_inc(ivh_head_halt_events[cause]);
+			this_cpu_inc(ivh_head_halt_hist[cause][ivh_cs_bucket(d)]);
+		}
 		if ((READ_ONCE(pn->head_ctl) & 0xffff) == HEAD_YIELDED)
 			this_cpu_inc(ivh_head_woke_yielded);
 		else
@@ -1673,6 +2169,37 @@ gotlock:
 	 * and does so before the smp_wmb() + xchg_tail() that first publishes
 	 * this qnode where any successor could find it (qspinlock.c:272-296).
 	 */
+	if (unlikely(probe)) {
+		u64 now = rdtsc();
+
+		/*
+		 * The predecessor's hold has just ended -- we are taking the
+		 * lock it released. If its stamp is still readable, this is a
+		 * free, population-correct sample of how long a CONTENDED hold
+		 * actually lasts on this workload, which is exactly the
+		 * distribution the false-positive audit needs and the only one
+		 * this predicate ever judges. Costs nothing on the release path.
+		 */
+		/*
+		 * Only when the tenure gate PASSED and the clear is off. A
+		 * failed gate means prev may have released long ago, so
+		 * now - a would span a stealer's hold too. With the clear on,
+		 * the tag is already NULL here and the sample is taken
+		 * holder-side in __ivh_cs_owner_clear() instead.
+		 */
+		if (pp && cs_gate == IVH_CS_GATE_OK &&
+		    !READ_ONCE(ivh_cs_owner_clear) &&
+		    !READ_ONCE(ivh_pv_rot_enable)) {
+			struct ivh_cs_owner *o = &per_cpu(ivh_cs_owner, pp->cpu);
+			u64 a = READ_ONCE(o->tsc);
+			s64 h = (s64)(now - a);
+
+			if (READ_ONCE(o->lock) == (void *)lock && h > 0)
+				this_cpu_inc(ivh_cs_prev_hold_hist[ivh_cs_bucket(h)]);
+		}
+		ivh_cs_ep_close(&ep_acq, ep_start, now, IVH_CS_EP_ACQUIRED);
+		ivh_cs_tenure_record(tenure_start, now, ep_any);
+	}
 	WRITE_ONCE(pn->head_ctl, HC(0, 0, HEAD_IDLE));
 	return (u32)(atomic_read(&lock->val) | _Q_LOCKED_VAL);
 }

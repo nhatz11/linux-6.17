@@ -24,6 +24,15 @@
 #include <linux/hash.h>
 #include <linux/init.h>
 #include <linux/ivh_lock_holder.h>
+#include <linux/log2.h>
+/*
+ * <asm/ivh_tsc_beat.h> is not self-contained: its ivh_tsc_cycles_to_ns()/
+ * ivh_tsc_ns_to_cycles() helpers use USEC_PER_SEC without including it (every
+ * existing includer gets it transitively). This file has no such transitive
+ * path, so pull it in explicitly rather than editing that header's includes.
+ */
+#include <linux/time64.h>
+#include <asm/ivh_tsc_beat.h>
 
 DEFINE_PER_CPU(u64, ivh_holder_stamps);
 DEFINE_PER_CPU(u64, ivh_holder_clears);
@@ -135,3 +144,61 @@ static int __init ivh_lock_holder_table_init(void)
 	return 0;
 }
 late_initcall(ivh_lock_holder_table_init);
+
+/*
+ * is_cs_preempted()'s owner stamp. See <linux/ivh_lock_holder.h> for why the
+ * gate is inlined and the body is not, and the 2026-09-14 build plan sec 1 for
+ * why one site suffices.
+ *
+ * ->tsc must become visible before ->lock: ->lock is the validity flag the
+ * remote reader tests, and without this ordering a reader can pair a matching
+ * ->lock with a stale ->tsc from a previous hold and compute a wildly wrong --
+ * or negative -- held_for. Identical rule and identical reason to
+ * ivh_rot_stamp_release() (kernel/locking/qspinlock_paravirt.h:1375-1383). On
+ * x86-TSO smp_wmb() is a compiler barrier, so this is free; it is written
+ * because the rule is real, not because the instruction is.
+ */
+void __ivh_cs_owner_stamp(struct qspinlock *lock)
+{
+	if (unlikely(this_cpu_read(ivh_cs_owner.lock)))
+		this_cpu_inc(ivh_cs_stamp_overwrote);
+
+	this_cpu_write(ivh_cs_owner.tsc, rdtsc());
+	smp_wmb();
+	this_cpu_write(ivh_cs_owner.lock, lock);
+	this_cpu_inc(ivh_cs_stamps);
+}
+EXPORT_SYMBOL_GPL(__ivh_cs_owner_stamp);
+
+/*
+ * Tag-checked and therefore idempotent: a release of a lock this CPU never
+ * stamped, or of an outer lock whose slot an inner one has since overwritten,
+ * finds a mismatch and does nothing. That is what makes partial stamp coverage
+ * safe -- the stamps/clears accounting identity is
+ *   ivh_cs_stamps == ivh_cs_clears + ivh_cs_stamp_overwrote + (in flight)
+ * rather than a raw equality, which is the lesson of the 680000:1
+ * stamps:clears ratio recorded at <asm/qspinlock.h>:100-140.
+ */
+void __ivh_cs_owner_clear(struct qspinlock *lock)
+{
+	s64 held;
+
+	if (this_cpu_read(ivh_cs_owner.lock) != (void *)lock)
+		return;
+	this_cpu_write(ivh_cs_owner.lock, NULL);
+	this_cpu_inc(ivh_cs_clears);
+
+	/*
+	 * Holder-side hold-duration sample. Under clear==1 the observer-side
+	 * sample at gotlock: can never fire (this store has already NULLed
+	 * the tag it tests), so the population-correct contended-hold
+	 * histogram is taken here instead. Only stamped holds reach this
+	 * line, and only contended acquisitions are stamped, so this is the
+	 * same population either way.
+	 */
+	held = (s64)(rdtsc() - this_cpu_read(ivh_cs_owner.tsc));
+	if (held > 0)
+		this_cpu_inc(ivh_cs_prev_hold_hist[held >= (1LL << 31) ?
+				IVH_BEAT_AGE_HIST_BUCKETS - 1 : ilog2((u64)held)]);
+}
+EXPORT_SYMBOL_GPL(__ivh_cs_owner_clear);

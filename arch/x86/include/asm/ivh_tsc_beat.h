@@ -41,6 +41,14 @@
 #include <linux/percpu.h>
 #include <linux/types.h>
 #include <asm/tsc.h>
+/*
+ * For ivh_cs_owner_enable and the ivh_cs_owner_stamp()/_clear() gates. That
+ * API deliberately lives in an arch-neutral, dependency-free header because
+ * its call sites are <asm/qspinlock.h> and kernel/locking/qspinlock.c, neither
+ * of which can reach this file -- see that header's own writeup. (The claim
+ * there that this include already exists was aspirational; it is added here.)
+ */
+#include <linux/ivh_lock_holder.h>
 
 /*
  * ---------------------------------------------------------------------------
@@ -495,6 +503,89 @@ struct ivh_rot_rel {
  */
 DECLARE_PER_CPU_ALIGNED(struct ivh_rot_rel, ivh_rot_rel);
 
+/*
+ * ---------------------------------------------------------------------------
+ * IVH critical-section owner stamp -- is_cs_preempted()'s input
+ * ---------------------------------------------------------------------------
+ *
+ * Written by a vCPU at the instant it acquires a CONTENDED qspinlock through
+ * the MCS queue-head path (kernel/locking/qspinlock.c:462, the one site every
+ * MCS-handoff predecessor provably passes through -- see
+ * tools/bpf/docs/ivh_is_cs_preempted_build_plan_2026-09-14.md sec 1 for the
+ * proof). Read remotely by the NEXT queue head, which reaches this CPU's slot
+ * through its own `prev->cpu`.
+ *
+ * ->lock does double duty. It is the identity of the hold AND its validity
+ * flag: a reader that finds a different pointer here knows its `prev` has
+ * moved on to some other lock and must abstain. It is COMPARED, NEVER
+ * DEREFERENCED -- __pv_queued_spin_unlock_slowpath() documents that lock
+ * memory may be freed and reused the instant the releasing store lands.
+ *
+ * NOT a reuse of struct ivh_rot_rel above, deliberately: that one is written
+ * remotely and read locally (the exact opposite direction, so sharing a line
+ * would false-share every access), its ->lock means "released TO you" rather
+ * than "held BY me", and it is still armed by the separate, live
+ * ivh_pv_rot_probe sysctl.
+ *
+ * Own cacheline for the same one-writer/many-remote-readers reason as
+ * struct ivh_tsc_beat.
+ */
+struct ivh_cs_owner {
+	void	*lock;	/* the qspinlock this CPU is holding; NULL == none */
+	u64	tsc;	/* raw rdtsc() at the moment of acquisition */
+} ____cacheline_aligned_in_smp;
+
+DECLARE_PER_CPU_ALIGNED(struct ivh_cs_owner, ivh_cs_owner);
+
+/*
+ * One scheduler tick in raw TSC cycles, and the margin in ticks.
+ *
+ * DERIVED at late_initcall from tsc_khz and HZ (kvm.c), never hardcoded: the
+ * same kernel must answer correctly on a host with a different TSC, and
+ * ivh_pv_beat_calibrate() (kvm.c:1556) is the standing precedent. At
+ * tsc_khz = 2200000 and HZ = 1000 this is 2200000 cycles.
+ *
+ * ivh_cs_owed_ticks is the margin, default 2 rather than 1. A hold that began
+ * one cycle after tick N is owed tick N+1 within one full period, so 1 period
+ * is the theoretical floor; the second period is slack for hrtimer jitter,
+ * for tick_sched_do_timer()'s MAX_STALLED_JIFFIES=5 forced-update behaviour
+ * (kernel/time/tick-sched.c:204,236-239), and for cross-vCPU TSC skew. It
+ * costs reaction time -- ~2-3 ms -- and buys the "no false positives from
+ * long critical sections" property that is this predicate's entire claim.
+ */
+extern unsigned long ivh_cs_tick_period;
+extern unsigned long ivh_cs_owed_ticks;
+
+/*
+ * Promptness bound for the RUNNING-at-handoff tenure-0 gate (build plan sec
+ * 1.2 c-RUNNING): a head abstains for the whole tenure if, at the moment its
+ * pending bit is committed, more than this many cycles have passed since its
+ * predecessor's acquisition stamp. Derived at late_initcall as
+ * IVH_CS_PROMPT_US microseconds from tsc_khz (default 9 us = ~20000 cycles
+ * here), and meant to be re-set from ivh_cs_prompt_hist[] once Stage A has
+ * data. It NARROWS the residual race; it does not close it. Only the
+ * release-side clear (ivh_cs_owner_clear) does.
+ */
+extern unsigned long ivh_cs_prompt_cycles;
+
+/*
+ * Arms the queue head's detect-and-count probe in pv_wait_head_or_lock()
+ * (kernel/locking/qspinlock_paravirt.h). Read once per head tenure. Stage A:
+ * counts only, never changes control flow. Refused by its sysctl handler
+ * unless ivh_cs_owner_enable == 1 and ivh_pv_rot_enable == 0.
+ */
+extern unsigned long ivh_cs_head_probe;
+
+/*
+ * Stage B: THE only behaviour knob. With ivh_cs_head_probe == 1 and
+ * ivh_adaptive_mode == IVH_MODE_ADAPTIVE, a fired is_cs_preempted() breaks the
+ * queue head out of its spin loop into the existing clear_pending() ->
+ * pv_hash() -> pv_wait() halt path early. Read once per head tenure. Default
+ * 0; refused by its sysctl handler unless both preconditions hold and
+ * ivh_pv_rot_enable == 0.
+ */
+extern unsigned long ivh_cs_head_bail;
+
 /* rot_flags bits deposited into the successor's pv_node at promotion time. */
 #define IVH_ROT_F_STALE		0x1	/* target looked preempted/halted */
 #define IVH_ROT_F_SKIPPABLE	0x2	/* ...and a live node existed to skip to */
@@ -703,6 +794,160 @@ DECLARE_PER_CPU(u64, ivh_rot_splice_blocked_tail);
  * and the mechanism is not behaving as designed.
  */
 DECLARE_PER_CPU(u64, ivh_rot_splice_blocked_starve);
+
+/*
+ * is_cs_preempted() Stage A -- DETECT ONLY. Two exhaustive partitions, and the
+ * harness must assert both with ZERO deviation (these are integer counts taken
+ * on one CPU with no sampling between them, so "within 0.1%" is too weak here):
+ *
+ *   ivh_cs_check_calls == ivh_cs_abstain_tenure + ivh_cs_abstain_hashed
+ *                       + ivh_cs_abstain_late
+ *                       + ivh_cs_abstain_noprev + ivh_cs_abstain_rot
+ *                       + ivh_cs_abstain_tag    + ivh_cs_abstain_skew
+ *                       + ivh_cs_abstain_young  + ivh_cs_long_hold
+ *   ivh_cs_long_hold   == ivh_cs_abstain_nohz + ivh_cs_abstain_retag
+ *                       + ivh_cs_healthy_long + ivh_cs_fired
+ *
+ * The three TENURE-GATE abstains (tenure/hashed/late) are per-CHECK counts of a
+ * verdict taken once per head tenure by ivh_cs_tenure_gate(), so they scale
+ * with spin length. To size coverage per TENURE use the ivh_cs_tenure0_*
+ * counters below instead.
+ *
+ * ivh_cs_long_hold is the FORM-0 population -- "this hold is longer than
+ * ivh_cs_owed_ticks ticks" with no liveness term -- and exists solely as the
+ * denominator of the false-positive audit. ivh_cs_healthy_long is the holds
+ * that were long AND whose holder beat within the last ivh_cs_owed_ticks
+ * ticks, i.e. the ones form 0 would have fired on and form 2 correctly
+ * exonerates. If
+ * ivh_cs_healthy_long / ivh_cs_long_hold is near zero, the tick term is inert
+ * and this predicate has silently degenerated into form 0. See
+ * ivh_tsc_full_redesign_build_plan_2026-07-29.md sec 1.2 for why that matters.
+ *
+ * ivh_cs_abstain_nohz MUST read exactly 0 on this host: neither nohz_full= nor
+ * dynticks (nohz=off) is in effect. A nonzero value means the command line
+ * changed and every other number in the run is suspect.
+ *
+ * ivh_cs_abstain_skew counts (now - acq) <= 0, i.e. the remote stamp is in our
+ * future. Expected ~0 on a TD with a synchronised TSC; a material rate
+ * invalidates the whole design, not just this counter.
+ */
+DECLARE_PER_CPU(u64, ivh_cs_stamps);
+DECLARE_PER_CPU(u64, ivh_cs_stamp_overwrote);
+DECLARE_PER_CPU(u64, ivh_cs_check_calls);
+DECLARE_PER_CPU(u64, ivh_cs_abstain_noprev);
+DECLARE_PER_CPU(u64, ivh_cs_abstain_rot);
+DECLARE_PER_CPU(u64, ivh_cs_abstain_tag);
+DECLARE_PER_CPU(u64, ivh_cs_abstain_skew);
+DECLARE_PER_CPU(u64, ivh_cs_abstain_young);
+DECLARE_PER_CPU(u64, ivh_cs_abstain_nohz);
+DECLARE_PER_CPU(u64, ivh_cs_long_hold);
+DECLARE_PER_CPU(u64, ivh_cs_healthy_long);
+DECLARE_PER_CPU(u64, ivh_cs_fired);
+DECLARE_PER_CPU(u64, ivh_cs_abstain_tenure);	/* waitcnt >= 1 without the clear */
+DECLARE_PER_CPU(u64, ivh_cs_abstain_hashed);	/* HASHED entry, _Q_SLOW_VAL witness failed */
+DECLARE_PER_CPU(u64, ivh_cs_abstain_late);	/* RUNNING entry, promptness gate failed */
+DECLARE_PER_CPU(u64, ivh_cs_abstain_retag);	/* tag changed between first and second read */
+DECLARE_PER_CPU(u64, ivh_cs_clears);
+
+/*
+ * Per-TENURE soundness-gate accounting (build plan sec 1.2). Counted once per
+ * tenure-0 head entry that has a prev and no rotation, in BOTH clear modes, so
+ * the size of each hole is measured directly rather than inferred:
+ *
+ *   ivh_cs_tenure0_enter           - denominator
+ *   ivh_cs_tenure0_hashed          - entered with pn->state == VCPU_HASHED
+ *                                    (was halted at handoff)
+ *   ivh_cs_tenure0_hashed_released - ...and lock->locked != _Q_SLOW_VAL after
+ *                                    the pending commit: prev had ALREADY
+ *                                    released. This IS the hole found in the
+ *                                    first version of the theorem, counted.
+ *   ivh_cs_tenure0_late            - RUNNING entry whose stamp age at the
+ *                                    pending commit exceeded
+ *                                    ivh_cs_prompt_cycles
+ *   ivh_cs_shadow_gate_pass_released - (clear==1 only) RUNNING entry whose tag
+ *                                    was ALREADY cleared at the pending commit
+ *                                    but whose stamp age would have PASSED the
+ *                                    promptness gate: the residual race the
+ *                                    clear==0 configuration would have
+ *                                    admitted. Approximate; see sec 1.4.
+ *   ivh_cs_prompt_hist[]           - log2 stamp age at the pending commit for
+ *                                    RUNNING entries with a matching tag: the
+ *                                    data ivh_cs_prompt_cycles is tuned from.
+ */
+DECLARE_PER_CPU(u64, ivh_cs_tenure0_enter);
+DECLARE_PER_CPU(u64, ivh_cs_tenure0_hashed);
+DECLARE_PER_CPU(u64, ivh_cs_tenure0_hashed_released);
+DECLARE_PER_CPU(u64, ivh_cs_tenure0_late);
+DECLARE_PER_CPU(u64, ivh_cs_shadow_gate_pass_released);
+DECLARE_PER_CPU(u64, ivh_cs_prompt_hist[IVH_BEAT_AGE_HIST_BUCKETS]);
+
+/*
+ * EPISODE accounting -- the part this project got wrong once and must not get
+ * wrong again.
+ *
+ * Handoff rotation reported 3104 events/s and was worth approximately nothing,
+ * because the DURATION of those events was never measured, and because its
+ * event counter was sampled every PV_PREV_CHECK_MASK (0xff) iterations so one
+ * stall was counted repeatedly by the same waiter. Both defects are structural
+ * here, not incidental, so both are designed out:
+ *
+ *   - An EPISODE is keyed on the HOLDER'S acquisition TSC. A second, third and
+ *     256th fire against the same acq stamp extend the open episode; they do
+ *     not open a new one. Over-counting by re-sampling is therefore impossible
+ *     by construction, not by convention.
+ *   - ivh_cs_fired / ivh_cs_ep_events IS the over-count factor rotation never
+ *     computed. Report it.
+ *   - A new acq stamp (the holder changed) CLOSES the open episode and opens a
+ *     fresh one, so an episode can never span two holds.
+ *
+ * Closed at three exits, kept separate because they mean different things:
+ *   ACQUIRED        - we got the lock. duration = the time we spun after
+ *                     detecting a dead holder. THIS IS THE RECOVERABLE TIME
+ *                     and the only number the go/no-go in sec 5 turns on.
+ *   HOLDER_CHANGED  - a different acq stamp appeared while we still spun. A
+ *                     true upper bound on what was recoverable.
+ *   EXHAUST         - we ran out of spin budget and are about to pv_wait().
+ *                     TRUNCATED: a lower bound, never a measurement.
+ */
+#define IVH_CS_EP_ACQUIRED	0
+#define IVH_CS_EP_HOLDER_CHANGED 1
+#define IVH_CS_EP_EXHAUST	2
+#define IVH_CS_EP_NR		3
+
+DECLARE_PER_CPU(u64, ivh_cs_ep_events);
+DECLARE_PER_CPU(u64, ivh_cs_ep_events_by_end[IVH_CS_EP_NR]);
+DECLARE_PER_CPU(u64, ivh_cs_ep_cycles[IVH_CS_EP_NR]);
+DECLARE_PER_CPU(u64, ivh_cs_ep_hist[IVH_CS_EP_NR][IVH_BEAT_AGE_HIST_BUCKETS]);
+
+/*
+ * CONTROL. Without this the episode numbers are unfalsifiable: a detected
+ * episode being 300 us long means nothing unless undetected head tenures are
+ * shorter. Index 0 = no detection during this tenure, 1 = at least one. Closed
+ * at the same three exits, measuring the WHOLE tenure, not just the episode.
+ *
+ * ivh_cs_prev_hold_hist is the population-correct denominator for the
+ * false-positive audit: every time a head acquires a lock whose predecessor's
+ * stamp it could read, it records how long that predecessor actually held it.
+ * That is the real distribution of CONTENDED hold durations -- which is the
+ * only population this predicate ever judges. If ivh_cs_ep_hist sits inside
+ * the bulk of this distribution we are firing on normal long holds; if it sits
+ * in a separate mode above its p99.9, we are firing on anomalies. Obtained for
+ * free on the observer side, so it needs no release-path instrumentation.
+ */
+DECLARE_PER_CPU(u64, ivh_cs_tenure_cycles[2]);
+DECLARE_PER_CPU(u64, ivh_cs_tenure_hist[2][IVH_BEAT_AGE_HIST_BUCKETS]);
+DECLARE_PER_CPU(u64, ivh_cs_prev_hold_hist[IVH_BEAT_AGE_HIST_BUCKETS]);
+
+/* Stage B only. Head halts split by cause, mirroring ivh_node_halt_record(). */
+#define IVH_CS_HALT_EXHAUST	0
+#define IVH_CS_HALT_CS		1
+#define IVH_CS_HALT_NR		2
+DECLARE_PER_CPU(u64, ivh_cs_head_bailed);
+DECLARE_PER_CPU(u64, ivh_head_spin_iters_bail_sum);
+DECLARE_PER_CPU(u64, ivh_head_spin_bail_attempts);
+DECLARE_PER_CPU(u64, ivh_head_halt_cycles[IVH_CS_HALT_NR]);
+DECLARE_PER_CPU(u64, ivh_head_halt_events[IVH_CS_HALT_NR]);
+DECLARE_PER_CPU(u64, ivh_head_halt_hist[IVH_CS_HALT_NR][IVH_BEAT_AGE_HIST_BUCKETS]);
 
 /*
  * Publish this CPU's heartbeat. rdtsc(), NOT rdtsc_ordered() -- this is a

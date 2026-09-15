@@ -138,6 +138,20 @@ static inline void queued_spin_unlock(struct qspinlock *lock)
 	 * same posture as the matching stamp on the acquire side.
 	 */
 	ivh_lock_clear_holder(lock);
+	/*
+	 * is_cs_preempted()'s owner clear. Gated on its own sysctl, default 0:
+	 * this is the ONE call this feature places on the uncontended unlock
+	 * fastpath, and its cost must be separately measurable from the
+	 * stamp's (acceptance check A7b). It is compiled into the Stage A
+	 * build because it is the only AIRTIGHT close of the
+	 * RUNNING-at-handoff race (2026-09-14 build plan sec 1.2/1.4); Stage A
+	 * is measured with it on (authoritative) and off (gated) in one boot.
+	 *
+	 * Strictly before pv_queued_spin_unlock(), for the reason R1/R2/R2b
+	 * already document: the moment the lock byte clears, another CPU may
+	 * own the lock, and a clear placed after would wipe ITS stamp.
+	 */
+	ivh_cs_owner_release(lock);
 	pv_queued_spin_unlock(lock);
 }
 
