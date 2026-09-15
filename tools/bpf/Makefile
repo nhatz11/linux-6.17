@@ -127,3 +127,32 @@ resolve_btfids_clean:
 .PHONY: all install clean bpftool bpftool_install bpftool_clean \
 	runqslower runqslower_clean \
 	resolve_btfids resolve_btfids_clean
+
+# ---------------------------------------------------------------------------
+# IVH migration daemon. `make MY_ivh_atc` used to fall through to make's
+# implicit %: %.c rule, which neither regenerated the skeleton nor linked the
+# right libbpf, and goto_mode.sh hides its output -- so a source change never
+# reached the binary. The loader MUST link the patched libbpf from the rseqport
+# tree: it is the one that knows the "sched+" section; the libbpf under
+# resolve_btfids does not, and the program then fails to load with -EINVAL.
+# ---------------------------------------------------------------------------
+IVH_LIBBPF_SRC ?= /root/linux-6.17/tools/lib/bpf
+IVH_LIBBPF_OUT := $(CURDIR)/.ivh_libbpf/
+IVH_LIBBPF_A   := $(IVH_LIBBPF_OUT)libbpf.a
+
+$(IVH_LIBBPF_A):
+	$(Q)mkdir -p $(IVH_LIBBPF_OUT)
+	$(Q)$(MAKE) -C $(IVH_LIBBPF_SRC) OUTPUT=$(IVH_LIBBPF_OUT) $(IVH_LIBBPF_A)
+
+MY_ivh_atc.bpf.o: MY_ivh_atc.bpf.c vmlinux.h bpf_helpers.h bpf_helper_defs.h
+	clang -g -O2 -target bpf -I$(IVH_LIBBPF_SRC)/.. -c $< -o $@
+
+MY_ivh_atc.skel.h: MY_ivh_atc.bpf.o
+	bpftool gen skeleton $< name MY_ivh_atc > $@
+
+MY_ivh_atc: MY_ivh_atc.c MY_ivh_atc.skel.h $(IVH_LIBBPF_A)
+	gcc -O2 -Wall -I$(srctree)/tools/include/uapi -I$(IVH_LIBBPF_SRC)/.. \
+	    -I$(IVH_LIBBPF_SRC)/../../include/uapi $< -o $@ $(IVH_LIBBPF_A) -lelf -lz
+
+.PHONY: ivh_atc
+ivh_atc: MY_ivh_atc

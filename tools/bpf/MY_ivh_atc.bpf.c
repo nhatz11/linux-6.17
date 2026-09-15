@@ -376,7 +376,20 @@ static __always_inline u32 ivh_cap_source_now(void)
  * verdict.  This is what distinguishes the reshape from the Part C failure,
  * where the ranking itself was noise (see recalibration doc sec 4).
  */
-#define IVH_CAP_TOPBAND     50   /* K: dest must be within K of the best CPU in this scan */
+/*
+ * 2026-09-15: TOPBAND 50 -> 250 (and IVH_CAP_HARDFLOOR 700 -> 500 below).
+ * Under FULL host contention (co-runner on all 16 vCPUs) the per-CPU capacity
+ * spread is noise, yet the (50, 700) gate kept rejecting on it: capacity
+ * rejects rose ~5x, accepted migrations fell ~2/3, and IVH+AS hackbench sank
+ * from ~32 s to PV's ~50-55 s within three rounds. With (250, 500): ~32 s flat,
+ * CV 4-6%, no lockups. At HALF contention (co-runner on vCPUs 0-7) both gates
+ * are equal: hackbench 12.4 vs 12.3 s, dbench +19.9% vs +18.6% over PV, ebizzy
+ * +114.7% vs +115.1%. The contended half (~350) is still rejected by both the
+ * rail and the band. Data: tools/bpf/docs/
+ * ivh_sustained_load_drift_and_capacity_test_2026-09-15.md sec 8-10 in the
+ * /root/linux-6.17 docs repo. The (50,50) plateau analysis above predates this.
+ */
+#define IVH_CAP_TOPBAND    250   /* K: dest must be within K of the best CPU in this scan */
 #define IVH_CAP_MARGIN      20   /* D: dest must beat source by at least D            */
 
 /*
@@ -424,8 +437,12 @@ static __always_inline u32 ivh_cap_source_now(void)
  * If reject_reasons[REJ_CAPACITY_LOW] ever goes to ~100%, this has become the
  * binding gate, the reshape has failed, and the answer is recalibration doc
  * sec 8 (publish steal/elapsed instead) -- NOT lowering this number.
+ *
+ * 2026-09-15: 700 -> 500 despite the warning above, on measured evidence (see
+ * the note at IVH_CAP_TOPBAND). Under full contention this rail was not what
+ * bound -- the band was -- but 700 sat above most CPUs' capacity in that regime.
  */
-#define IVH_CAP_HARDFLOOR  700
+#define IVH_CAP_HARDFLOOR  500
 
 struct task_ctx {
     struct task_struct *curr;          /* task that is to be moved */
