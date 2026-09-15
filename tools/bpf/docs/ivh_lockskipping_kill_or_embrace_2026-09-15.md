@@ -120,3 +120,64 @@ stale-information objection. **Those are the two remaining reasons to look
 again. If Step 1 or Step 2 fails, the answer is kill, and the negative result is
 itself publishable as a design lesson: stealing already rescues the case that
 skipping targets.**
+
+## 7. Possible improvement: splice the tail by moving the tail pointer
+
+**Idea (user, 2026-09-15).** Today both paths refuse to splice a pick whose
+`->next` reads NULL, because the lock word still names that node as the tail and
+a concurrent enqueuer would clobber the splice (or be orphaned by it). Instead of
+refusing, **update the tail first**:
+
+```c
+after = READ_ONCE(pick->next);
+if (!after) {                                   /* pick looks like the tail */
+    if (cmpxchg_tail(lock, pick_code, prev_code) == pick_code) {
+        WRITE_ONCE(prev->next, NULL);           /* prev is the tail now */
+        WRITE_ONCE(pick->next, succ);           /* pick moves to the front */
+    } else {
+        /* an enqueue is in flight: abort the skip, promote succ */
+    }
+}
+```
+
+**Why the race closes.** The tail lives in `lock->val`, and `xchg_tail()` and this
+cmpxchg are both compare-and-swaps on that word, so they serialise:
+- arrival wins -> tail is D, our cmpxchg fails, we abort (safe);
+- we win -> tail is prev, the arrival's `xchg_tail()` returns prev and it links
+  behind prev, giving `pick -> succ -> ... -> prev -> D`.
+
+It also distinguishes the two cases a NULL `->next` cannot: a waiter mid-enqueue
+has already changed the tail, so the cmpxchg fails.
+
+**Why it matters.** With shallow queues the live waiter worth jumping to is very
+often the tail, so `ivh_rot_splice_blocked_tail` is a large share of the refused
+opportunities. In the 2026-09-14 Phase 1 data every "nobody to skip to" case was
+a queue that simply ended there.
+
+**Costs and open hazards (needs adversarial review before building):**
+1. Adds an atomic RMW to a handoff path that today uses only plain stores, on the
+   cacheline every arriving thread already contends.
+2. The cmpxchg must preserve `locked` and `pending`, and it interacts with the
+   steal path and the `(val & _Q_TAIL_MASK) == tail` uncontended exit
+   (`qspinlock.c:462`).
+3. Needs each node's own tail code `encode_tail(cpu, idx)`; `struct mcs_spinlock`
+   does not store `idx`. Cleanest: stash the 16-bit tail code in `pv_node` at
+   `pv_init_node()` time -- there are 2 free bytes after `rot_flags`, so sizeof
+   stays 32.
+4. Reviewer should attack: interaction with `pending` and the steal path; whether
+   `prev` can itself be mid-splice; what happens if `prev` is the node that just
+   acquired the lock.
+
+**Sequencing:** queue this behind Steps 1-2. If the opportunity measurement says
+there is nothing to act on even counting the tail-blocked cases, this cannot pay
+for itself.
+
+## 8. Known gap: no starvation cap in the unlock-time path
+
+G-LOCK-31's promotion-time splice counts skips in the skipped node's `rot_flags`
+(bits 2-7) and promotes it unconditionally at `ivh_pv_rot_skip_max` (default 4).
+**G-LOCK-32's `pv_deferred_handoff()` does not carry that cap.** Exposure is
+small in practice -- each skip costs one position, and a waiter can only be
+skipped again while it is still preempted, during which it could not have used
+the lock anyway -- but the cap must be added before any fairness bound is
+claimed for unlock-time skipping.
