@@ -251,3 +251,59 @@ So there are **two separate problems**:
    across runs), not IVH+AS. For G-LOCK-29 the stamp, the unlock-path gate and the
    head-halt timing are all mode-independent, so PV measures their cost. PV
    reference on G-LOCK-28: 52.97 s, sd 0.50 s.
+
+## 8. Gate-loosening A/B: the strict capacity gate is the cause (same night)
+
+Context from the user: **all 16 vCPUs are contended by the host sysbench
+co-runner**, so no destination is genuinely clean and the capacity differences
+the gate ranks on are not meaningful here.
+
+Test: `/root/ivh_tools/gate_loose_test.sh`, log `gate_loose_012448.log` (+
+`.snaps.jsonl`). Two scratch rebuilds of the running MY_ivh_atc source
+(`/root/kernels/linux-6.17-vanilla/tools/bpf/MY_ivh_atc.bpf.c`):
+- **N (normal):** `IVH_CAP_HARDFLOOR 700`, `IVH_CAP_TOPBAND 50` (the running values;
+  note the `/root/linux-6.17/tools/bpf` copy says 600 and is stale)
+- **L (loose):** `IVH_CAP_HARDFLOOR 500`, `IVH_CAP_TOPBAND 250` (capacity gate effectively off)
+
+Order N L L N P, 5 consecutive IVH+AS hackbench rounds per arm, capacity-settled
+wait before each arm. vcap_probe untouched; daemon swapped per arm.
+
+| arm | round times (s) | median | CV | migrations/s | CAP_LOW rejects/s | accepted/s | accept share |
+|---|---|---|---|---|---|---|---|
+| N | 35.2 48.2 53.1 52.8 55.2 | **52.8** | 16.5% | 878 | 70,620 | 1,215 | 1.3% |
+| L | 32.1 34.1 28.5 31.0 32.1 | **32.1** | 6.5% | 9,361 | 0 | 15,967 | 6.4% |
+| L | 31.5 32.5 31.9 29.1 31.3 | **31.5** | 4.1% | 10,576 | 0 | 16,875 | 5.2% |
+| N | 30.9 39.7 50.0 50.6 50.4 | **50.0** | 19.9% | 1,527 | 385,858 | 2,122 | 0.5% |
+| PV | 54.6 54.7 54.3 54.5 54.2 | **54.5** | 0.4% | 0 | 0 | 0 | — |
+
+- **The loose gate removes the drift.** Normal-gate arms start near 31-35 s and
+  sink to PV's level (50-55 s) by round 3; loose-gate arms hold at 28.5-34.1 s
+  for all 5 rounds, twice.
+- **Loose is ~38% faster than normal at the plateau and ~42% faster than PV**
+  (medians 31.8 vs 51.4 vs 54.5 s).
+- **Most of the "unexplained ~18% variance" of §6.4 was the gate too:** loose-arm
+  CV is 4-6%, normal-arm CV 17-20%.
+- With the capacity gate out of the way, `REJ_NOT_BETTER` becomes the main filter
+  (170-230k/s) and accepted migrations rise ~10x.
+- No soft-lockup / RCU-stall / hung-task warnings in either loose arm; no round
+  timed out. The migration-storm concern in the `IVH_CAP_HARDFLOOR` comment did
+  not show up on this workload.
+
+**Caveats:** one NLLN block on one workload (hackbench) in one host condition
+(full co-runner contention). The loose values were chosen to disable the gate,
+not tuned. Not yet checked: dbench/ebizzy, a partly contended host (where the gate
+has real clean destinations to prefer), or intermediate settings.
+
+**Implications:**
+1. Under full host contention the capacity gate is counterproductive: it keeps
+   IVH from migrating and pulls IVH+AS down to PV within ~3 rounds.
+2. Every IVH result measured with the strict gate under this co-runner likely
+   understates IVH, and its size depended on load history (§1).
+3. §7's rules still apply until a gate setting is adopted and re-validated.
+
+Rebuild notes (for making a variant): compile the BPF object with
+`clang -g -O2 -target bpf`, generate the skeleton with
+`bpftool gen skeleton ... name MY_ivh_atc`, and link the loader against the
+**patched libbpf from `/root/linux-6.17/tools/lib/bpf`** (it knows the `sched+`
+section). The libbpf under `resolve_btfids` does not, and the program fails to
+load with `-EINVAL`.
