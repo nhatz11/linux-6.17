@@ -307,3 +307,25 @@ Rebuild notes (for making a variant): compile the BPF object with
 **patched libbpf from `/root/linux-6.17/tools/lib/bpf`** (it knows the `sched+`
 section). The libbpf under `resolve_btfids` does not, and the program fails to
 load with `-EINVAL`.
+
+## 9. Half contention (co-runner moved to vCPUs 0-7), original daemon, normal gate
+
+`/root/ivh_tools/half_contention_check.sh`, order I P P I, 3 consecutive rounds
+per arm, capacity-settled wait before each arm. Log `half_contention_*.log`.
+
+| arm | round times (s) | mean | migrations/s | busy% vCPU 0-7 / 8-15 | capacity 0-7 / 8-15 |
+|---|---|---|---|---|---|
+| IVH+AS | 12.38 12.29 12.24 | 12.30 | 3,859 | 37 / 85 | 353 / 1023 |
+| PV | 58.90 59.94 60.02 | 59.62 | 0 | 64 / 76 | 338 / 882 |
+| PV | 63.95 65.47 61.95 | 63.79 | 0 | 62 / 77 | 348 / 875 |
+| IVH+AS | 12.26 12.25 12.23 | 12.24 | 3,914 | 36 / 85 | 348 / 1022 |
+
+- **IVH+AS 12.27 s (sd 0.06 s) vs PV 61.71 s (sd 2.6 s): 5.0x, 80% less time.**
+- **No drift** in either IVH arm, and IVH is far steadier than PV here.
+- IVH moves the work onto the clean half (busy 85% on vCPUs 8-15 vs 37% on 0-7).
+- With a genuinely clean half, the normal capacity gate does its job: clean vCPUs
+  read ~1022 and pass, contended ones read ~350 and are rejected. So the §6-§8 drift
+  is specific to **full** contention, where the gate has nothing real to prefer.
+- Not yet run here: the loose gate. By arithmetic it should behave the same (the
+  contended half at ~350 is below both the 500 floor and best-minus-250), but that
+  is unmeasured.
