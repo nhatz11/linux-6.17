@@ -157,6 +157,10 @@ static __always_inline u32  __pv_wait_head_or_lock(struct qspinlock *lock,
 						   struct mcs_spinlock *node,
 						   struct mcs_spinlock *prev)
 						   { return 0; }
+static __always_inline bool __pv_defer_promote(struct qspinlock *lock,
+					      struct mcs_spinlock *node,
+					      struct mcs_spinlock *next)
+					      { return false; }
 static __always_inline void __pv_handoff_rotate(struct qspinlock *lock,
 						struct mcs_spinlock *node,
 						struct mcs_spinlock **nextp) { }
@@ -170,6 +174,7 @@ static __always_inline void __pv_handoff_ack(struct qspinlock *lock,
 #define pv_kick_node		__pv_kick_node
 #define pv_wait_head_or_lock	__pv_wait_head_or_lock
 #define pv_handoff_rotate	__pv_handoff_rotate
+#define pv_defer_promote	__pv_defer_promote
 #define pv_handoff_ack		__pv_handoff_ack
 
 #ifdef CONFIG_PARAVIRT_SPINLOCKS
@@ -527,10 +532,17 @@ locked:
 	 * See pv_handoff_rotate() in qspinlock_paravirt.h for the per-store
 	 * safety argument.
 	 */
-	pv_handoff_rotate(lock, node, &next);
+	/*
+	 * G-LOCK-32: with ivh_pv_skip_point=1 the choice of the next waiter is
+	 * deferred to our unlock, where it is made with current state. Nothing is
+	 * promoted or kicked here in that case.
+	 */
+	if (!pv_defer_promote(lock, node, next)) {
+		pv_handoff_rotate(lock, node, &next);
 
-	arch_mcs_spin_unlock_contended(&next->locked);
-	pv_kick_node(lock, next);
+		arch_mcs_spin_unlock_contended(&next->locked);
+		pv_kick_node(lock, next);
+	}
 
 release:
 	trace_contention_end(lock, 0);
@@ -559,6 +571,7 @@ EXPORT_SYMBOL(queued_spin_lock_slowpath);
 #undef pv_wait_node
 #undef pv_kick_node
 #undef pv_wait_head_or_lock
+#undef pv_defer_promote
 #undef pv_handoff_rotate
 #undef pv_handoff_ack
 

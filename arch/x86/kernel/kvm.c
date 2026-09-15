@@ -1423,6 +1423,17 @@ unsigned long ivh_pv_tier2_enable = 1UL;	/* G-LOCK-31, see <asm/ivh_tsc_beat.h> 
 unsigned long ivh_cs_scan = 0UL;
 unsigned long ivh_cs_criterion = 0UL;
 unsigned long ivh_cs_noise_cycles = 22000UL;	/* 10 us at 2.2 GHz */
+/*
+ * G-LOCK-32. ivh_pv_skip_point: 0 (default) = choose the next waiter at
+ * promotion, before the holder's CS (G-LOCK-31 behaviour); 1 = defer the choice
+ * to unlock, so it is made with current state. ivh_pv_unlock_reserve controls
+ * the pending bit the deferring holder sets:
+ *   0 = the first waiter drops it when it halts (closest to stock)
+ *   1 = the holder clears it at release
+ *   2 = kept through the handoff; only the chosen waiter clears it (no stealing)
+ */
+unsigned long ivh_pv_skip_point = 0UL;
+unsigned long ivh_pv_unlock_reserve = 0UL;
 
 DEFINE_PER_CPU(u64, ivh_beat_agree_true);
 DEFINE_PER_CPU(u64, ivh_beat_agree_false);
@@ -1545,6 +1556,12 @@ DEFINE_PER_CPU(u64, ivh_cs_scan_hit);
 DEFINE_PER_CPU(u64, ivh_cs_scan_miss);
 DEFINE_PER_CPU(u64, ivh_cs_abstain_nolastcs);
 DEFINE_PER_CPU(u64, ivh_cs_bail_suppressed);
+DEFINE_PER_CPU(u64, ivh_defer_acquires);
+DEFINE_PER_CPU(u64, ivh_defer_handoffs);
+DEFINE_PER_CPU(u64, ivh_defer_skips);
+DEFINE_PER_CPU(u64, ivh_defer_stop_halted);
+DEFINE_PER_CPU(u64, ivh_defer_kicks);
+DEFINE_PER_CPU(u64, ivh_defer_no_successor);
 DEFINE_PER_CPU(u64, ivh_cs_abstain_rot);
 DEFINE_PER_CPU(u64, ivh_cs_abstain_tag);
 DEFINE_PER_CPU(u64, ivh_cs_abstain_skew);
@@ -2111,6 +2128,34 @@ static int ivh_cs_proc_owner_clear(const struct ctl_table *table, int write,
 	return 0;
 }
 
+/*
+ * G-LOCK-32: deferring the choice to unlock requires the owner stamp and the
+ * release-side clear, the same premises is_cs_preempted() needs (review F3).
+ */
+static int ivh_pv_proc_skip_point(const struct ctl_table *table, int write,
+				  void *buffer, size_t *lenp, loff_t *ppos)
+{
+	struct ctl_table tmp = *table;
+	unsigned long val = READ_ONCE(ivh_pv_skip_point);
+	int ret;
+
+	tmp.data = &val;
+	ret = proc_doulongvec_minmax(&tmp, write, buffer, lenp, ppos);
+	if (ret || !write)
+		return ret;
+	if (val > 1) {
+		pr_err("IVH: refusing ivh_pv_skip_point=%lu: valid values are 0 and 1\n", val);
+		return -EINVAL;
+	}
+	if (val && (READ_ONCE(ivh_cs_owner_enable) != 1 ||
+		    READ_ONCE(ivh_cs_owner_clear) != 1)) {
+		pr_err("IVH: refusing ivh_pv_skip_point=1: requires ivh_cs_owner_enable=1 and ivh_cs_owner_clear=1\n");
+		return -EINVAL;
+	}
+	WRITE_ONCE(ivh_pv_skip_point, val);
+	return 0;
+}
+
 /* G-LOCK-31: ivh_cs_scan needs the clear, or a released lock's tag misleads the scan. */
 static int ivh_cs_proc_scan(const struct ctl_table *table, int write,
 			    void *buffer, size_t *lenp, loff_t *ppos)
@@ -2350,6 +2395,22 @@ static const struct ctl_table ivh_pv_sysctls[] = {
 		.proc_handler	= proc_doulongvec_minmax,
 		.extra1		= &ivh_g31_zero,
 		.extra2		= &ivh_g31_one,
+	},
+	{
+		.procname	= "ivh_pv_skip_point",
+		.data		= &ivh_pv_skip_point,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= ivh_pv_proc_skip_point,
+	},
+	{
+		.procname	= "ivh_pv_unlock_reserve",
+		.data		= &ivh_pv_unlock_reserve,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+		.extra1		= &ivh_g31_zero,
+		.extra2		= &ivh_cs_owed_max,
 	},
 	{
 		.procname	= "ivh_cs_scan",

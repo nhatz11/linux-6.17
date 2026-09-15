@@ -2342,6 +2342,130 @@ gotlock:
 #include <asm/qspinlock_paravirt.h>
 
 /*
+ * G-LOCK-32: defer the choice of the next waiter to unlock time.
+ *
+ * Instead of promoting @next now (before our critical section), record it in the
+ * PV hash so our unlock can find it, mark the lock _Q_SLOW_VAL so the unlock
+ * takes the slow path, and set the pending bit as a reservation so arrivals
+ * enqueue instead of camping in pv_hybrid_queued_unfair_trylock(). @next cannot
+ * leave the queue while we hold the lock, so the recorded pointer stays valid
+ * for the whole CS -- that is what lets us give our qnode back as usual.
+ *
+ * Returns true when the promotion was deferred; the caller then does NOT
+ * promote or kick.
+ */
+static bool pv_defer_promote(struct qspinlock *lock, struct mcs_spinlock *node,
+			     struct mcs_spinlock *next)
+{
+	struct pv_node *pn = (struct pv_node *)next;
+
+	if (likely(!READ_ONCE(ivh_pv_skip_point)))
+		return false;
+	if (unlikely(!next)) {
+		this_cpu_inc(ivh_defer_no_successor);
+		return false;
+	}
+
+	/*
+	 * Hash before the _Q_SLOW_VAL store, the same ordering pv_kick_node() and
+	 * the head path use, so an unlock that observes SLOW_VAL is guaranteed to
+	 * find the entry. Review F4: the table cannot fill -- every entry is
+	 * charged to a distinct queued qnode, and a lock never has both a
+	 * deferred entry and a halted-head entry.
+	 */
+	(void)pv_hash(lock, pn);
+	WRITE_ONCE(lock->locked, _Q_SLOW_VAL);
+	set_pending(lock);
+
+	/*
+	 * Reserve policy 0: if the first waiter is already halted there is no
+	 * spinner for the reservation to protect, so drop it immediately and let
+	 * arrivals steal, which is what stock PV does once a head halts.
+	 */
+	if (READ_ONCE(ivh_pv_unlock_reserve) == 0) {
+		smp_mb();
+		if (READ_ONCE(pn->state) != VCPU_RUNNING)
+			clear_pending(lock);
+	}
+
+	this_cpu_inc(ivh_defer_acquires);
+	return true;
+}
+
+/*
+ * G-LOCK-32: the unlock-side half. @first is the waiter the holder deferred.
+ * Walk forward skipping PREEMPTED waiters (VCPU_RUNNING but silent), stop at a
+ * HALTED one (fairness: never skip a waiter that halted on purpose), splice the
+ * chosen one to the front, then release and promote.
+ */
+static void pv_deferred_handoff(struct qspinlock *lock, struct pv_node *first)
+{
+	struct mcs_spinlock *pick = &first->mcs;
+	struct pv_node *pp;
+	u8 old = VCPU_HALTED;
+
+	this_cpu_inc(ivh_defer_handoffs);
+
+	if (READ_ONCE(ivh_pv_rot_enable)) {
+		unsigned long src = READ_ONCE(ivh_pv_preempt_src);
+		u64 thr = READ_ONCE(ivh_pv_beat_threshold);
+		u64 now = rdtsc();
+		struct mcs_spinlock *prev = NULL, *n = pick, *nn, *after;
+		bool found = false;
+		int hop, cls;
+
+		for (hop = 0; hop < IVH_ROT_HOP_CAP; hop++) {
+			cls = ivh_rot_class(n, src, thr, now);
+			if (cls == IVH_ROT_LIVE) {
+				found = true;
+				break;
+			}
+			if (cls == IVH_ROT_HALTED) {
+				if (hop)
+					this_cpu_inc(ivh_defer_stop_halted);
+				break;
+			}
+			nn = READ_ONCE(n->next);	/* PREEMPTED: try to move past */
+			if (!nn)
+				break;		/* tail: nothing to skip to */
+			prev = n;
+			n = nn;
+		}
+		if (found && prev) {
+			after = READ_ONCE(n->next);
+			if (after) {		/* never splice through a NULL ->next */
+				WRITE_ONCE(prev->next, after);
+				WRITE_ONCE(n->next, pick);
+				pick = n;
+				this_cpu_inc(ivh_defer_skips);
+			}
+		}
+	}
+
+	/* Review F2: pending -> release -> promote, in that order. */
+	if (READ_ONCE(ivh_pv_unlock_reserve) != 2)
+		clear_pending(lock);
+	smp_store_release(&lock->locked, 0);
+
+	/*
+	 * Review F1 (mandatory): a halted node waiter sleeps on
+	 * pv_wait(&pn->state, VCPU_HALTED). Only a STATE CHANGE ends that wait --
+	 * the kick alone does not latch in the no-PV-unhalt spin path, the IRQ-off
+	 * spin path, or IPI mode. Set ->locked first so a waiter that is still
+	 * spinning simply observes it, then flip HALTED->RUNNING and kick only if
+	 * the flip won. Never pv_hash()/pv_kick_node() the pick here: that would
+	 * leave an orphan entry and hang a later deferral.
+	 */
+	WRITE_ONCE(pick->locked, 1);
+	smp_mb__before_atomic();
+	pp = (struct pv_node *)pick;
+	if (try_cmpxchg_relaxed(&pp->state, &old, VCPU_RUNNING)) {
+		this_cpu_inc(ivh_defer_kicks);
+		pv_kick(pp->cpu);
+	}
+}
+
+/*
  * PV versions of the unlock fastpath and slowpath functions to be used
  * instead of queued_spin_unlock().
  */
@@ -2371,6 +2495,17 @@ __pv_queued_spin_unlock_slowpath(struct qspinlock *lock, u8 locked)
 	 * Therefore start by looking up the blocked node and unhashing it.
 	 */
 	node = pv_unhash(lock);
+
+	/*
+	 * G-LOCK-32: dispatch on the NODE, not on ivh_pv_skip_point, so a lock
+	 * acquired in either mode always releases correctly even if the knob is
+	 * flipped mid-flight. A promoted head always has mcs.locked == 1; a
+	 * deferred first waiter has never been promoted, so it reads 0.
+	 */
+	if (READ_ONCE(node->mcs.locked) == 0) {
+		pv_deferred_handoff(lock, node);
+		return;
+	}
 
 	/*
 	 * Now that we have a reference to the (likely) blocked pv_node,

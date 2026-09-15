@@ -860,7 +860,16 @@ DECLARE_PER_CPU(u64, ivh_rot_stop_halted);	/* walk met a VCPU_HALTED waiter at h
 DECLARE_PER_CPU(u64, ivh_cs_scan_hit);
 DECLARE_PER_CPU(u64, ivh_cs_scan_miss);
 DECLARE_PER_CPU(u64, ivh_cs_abstain_nolastcs);	/* criterion 1: holder CPU has no last CS yet (partition 1 term) */
-DECLARE_PER_CPU(u64, ivh_cs_bail_suppressed);	/* hit, but already hashed and SLOW_VAL gone: nobody would wake us */
+DECLARE_PER_CPU(u64, ivh_cs_bail_suppressed);
+/* G-LOCK-32: deferred promotion (choose the next waiter at unlock). */
+extern unsigned long ivh_pv_skip_point;
+extern unsigned long ivh_pv_unlock_reserve;
+DECLARE_PER_CPU(u64, ivh_defer_acquires);	/* holds that deferred a promotion */
+DECLARE_PER_CPU(u64, ivh_defer_handoffs);	/* unlocks that took the deferred path */
+DECLARE_PER_CPU(u64, ivh_defer_skips);		/* handoffs that skipped >= 1 preempted waiter */
+DECLARE_PER_CPU(u64, ivh_defer_stop_halted);	/* walk stopped at a halted waiter */
+DECLARE_PER_CPU(u64, ivh_defer_kicks);		/* deferred handoffs that had to wake the pick */
+DECLARE_PER_CPU(u64, ivh_defer_no_successor);	/* hit, but already hashed and SLOW_VAL gone: nobody would wake us */
 DECLARE_PER_CPU(u64, ivh_cs_abstain_rot);
 DECLARE_PER_CPU(u64, ivh_cs_abstain_tag);
 DECLARE_PER_CPU(u64, ivh_cs_abstain_skew);
