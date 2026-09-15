@@ -145,3 +145,123 @@ Verdicts: **CANDIDATE** (all blocks agree, median >= +5%), **REGRESSION**
 ## 6. Results
 
 To be filled in when the run completes.
+
+## 7. Full inventory: tried vs not tried, kernel vs userspace
+
+Numbers are median IVH-vs-PV across blocks (8 for confirmed candidates, 3 for the
+rest). Positive = IVH better. Half contention, kernel G-LOCK-30, loose gate.
+
+### 7.1 KERNEL-SPACE contention -- IMPROVED (16)
+
+| workload | gain | blocks | kernel lock exercised |
+|---|---|---|---|
+| fs_mark (tmpfs) | **+167%** | 8/8 | dcache/inode, VFS metadata |
+| perf sched pipe | **+147%** | 8/8 | pipe mutex + rq locks |
+| ebizzy mmap | **+104%** | 8/8 | `mmap_lock` (rwsem `wait_lock`) |
+| stress-ng dentry | **+100%** | 8/8 | dcache spinlocks |
+| hackbench pipe-threads | **+76%** | 8/8 | pipe + scheduler |
+| hackbench socket-threads | **+75%** | 8/8 | `unix_state_lock`, `sk_receive_queue.lock` |
+| hackbench pipe-processes | **+62%** | 8/8 | pipe + scheduler |
+| perf epoll wait | **+54%** | 8/8 | `ep->lock`, waitqueue |
+| stress-ng flock | **+44%** | 8/8 | `blocked_lock_lock`, `flc_lock` |
+| stress-ng mmap | **+23%** | 8/8 | `mmap_lock` |
+| stress-ng sock | **+20%** | 8/8 | socket + sk queue locks |
+| dbench (16 clients) | **+19%** | 8/8 | VFS metadata + fsync |
+| stress-ng pipe | **+16%** | 8/8 | pipe mutex |
+| will-it-scale mmap1 / mmap2 | +10.9 / +10.4% | 3/3 | `mmap_lock` |
+| perf syscall basic | +10.3% | 6/6 | syscall entry path |
+| stress-ng futex | +10.5% | 8/8 | futex `hb->lock` |
+| schbench | +6.9% | 3/3 | scheduler wakeup |
+
+### 7.2 KERNEL-SPACE -- REGRESSED (17)
+
+| workload | loss | category | fixable? |
+|---|---|---|---|
+| netperf TCP_RR | −44% | latency-bound pair | **yes**: migration eligibility gate (exclude tight comm pairs) |
+| iperf3 (16 flows) | −34% | latency/locality | **yes**: same gate |
+| will-it-scale tlb_flush1 | −29% | migration spreads `mm_cpumask` -> more shootdown IPIs | **yes**: same mechanism the daemon already uses to exclude JIT processes |
+| netperf TCP_STREAM | −18% | latency/locality | **yes**: same gate |
+| will-it-scale futex4 | −16% | saturated micro | no -- inherent, aggregate |
+| will-it-scale dup1 | −12% | saturated micro | no -- inherent, aggregate |
+| will-it-scale eventfd1 | −11% | saturated micro | no -- inherent, aggregate |
+| will-it-scale futex2 | −10% | saturated micro | no -- inherent, aggregate |
+| will-it-scale lock1 / lock2 | −10 / −9% | saturated micro | no -- inherent, aggregate |
+| will-it-scale unix1 | −9% | saturated micro | no -- inherent, aggregate |
+| will-it-scale unlink1 / unlink2 | −7.7 / −7.4% | saturated micro | no -- inherent, aggregate |
+| will-it-scale open1 | −7.2% | saturated micro | no -- inherent, aggregate |
+| perf futex hash | −7.0% | saturated micro | no -- inherent, aggregate |
+| will-it-scale pipe1 | −5.9% | saturated micro | no -- inherent, aggregate |
+| will-it-scale fallocate1 | −5.8% | saturated micro | no -- inherent, aggregate |
+| perf futex wake-parallel | invalid | sub-ms metric, +-66% variance | **drop, do not report** |
+
+**The saturated-micro rule:** 16 threads, one syscall in a tight loop, zero work
+between calls, every vCPU busy. No idle destination to migrate to and no
+preempted holder to rescue, so IVH can only cost. Report as one aggregated
+sentence ("13 saturated will-it-scale microbenchmarks cost 6-16%"), not 13 rows.
+
+Contrast inside our own data: stress-ng flock **+44%** and hackbench **+75%** hit
+the *same* kernel locks as will-it-scale lock1 (−10%) and unix1 (−9%). The
+difference is spare capacity and real work, not the lock.
+
+### 7.3 KERNEL-SPACE -- NEUTRAL (<5%, 21) and NOISY (5)
+
+Neutral: perf sched messaging +4.4, perf epoll ctl +4.4, will-it-scale pread1,
+getppid1, poll1, write1, posix_semaphore1, futex1, futex3, sched_yield, lseek1,
+signal1, pwrite1, open2, page_fault1/2/3, context_switch1, read1, perf futex
+lock-pi, fio (tmpfs).
+Noisy (direction flips between blocks): will-it-scale brk1 +43, perf futex wake
++38, will-it-scale tlb_flush2 +13, stress-ng fork +10, perf futex requeue −6.7.
+
+These are "IVH costs nothing here" -- worth one line, not a table. The noisy ones
+need longer runs before any claim.
+
+### 7.4 USERSPACE locks -- results (10)
+
+| workload | result | lock | engineering path |
+|---|---|---|---|
+| sysbench mutex | **+24%** | pthread_mutex -> futex | already wins (blocks through kernel futex path) |
+| Phoenix word_count | +4.3% (3/3, under floor) | pthread_mutex | **AFL port** could push it over 5% |
+| spinbench short / med / long | −0.5 / +1.2 / −0.9% | `pthread_spinlock_t` | **AFL port + `extend()`/`unextend()`** -- this is the designed case |
+| libslock MCS / ticket | +2.1 / −1.7% | userspace MCS / ticket | **AFL port** |
+| libslock TAS / TTAS | −6.6 / +11.1%, both noisy | userspace TAS/TTAS | **AFL port**; noisy because they spin with no backoff |
+| ebizzy malloc | −0.8% | glibc malloc arena | patched glibc already instruments it; AFL swap possible |
+| Phoenix kmeans | **−8.7%** | pthread_mutex + condvar | **AFL port** (blocked: AFL has no condvar) **or `ivh_exclude`** |
+| sysbench threads | **−30%** | pthread_mutex + `sched_yield` | likely migration churn; `ivh_exclude` first, then AFL |
+| stress-ng sem | **−19%** | POSIX semaphores -> futex | AFL has no semaphore API; `ivh_exclude` first |
+
+**Pattern:** unmodified userspace lock workloads are flat or negative, never
+positive. The two userspace wins (sysbench mutex, stress-ng futex) are the ones
+that *block through the kernel futex path*, where kernel spinlocks are exercised.
+Pure userspace spinning (spinbench, libslock) is invisible to IVH until ported.
+
+### 7.5 NOT TRIED
+
+**Kernel-space, no source changes needed**
+- `locktorture` -- needs `CONFIG_LOCK_TORTURE_TEST`; fold into the next kernel build
+- will-it-scale `_processes` variants (~60) -- different lock mix (no shared mm)
+- kernel build / kernbench -- the standard "real work" benchmark in this literature
+- fxmark (filesystem scalability ladder), filebench, compilebench, MOSBench, LEBench
+- PostgreSQL + pgbench, MySQL/InnoDB + sysbench-oltp
+- memcached + memtier, Redis + memtier
+- nginx + wrk, Apache + ab
+
+**Userspace, needs the AFL port / `extend()` / `sys_ivh_cs_enter()`**
+- PARSEC: **dedup** (`pthread_spinlock_t`, zero source changes needed with the
+  patched glibc), **streamcluster** / **fluidanimate** (hand-rolled trylock
+  barrier), plus the rest as controls
+- RocksDB `db_bench` with SpinMutex, LevelDB `db_bench`
+- TBB `spin_mutex`, Abseil/tcmalloc SpinLock, InnoDB spin-then-sleep mutex
+- SPLASH-2/3/4 -- **dropped**: all 14 codes use `pthread_mutex`, no spinlocks
+- Phoenix remaining apps (histogram, string_match, pca, linear_regression), Metis
+
+### 7.6 What to do with each group in the paper
+
+| group | treatment |
+|---|---|
+| 16 kernel-space wins | the results table; lead with the application-level ones |
+| 4 fixable regressions (3 network + tlb_flush1) | show the migration eligibility gate fixing them; turns a weakness into a contribution |
+| 13 saturated micro regressions | one aggregated sentence as a stated limitation |
+| 21 neutral | one line: "IVH costs nothing on 21 further workloads" |
+| 5 noisy | omit, or re-run longer before claiming anything |
+| 9 userspace | scope statement: not wired up yet; AFL port is future work |
+| invalid metric | drop |
