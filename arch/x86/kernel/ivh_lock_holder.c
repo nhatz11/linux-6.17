@@ -64,7 +64,16 @@ static __always_inline struct ivh_holder_slot *ivh_holder_slot_of(struct qspinlo
 
 void __ivh_lock_set_holder(struct qspinlock *lock)
 {
-	struct ivh_holder_slot *slot = ivh_holder_slot_of(lock);
+	unsigned long en = READ_ONCE(ivh_lock_holder_enabled);
+	struct ivh_holder_slot *slot;
+
+	/* G-LOCK-30: the fast-path owner stamp rides this gate; see the bitmask
+	 * comment in <linux/ivh_lock_holder.h>. */
+	if (en & IVH_HOLDER_EN_CS_FAST)
+		__ivh_cs_owner_stamp(lock);
+	if (!(en & IVH_HOLDER_EN_TABLE))
+		return;
+	slot = ivh_holder_slot_of(lock);
 
 	if (unlikely(!slot))
 		return;
@@ -77,7 +86,12 @@ EXPORT_SYMBOL_GPL(__ivh_lock_set_holder);
 
 void __ivh_lock_clear_holder(struct qspinlock *lock)
 {
-	struct ivh_holder_slot *slot = ivh_holder_slot_of(lock);
+	struct ivh_holder_slot *slot;
+
+	/* The owner-stamp clear is ivh_cs_owner_release(), on its own gate. */
+	if (!(READ_ONCE(ivh_lock_holder_enabled) & IVH_HOLDER_EN_TABLE))
+		return;
+	slot = ivh_holder_slot_of(lock);
 
 	if (unlikely(!slot))
 		return;

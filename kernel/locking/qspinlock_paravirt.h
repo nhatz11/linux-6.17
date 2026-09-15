@@ -158,6 +158,14 @@ static inline bool pv_hybrid_queued_unfair_trylock(struct qspinlock *lock)
 			if (unlikely(READ_ONCE(ivh_pv_rot_probe)) &&
 			    (val & _Q_TAIL_MASK))
 				this_cpu_inc(ivh_rot_steals);
+			/*
+			 * G-LOCK-30, site A6: a stealer is a holder a queue head
+			 * with no predecessor may be waiting on. Same gate bit as
+			 * the fast path (A1/A2 via ivh_lock_set_holder()).
+			 */
+			if (unlikely(READ_ONCE(ivh_lock_holder_enabled) &
+				     IVH_HOLDER_EN_CS_FAST))
+				__ivh_cs_owner_stamp(lock);
 			return true;
 		}
 		if (!(val & _Q_TAIL_MASK) || (val & _Q_PENDING_MASK))
@@ -478,6 +486,29 @@ static inline bool is_wait_preempted(int cpu, bool tier2)
 }
 
 /*
+ * G-LOCK-30: find the holder of @lock for a queue head with no predecessor, by
+ * scanning the per-CPU owner slots for a tag match. Sound only with the
+ * release-side clear armed (ivh_cs_owner_clear), which the caller checks: the
+ * clear runs strictly before the releasing store, so a slot that still names
+ * @lock belongs to a CPU that has not yet released it. Nested or IRQ-context
+ * acquisitions on the holder's CPU overwrite or clear its single slot, which
+ * can only turn a hit into a miss -- the abstain direction. 16 loads on this
+ * guest, taken every PV_PREV_CHECK_MASK iterations, not per iteration.
+ */
+static noinline int ivh_cs_owner_find(struct qspinlock *lock)
+{
+	int self = smp_processor_id(), cpu;
+
+	for_each_online_cpu(cpu) {
+		if (cpu == self)
+			continue;
+		if (READ_ONCE(per_cpu(ivh_cs_owner, cpu).lock) == (void *)lock)
+			return cpu;
+	}
+	return -1;
+}
+
+/*
  * Is the CURRENT HOLDER of @lock -- not our predecessor-as-a-waiter, which is
  * what pv_wait_early()'s tier 1 and tier 2 answer -- host-preempted?
  *
@@ -516,18 +547,30 @@ static inline bool is_wait_preempted(int cpu, bool tier2)
 static inline bool is_cs_preempted(struct qspinlock *lock, struct pv_node *prev,
 				   u64 *acq_out, u64 *held_out)
 {
+	int cpu;
 	struct ivh_cs_owner *o;
 	u64 acq, beat, now;
 	s64 held;
 
 	/* ivh_cs_check_calls is counted by the caller, ivh_cs_head_probe_one(),
 	 * so the tenure-gate abstains fall inside the same partition. */
-	if (!prev) {
-		/* Role B: first thread queued, xchg_tail() returned no prior
-		 * tail, so there is no predecessor and no identity. Structural,
-		 * not a bug -- counted so its size is known rather than
-		 * assumed. See ivh_head_waiter_adaptive_spinning_design
-		 * _2026-09-14.md sec 1 role B. */
+	if (prev) {
+		cpu = prev->cpu;
+	} else if ((READ_ONCE(ivh_lock_holder_enabled) & IVH_HOLDER_EN_CS_FAST) &&
+		   READ_ONCE(ivh_cs_owner_clear)) {
+		/* G-LOCK-30: no predecessor, but fast-path holders are stamped. */
+		cpu = ivh_cs_owner_find(lock);
+		if (cpu < 0) {
+			this_cpu_inc(ivh_cs_fast_lookup_miss);
+			this_cpu_inc(ivh_cs_abstain_noprev);
+			return false;
+		}
+		this_cpu_inc(ivh_cs_fast_lookup_hit);
+	} else {
+		/* Role B: first thread queued, no predecessor, no identity.
+		 * See ivh_is_cs_preempted_stage_a_results_2026-09-15.md: this
+		 * is ~98% of head spin samples, which is why G-LOCK-30 adds the
+		 * fast-path stamp above. */
 		this_cpu_inc(ivh_cs_abstain_noprev);
 		return false;
 	}
@@ -545,7 +588,7 @@ static inline bool is_cs_preempted(struct qspinlock *lock, struct pv_node *prev,
 		return false;
 	}
 
-	o = &per_cpu(ivh_cs_owner, prev->cpu);
+	o = &per_cpu(ivh_cs_owner, cpu);
 
 	/*
 	 * prev->cpu is safe to read at ANY time, and this is worth stating
@@ -606,12 +649,12 @@ static inline bool is_cs_preempted(struct qspinlock *lock, struct pv_node *prev,
 	 * here so the predicate does not depend on that staying true, and
 	 * ivh_cs_abstain_nohz must read exactly 0 in every run on this host.
 	 */
-	if (unlikely(tick_nohz_full_cpu(prev->cpu))) {
+	if (unlikely(tick_nohz_full_cpu(cpu))) {
 		this_cpu_inc(ivh_cs_abstain_nohz);
 		return false;
 	}
 
-	beat = READ_ONCE(per_cpu(ivh_tsc_beat, prev->cpu).stamp);
+	beat = READ_ONCE(per_cpu(ivh_tsc_beat, cpu).stamp);
 
 	/*
 	 * Second tag read. Under ivh_cs_owner_clear == 1 the clear commits

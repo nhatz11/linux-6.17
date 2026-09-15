@@ -1415,6 +1415,9 @@ unsigned long ivh_cs_tick_period  = 2200000UL;
 unsigned long ivh_cs_prompt_cycles = 19800UL;	/* 9 us at 2.2 GHz; recalibrated below */
 EXPORT_SYMBOL_GPL(ivh_cs_owner_enable);
 EXPORT_SYMBOL_GPL(ivh_cs_owner_clear);
+/* G-LOCK-30: mirror of IVH_HOLDER_EN_CS_FAST in ivh_lock_holder_enabled; the
+ * bit, not this variable, is what the lock paths read. */
+unsigned long ivh_cs_owner_fast = 0UL;
 
 DEFINE_PER_CPU(u64, ivh_beat_agree_true);
 DEFINE_PER_CPU(u64, ivh_beat_agree_false);
@@ -1530,6 +1533,8 @@ DEFINE_PER_CPU(u64, ivh_cs_clears);
 DEFINE_PER_CPU(u64, ivh_cs_stamp_overwrote);
 DEFINE_PER_CPU(u64, ivh_cs_check_calls);
 DEFINE_PER_CPU(u64, ivh_cs_abstain_noprev);
+DEFINE_PER_CPU(u64, ivh_cs_fast_lookup_hit);
+DEFINE_PER_CPU(u64, ivh_cs_fast_lookup_miss);
 DEFINE_PER_CPU(u64, ivh_cs_abstain_rot);
 DEFINE_PER_CPU(u64, ivh_cs_abstain_tag);
 DEFINE_PER_CPU(u64, ivh_cs_abstain_skew);
@@ -2001,6 +2006,68 @@ static int ivh_cs_proc_head_probe(const struct ctl_table *table, int write,
 }
 
 /*
+ * G-LOCK-30: ivh_cs_owner_fast arms the owner stamp on the uncontended acquire
+ * paths (A1/A2 via ivh_lock_set_holder(), A6 steals) so a queue head with no
+ * predecessor can find its holder by scanning the per-CPU slots. Refused
+ * unless the slowpath stamp and the release-side clear are both on: without the
+ * clear a released lock leaves its tag behind and the scan can name a CPU that
+ * no longer holds it. Enabling wipes every slot first, so stamps written while
+ * the clear was off cannot be read as live.
+ */
+static int ivh_cs_proc_owner_fast(const struct ctl_table *table, int write,
+				  void *buffer, size_t *lenp, loff_t *ppos)
+{
+	struct ctl_table tmp = *table;
+	unsigned long val = READ_ONCE(ivh_cs_owner_fast);
+	int ret, cpu;
+
+	tmp.data = &val;
+	ret = proc_doulongvec_minmax(&tmp, write, buffer, lenp, ppos);
+	if (ret || !write)
+		return ret;
+	if (val > 1) {
+		pr_err("IVH: refusing ivh_cs_owner_fast=%lu: valid values are 0 and 1\n", val);
+		return -EINVAL;
+	}
+	if (val && (READ_ONCE(ivh_cs_owner_enable) != 1 ||
+		    READ_ONCE(ivh_cs_owner_clear) != 1)) {
+		pr_err("IVH: refusing ivh_cs_owner_fast=1: requires ivh_cs_owner_enable=1 and ivh_cs_owner_clear=1\n");
+		return -EINVAL;
+	}
+	if (val) {
+		for_each_possible_cpu(cpu)
+			WRITE_ONCE(per_cpu(ivh_cs_owner, cpu).lock, NULL);
+		WRITE_ONCE(ivh_lock_holder_enabled,
+			   READ_ONCE(ivh_lock_holder_enabled) | IVH_HOLDER_EN_CS_FAST);
+	} else {
+		WRITE_ONCE(ivh_lock_holder_enabled,
+			   READ_ONCE(ivh_lock_holder_enabled) & ~IVH_HOLDER_EN_CS_FAST);
+	}
+	WRITE_ONCE(ivh_cs_owner_fast, val);
+	return 0;
+}
+
+/* G-LOCK-30: the clear may not be turned off while the fast stamp needs it. */
+static int ivh_cs_proc_owner_clear(const struct ctl_table *table, int write,
+				   void *buffer, size_t *lenp, loff_t *ppos)
+{
+	struct ctl_table tmp = *table;
+	unsigned long val = READ_ONCE(ivh_cs_owner_clear);
+	int ret;
+
+	tmp.data = &val;
+	ret = proc_doulongvec_minmax(&tmp, write, buffer, lenp, ppos);
+	if (ret || !write)
+		return ret;
+	if (!val && READ_ONCE(ivh_cs_owner_fast)) {
+		pr_err("IVH: refusing ivh_cs_owner_clear=0 while ivh_cs_owner_fast=1\n");
+		return -EINVAL;
+	}
+	WRITE_ONCE(ivh_cs_owner_clear, val);
+	return 0;
+}
+
+/*
  * ivh_cs_head_bail (Stage B): the only knob in this feature that changes
  * behaviour. Refused unless the detector is armed (ivh_cs_head_probe=1) --
  * bail acts on its verdicts and is gated on it at runtime anyway -- and unless
@@ -2188,7 +2255,14 @@ static const struct ctl_table ivh_pv_sysctls[] = {
 		.data		= &ivh_cs_owner_clear,
 		.maxlen		= sizeof(unsigned long),
 		.mode		= 0644,
-		.proc_handler	= proc_doulongvec_minmax,
+		.proc_handler	= ivh_cs_proc_owner_clear,
+	},
+	{
+		.procname	= "ivh_cs_owner_fast",
+		.data		= &ivh_cs_owner_fast,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= ivh_cs_proc_owner_fast,
 	},
 	{
 		.procname	= "ivh_cs_head_probe",

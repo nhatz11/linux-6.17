@@ -111,6 +111,19 @@ struct qspinlock;
 #define IVH_HOLDER_MIN_BITS	6
 
 extern unsigned long ivh_lock_holder_enabled;
+
+/*
+ * ivh_lock_holder_enabled is a BITMASK (G-LOCK-30). Folding the second user
+ * into the existing gate keeps the uncontended fast path at exactly one
+ * READ_ONCE + one branch when everything is off, as before.
+ *   IVH_HOLDER_EN_TABLE   -- the hash table below (no sysctl arms it yet)
+ *   IVH_HOLDER_EN_CS_FAST -- is_cs_preempted()'s per-CPU {lock, tsc} owner
+ *                            stamp on the uncontended acquire paths, so a
+ *                            queue head with no predecessor can find its
+ *                            holder. Set via the ivh_cs_owner_fast sysctl.
+ */
+#define IVH_HOLDER_EN_TABLE	1UL
+#define IVH_HOLDER_EN_CS_FAST	2UL
 extern unsigned long ivh_holder_bits;
 
 void __ivh_lock_set_holder(struct qspinlock *lock);

@@ -88,6 +88,7 @@ static inline void native_queued_spin_unlock(struct qspinlock *lock)
 	 * tag check and increments nothing.
 	 */
 	ivh_lock_clear_holder(lock);
+	ivh_cs_owner_release(lock);	/* G-LOCK-30: every release path clears */
 	smp_store_release(&lock->locked, 0);
 }
 

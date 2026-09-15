@@ -835,6 +835,10 @@ DECLARE_PER_CPU(u64, ivh_cs_stamps);
 DECLARE_PER_CPU(u64, ivh_cs_stamp_overwrote);
 DECLARE_PER_CPU(u64, ivh_cs_check_calls);
 DECLARE_PER_CPU(u64, ivh_cs_abstain_noprev);
+/* G-LOCK-30: holder lookup for no-predecessor heads (subset of check_calls, not a partition term) */
+DECLARE_PER_CPU(u64, ivh_cs_fast_lookup_hit);
+DECLARE_PER_CPU(u64, ivh_cs_fast_lookup_miss);
+extern unsigned long ivh_cs_owner_fast;
 DECLARE_PER_CPU(u64, ivh_cs_abstain_rot);
 DECLARE_PER_CPU(u64, ivh_cs_abstain_tag);
 DECLARE_PER_CPU(u64, ivh_cs_abstain_skew);
