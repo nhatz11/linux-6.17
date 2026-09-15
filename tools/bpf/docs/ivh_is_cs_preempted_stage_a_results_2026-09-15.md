@@ -126,3 +126,54 @@ new-gate daemon running. No kernel warnings.
 
 Same picture as half contention: the detector fires correctly, but the heads it
 can see hold almost no spin time. Kill criterion still fires.
+
+## 8. G-LOCK-30: fast-path owner stamp, and the replace-exhaustion A/B
+
+Kernel `6.17.0-G-LOCK-30-csfast+` (kernel commit `9be8425a00d2`): new sysctl
+`ivh_cs_owner_fast` stamps the per-CPU `{lock, tsc}` slot on the uncontended
+acquire paths (A1/A2) and PV steals (A6); a head with no predecessor scans the
+16 slots for its lock. Co-runner on all 16 vCPUs, migration ON, IVH+AS, new gate.
+Neutrality with switches off was not re-measured on this boot.
+
+Script `/root/ivh_tools/replace_exhaust.sh`, data `replace_exhaust_042212`. Order
+D F X B B X F D, 2 rounds per arm, capacity-settled wait before each arm. The
+host was much slower than earlier today (~70 s per round vs ~32 s).
+
+| arm | what | rounds (s) | mean | vs D |
+|---|---|---|---|---|
+| D | threshold 32768, everything off (today's config) | 67.5 73.4 73.8 75.9 | 72.7 | — |
+| F | threshold 32768, fast stamp on, no detection | 74.2 76.0 81.8 88.5 | 80.1 | **+10.3%** |
+| X | threshold max, no replacement | 71.4 76.6 77.5 83.4 | 77.2 | +6.3% |
+| B | threshold max, is_cs_preempted bail on every head | 91.5 82.6 74.2 80.3 | 82.1 | **+13.0%** |
+
+(Lower is better. One block; within-arm spread ~5-10%, so treat single-digit
+differences as indicative.)
+
+B-arm counters (two arms):
+
+| | arm 4 | arm 5 |
+|---|---|---|
+| no-predecessor lookups hit / miss | 5.55M / 14.26M | 4.60M / 12.70M |
+| checks still abstaining on noprev | 68.9% | 70.3% |
+| long holds (> 2 ticks) as share of checks | 12.3% | 11.8% |
+| of those, holder still ticking (no fire) | **96.3%** | **94.9%** |
+| bails -> head halts | 93,605 | 108,201 |
+| bail halt duration mean / p50 | 102 us / ~32 cycles | 75 us / ~32 cycles |
+
+D arms, for comparison: 41,679 and 43,561 exhaustion halts, mean ~720 us.
+
+**Result: it does not replace exhaustion.**
+1. **Stamping every uncontended lock costs ~10%** on this workload (F vs D).
+2. **Coverage is still poor:** a single per-CPU slot is overwritten by nested
+   acquisitions, so ~70% of no-predecessor checks still cannot find the holder.
+3. **Most long waits are behind a holder that is running.** 95-96% of holds longer
+   than 2 ticks had a holder that was still ticking (a slow critical section under
+   heavy steal, or a holder itself waiting on an inner lock). A preemption detector
+   correctly stays quiet there, but exhaustion used to cut those waits off. That is
+   the part of exhaustion's job this design cannot do.
+4. **When it fires, it is usually late:** most bail halts return almost immediately
+   (p50 ~32 cycles). A holder that has just resumed from host preemption keeps a
+   stale beat until its next tick, so the detector fires as the holder is about to
+   release.
+
+Machine state after the run: all `ivh_cs_*` off, threshold 32768, IVH+AS.
