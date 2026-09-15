@@ -110,3 +110,19 @@ disabled). Most of it is healthy short waiting, not preemption.
 
 All `ivh_cs_*` switches back to 0, `ivh_pv_spin_threshold` 32768, IVH+AS mode,
 new-gate daemon running. No kernel warnings.
+
+## 7. Re-run at full contention (co-runner on all 16 vCPUs), shorter
+
+`cs_detect_run.sh`, A-clr, threshold 16777216, DUR 30 s (one hackbench round each).
+
+| | migration ON | migration OFF |
+|---|---|---|
+| hackbench | 32.84 s | 55.12 s |
+| head spin samples with no predecessor | 98.0% | 97.9% |
+| distinct stalls caught | 2 (mean 0.51 ms) | 20 (mean 1.65 ms) |
+| stall time / all vCPU time | ~0.0001% | 20 x 1.65 ms / (56 s x 16) = **~0.004%** |
+| no-predecessor head spinning / all vCPU time | ~2.4% | ~2.9% |
+| healthy_long / long_hold | 0.01 | 0.38 |
+
+Same picture as half contention: the detector fires correctly, but the heads it
+can see hold almost no spin time. Kill criterion still fires.
