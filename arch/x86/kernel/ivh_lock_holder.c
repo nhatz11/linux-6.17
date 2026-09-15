@@ -197,6 +197,17 @@ void __ivh_cs_owner_clear(struct qspinlock *lock)
 {
 	s64 held;
 
+	u64 tsc;
+
+	if (this_cpu_read(ivh_cs_owner.lock) != (void *)lock)
+		return;
+	/*
+	 * G-LOCK-31: load the acquisition TSC BEFORE the NULL store, and re-check
+	 * the tag after loading it. An IRQ that stamps another lock between the
+	 * tag check and this read replaces tsc; the re-check catches that and
+	 * skips the last_cs sample rather than recording a corrupt hold.
+	 */
+	tsc = this_cpu_read(ivh_cs_owner.tsc);
 	if (this_cpu_read(ivh_cs_owner.lock) != (void *)lock)
 		return;
 	this_cpu_write(ivh_cs_owner.lock, NULL);
@@ -210,9 +221,13 @@ void __ivh_cs_owner_clear(struct qspinlock *lock)
 	 * line, and only contended acquisitions are stamped, so this is the
 	 * same population either way.
 	 */
-	held = (s64)(rdtsc() - this_cpu_read(ivh_cs_owner.tsc));
-	if (held > 0)
+	held = (s64)(rdtsc() - tsc);
+	if (held > 0) {
 		this_cpu_inc(ivh_cs_prev_hold_hist[held >= (1LL << 31) ?
 				IVH_BEAT_AGE_HIST_BUCKETS - 1 : ilog2((u64)held)]);
+		/* G-LOCK-31: written after the NULL store, so a reader that sees
+		 * the tag still naming a lock never pairs it with this value. */
+		this_cpu_write(ivh_cs_owner.last_cs, (u64)held);
+	}
 }
 EXPORT_SYMBOL_GPL(__ivh_cs_owner_clear);

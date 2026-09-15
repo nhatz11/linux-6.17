@@ -533,6 +533,7 @@ DECLARE_PER_CPU_ALIGNED(struct ivh_rot_rel, ivh_rot_rel);
 struct ivh_cs_owner {
 	void	*lock;	/* the qspinlock this CPU is holding; NULL == none */
 	u64	tsc;	/* raw rdtsc() at the moment of acquisition */
+	u64	last_cs;	/* G-LOCK-31: this CPU's last completed stamped hold, cycles; 0 == unknown */
 } ____cacheline_aligned_in_smp;
 
 DECLARE_PER_CPU_ALIGNED(struct ivh_cs_owner, ivh_cs_owner);
@@ -839,6 +840,27 @@ DECLARE_PER_CPU(u64, ivh_cs_abstain_noprev);
 DECLARE_PER_CPU(u64, ivh_cs_fast_lookup_hit);
 DECLARE_PER_CPU(u64, ivh_cs_fast_lookup_miss);
 extern unsigned long ivh_cs_owner_fast;
+/*
+ * G-LOCK-31 knobs.
+ *   ivh_pv_tier2_enable  1 (default) = today; 0 = non-head waiters never call
+ *                        is_wait_preempted() (tier 2 and the tier-1 confirm).
+ *   ivh_cs_scan          0 (default) = holder identity from prev only;
+ *                        1 = if prev is absent or its slot does not name the
+ *                        lock, scan the per-CPU owner slots. Needs owner_clear.
+ *   ivh_cs_criterion     0 (default) = G-LOCK-29/30 test: held > owed ticks AND
+ *                        holder heartbeat older than owed ticks;
+ *                        1 = held > holder CPU's last CS + ivh_cs_noise_cycles.
+ *   ivh_cs_noise_cycles  the noise constant for criterion 1.
+ */
+extern unsigned long ivh_pv_tier2_enable;
+extern unsigned long ivh_cs_scan;
+extern unsigned long ivh_cs_criterion;
+extern unsigned long ivh_cs_noise_cycles;
+DECLARE_PER_CPU(u64, ivh_rot_stop_halted);	/* walk met a VCPU_HALTED waiter at hop >= 1 and stopped */
+DECLARE_PER_CPU(u64, ivh_cs_scan_hit);
+DECLARE_PER_CPU(u64, ivh_cs_scan_miss);
+DECLARE_PER_CPU(u64, ivh_cs_abstain_nolastcs);	/* criterion 1: holder CPU has no last CS yet (partition 1 term) */
+DECLARE_PER_CPU(u64, ivh_cs_bail_suppressed);	/* hit, but already hashed and SLOW_VAL gone: nobody would wake us */
 DECLARE_PER_CPU(u64, ivh_cs_abstain_rot);
 DECLARE_PER_CPU(u64, ivh_cs_abstain_tag);
 DECLARE_PER_CPU(u64, ivh_cs_abstain_skew);

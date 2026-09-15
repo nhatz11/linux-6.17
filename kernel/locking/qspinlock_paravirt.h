@@ -548,58 +548,65 @@ static inline bool is_cs_preempted(struct qspinlock *lock, struct pv_node *prev,
 				   u64 *acq_out, u64 *held_out)
 {
 	int cpu;
+	bool clr, scan;
 	struct ivh_cs_owner *o;
 	u64 acq, beat, now;
 	s64 held;
 
 	/* ivh_cs_check_calls is counted by the caller, ivh_cs_head_probe_one(),
 	 * so the tenure-gate abstains fall inside the same partition. */
-	if (prev) {
-		cpu = prev->cpu;
-	} else if ((READ_ONCE(ivh_lock_holder_enabled) & IVH_HOLDER_EN_CS_FAST) &&
-		   READ_ONCE(ivh_cs_owner_clear)) {
-		/* G-LOCK-30: no predecessor, but fast-path holders are stamped. */
-		cpu = ivh_cs_owner_find(lock);
-		if (cpu < 0) {
-			this_cpu_inc(ivh_cs_fast_lookup_miss);
-			this_cpu_inc(ivh_cs_abstain_noprev);
-			return false;
-		}
-		this_cpu_inc(ivh_cs_fast_lookup_hit);
-	} else {
-		/* Role B: first thread queued, no predecessor, no identity.
-		 * See ivh_is_cs_preempted_stage_a_results_2026-09-15.md: this
-		 * is ~98% of head spin samples, which is why G-LOCK-30 adds the
-		 * fast-path stamp above. */
-		this_cpu_inc(ivh_cs_abstain_noprev);
-		return false;
-	}
-
 	/*
-	 * Hard interlock with handoff rotation. pv_handoff_rotate() REWRITES
-	 * ->next pointers in the queue, so under ivh_pv_rot_enable the node
-	 * that released our MCS baton need not be the node we linked behind,
-	 * and `prev` is then not the holder. The sysctl handlers refuse the
-	 * combination in both directions; this is the belt to that braces,
-	 * because the two knobs can in principle be raced against each other.
+	 * Handoff rotation rewrites ->next, so a head's prev need not be the
+	 * holder. With the release-side clear on (G-LOCK-31) that is harmless:
+	 * the skipped waiter queued on this lock cannot hold it and its slot
+	 * cannot carry an old stamp of it, so the tag compare misses, and the
+	 * head either scans (ivh_cs_scan) or abstains into exhaustion. Without
+	 * the clear an old stamp could match, so abstain outright.
 	 */
-	if (unlikely(READ_ONCE(ivh_pv_rot_enable))) {
+	clr = READ_ONCE(ivh_cs_owner_clear);
+	if (unlikely(READ_ONCE(ivh_pv_rot_enable) && !clr)) {
 		this_cpu_inc(ivh_cs_abstain_rot);
 		return false;
 	}
 
-	o = &per_cpu(ivh_cs_owner, cpu);
-
 	/*
-	 * prev->cpu is safe to read at ANY time, and this is worth stating
-	 * because it is the one place a stale pointer could have bitten:
-	 * qnodes[] is DEFINE_PER_CPU_ALIGNED (qspinlock.c:138) and
-	 * pv_init_node() stores pn->cpu = smp_processor_id(), so the ->cpu
-	 * field of the node at (cpu, idx) is that cpu, permanently, across
-	 * every reuse of the slot. It cannot go stale in a harmful direction.
-	 * The only real staleness question -- "is that CPU still the holder" --
-	 * is answered by the tag compare on the next line.
+	 * Holder identity. prev->cpu is a per-CPU constant of the qnode slot and
+	 * safe to read at any time. G-LOCK-31: with ivh_cs_scan (or G-LOCK-30's
+	 * fast mode for a head with no predecessor), a missing prev or a prev
+	 * slot that does not name this lock falls through to a scan of the
+	 * per-CPU owner slots. Fast-path holders are unstamped unless fast mode
+	 * is on, so the scan cannot find them: rule 2, exhaustion.
 	 */
+	cpu = prev ? prev->cpu : -1;
+	scan = clr && (READ_ONCE(ivh_cs_scan) ||
+		       (!prev && (READ_ONCE(ivh_lock_holder_enabled) &
+				  IVH_HOLDER_EN_CS_FAST)));
+	if (scan && (cpu < 0 ||
+		     READ_ONCE(per_cpu(ivh_cs_owner, cpu).lock) != (void *)lock)) {
+		int found = ivh_cs_owner_find(lock);
+
+		if (found < 0) {
+			this_cpu_inc(ivh_cs_scan_miss);
+			if (prev) {
+				this_cpu_inc(ivh_cs_abstain_tag);
+			} else {
+				this_cpu_inc(ivh_cs_fast_lookup_miss);
+				this_cpu_inc(ivh_cs_abstain_noprev);
+			}
+			return false;
+		}
+		this_cpu_inc(ivh_cs_scan_hit);
+		if (!prev)
+			this_cpu_inc(ivh_cs_fast_lookup_hit);
+		cpu = found;
+	}
+	if (cpu < 0) {
+		/* Role B: no predecessor, no scan, no identity. */
+		this_cpu_inc(ivh_cs_abstain_noprev);
+		return false;
+	}
+
+	o = &per_cpu(ivh_cs_owner, cpu);
 	if (READ_ONCE(o->lock) != (void *)lock) {
 		this_cpu_inc(ivh_cs_abstain_tag);
 		return false;
@@ -619,6 +626,38 @@ static inline bool is_cs_preempted(struct qspinlock *lock, struct pv_node *prev,
 		this_cpu_inc(ivh_cs_abstain_skew);
 		return false;
 	}
+
+	/*
+	 * G-LOCK-31 criterion 1: halt once the holder has held longer than its
+	 * CPU's last completed hold plus a noise margin. No heartbeat. Read order
+	 * is tag -> smp_rmb -> tsc -> last_cs -> tag again: the clear writes
+	 * last_cs only after NULLing the tag, and any nested hold that could
+	 * update last_cs overwrites the tag first, so the re-read rejects it.
+	 * Cannot tell a preempted holder from one running a longer CS than last
+	 * time; ivh_cs_noise_cycles is the knob for that.
+	 */
+	if (READ_ONCE(ivh_cs_criterion) == 1) {
+		u64 last = READ_ONCE(o->last_cs);
+
+		if (!last) {
+			this_cpu_inc(ivh_cs_abstain_nolastcs);
+			return false;
+		}
+		if ((u64)held <= last + READ_ONCE(ivh_cs_noise_cycles)) {
+			this_cpu_inc(ivh_cs_abstain_young);
+			return false;
+		}
+		this_cpu_inc(ivh_cs_long_hold);
+		if (READ_ONCE(o->lock) != (void *)lock) {
+			this_cpu_inc(ivh_cs_abstain_retag);
+			return false;
+		}
+		*acq_out  = acq;
+		*held_out = (u64)held;
+		this_cpu_inc(ivh_cs_fired);
+		return true;
+	}
+
 	if ((u64)held <= (u64)READ_ONCE(ivh_cs_tick_period) *
 			 READ_ONCE(ivh_cs_owed_ticks)) {
 		this_cpu_inc(ivh_cs_abstain_young);
@@ -773,7 +812,7 @@ static noinline u8 ivh_cs_tenure_gate(struct qspinlock *lock,
 	smp_mb();
 
 	/* No identity, or rotation: is_cs_preempted() abstains and counts. */
-	if (!prev || READ_ONCE(ivh_pv_rot_enable))
+	if (!prev || (READ_ONCE(ivh_pv_rot_enable) && !clr))
 		return IVH_CS_GATE_OK;
 
 	if (waitcnt)
@@ -1025,7 +1064,8 @@ pv_wait_early(struct pv_node *prev, unsigned long loop)
 		 * SLOWER. Same posture and precedent as
 		 * ivh_adaptive_irqoff_bail_gate above.
 		 */
-		if (mode == IVH_MODE_ADAPTIVE && confirm) {
+		if (mode == IVH_MODE_ADAPTIVE && confirm &&
+		    READ_ONCE(ivh_pv_tier2_enable)) {
 			if (is_wait_preempted(prev->cpu, false)) {
 				this_cpu_inc(ivh_beat_tier1_fired);
 				return PV_BAIL_TIER1_AGREED;
@@ -1053,6 +1093,10 @@ pv_wait_early(struct pv_node *prev, unsigned long loop)
 	 * transition from hot-spin to halt.
 	 */
 	if (mode != IVH_MODE_ADAPTIVE)
+		return PV_BAIL_NONE;
+
+	/* G-LOCK-31: no waiter-side staleness check at all with tier 2 off. */
+	if (!READ_ONCE(ivh_pv_tier2_enable))
 		return PV_BAIL_NONE;
 
 	return is_wait_preempted(prev->cpu, true) ? PV_BAIL_TIER2 : PV_BAIL_NONE;
@@ -1419,10 +1463,26 @@ static void pv_kick_node(struct qspinlock *lock, struct mcs_spinlock *node)
  * reports "never preempted", and rotation is self-disabling -- it can never
  * fire on a signal it does not have.
  */
-static __always_inline bool ivh_rot_stale(struct mcs_spinlock *n, unsigned long src,
-					  u64 thr, u64 now)
+#define IVH_ROT_LIVE		0
+#define IVH_ROT_PREEMPTED	1
+#define IVH_ROT_HALTED		2
+
+static __always_inline int ivh_rot_class(struct mcs_spinlock *n, unsigned long src,
+					 u64 thr, u64 now)
 {
 	struct pv_node *pn = (struct pv_node *)n;
+
+	/*
+	 * G-LOCK-31: state FIRST, then the heartbeat. A waiter that halted on
+	 * purpose (anything but VCPU_RUNNING) is HALTED regardless of its beat --
+	 * a tier-1 halt lands within 256 iterations of a publish, so its beat is
+	 * often still fresh. Only a waiter that is VCPU_RUNNING by its own account
+	 * and silent is PREEMPTED. Only the node's own CPU writes its state, and
+	 * walked nodes are never HASHED (pv_kick_node() only touches the node
+	 * being promoted).
+	 */
+	if (READ_ONCE(pn->state) != VCPU_RUNNING)
+		return IVH_ROT_HALTED;
 
 	/*
 	 * Deliberately NOT is_wait_preempted(): that function has mandatory
@@ -1441,9 +1501,10 @@ static __always_inline bool ivh_rot_stale(struct mcs_spinlock *n, unsigned long 
 	 * would never actually perform.
 	 */
 	if (src != 2)
-		return vcpu_is_preempted(pn->cpu);
+		return vcpu_is_preempted(pn->cpu) ? IVH_ROT_PREEMPTED : IVH_ROT_LIVE;
 
-	return (s64)(now - READ_ONCE(per_cpu(ivh_tsc_beat, pn->cpu).stamp)) > (s64)thr;
+	return (s64)(now - READ_ONCE(per_cpu(ivh_tsc_beat, pn->cpu).stamp)) > (s64)thr ?
+		IVH_ROT_PREEMPTED : IVH_ROT_LIVE;
 }
 
 /*
@@ -1491,7 +1552,7 @@ static noinline u8 ivh_rot_probe_walk(struct mcs_spinlock *next, bool probe,
 	u64 now = rdtsc();
 	struct mcs_spinlock *prev = next;
 	struct mcs_spinlock *n = next;
-	int hop;
+	int hop, cls;
 
 	pick->prev = NULL;
 	pick->live = NULL;
@@ -1499,7 +1560,11 @@ static noinline u8 ivh_rot_probe_walk(struct mcs_spinlock *next, bool probe,
 	if (probe)
 		this_cpu_inc(ivh_rot_handoffs);
 
-	if (!ivh_rot_stale(n, src, thr, now)) {
+	/*
+	 * G-LOCK-31: a HALTED next-in-line is promoted normally (pv_kick_node()
+	 * hashes it so the unlock wakes it), same as a live one.
+	 */
+	if (ivh_rot_class(n, src, thr, now) != IVH_ROT_PREEMPTED) {
 		if (probe)
 			this_cpu_inc(ivh_rot_depth_hist[0]);
 		return 0;
@@ -1549,7 +1614,17 @@ static noinline u8 ivh_rot_probe_walk(struct mcs_spinlock *next, bool probe,
 		 */
 		prev = n;
 		n = nn;
-		if (!ivh_rot_stale(n, src, thr, now)) {
+		cls = ivh_rot_class(n, src, thr, now);
+		if (cls == IVH_ROT_HALTED) {
+			/*
+			 * G-LOCK-31, fairness: never skip past a waiter that
+			 * halted on purpose. Stop the search; the caller
+			 * promotes the original next-in-line.
+			 */
+			this_cpu_inc(ivh_rot_stop_halted);
+			return IVH_ROT_F_STALE;
+		}
+		if (cls == IVH_ROT_LIVE) {
 			if (probe)
 				this_cpu_inc(ivh_rot_depth_hist[hop]);
 			/*
@@ -2056,9 +2131,18 @@ pv_wait_head_or_lock(struct qspinlock *lock, struct mcs_spinlock *node,
 						&ep_any);
 
 				if (hit && bail) {
-					this_cpu_inc(ivh_cs_head_bailed);
-					cause = IVH_CS_HALT_CS;
-					break;
+					/*
+					 * G-LOCK-31: already hashed but SLOW_VAL is
+					 * gone means no unlock will kick us; halting
+					 * would return at once and churn. Keep spinning.
+					 */
+					if (lp && READ_ONCE(lock->locked) != _Q_SLOW_VAL) {
+						this_cpu_inc(ivh_cs_bail_suppressed);
+					} else {
+						this_cpu_inc(ivh_cs_head_bailed);
+						cause = IVH_CS_HALT_CS;
+						break;
+					}
 				}
 			}
 			cpu_relax();

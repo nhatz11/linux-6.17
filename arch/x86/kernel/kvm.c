@@ -14,6 +14,7 @@
 #include <linux/irq.h>
 #include <linux/kernel.h>
 #include <linux/kvm_para.h>
+#include <linux/rcupdate.h>
 #include <linux/cpu.h>
 #include <linux/mm.h>
 #include <linux/highmem.h>
@@ -1418,6 +1419,10 @@ EXPORT_SYMBOL_GPL(ivh_cs_owner_clear);
 /* G-LOCK-30: mirror of IVH_HOLDER_EN_CS_FAST in ivh_lock_holder_enabled; the
  * bit, not this variable, is what the lock paths read. */
 unsigned long ivh_cs_owner_fast = 0UL;
+unsigned long ivh_pv_tier2_enable = 1UL;	/* G-LOCK-31, see <asm/ivh_tsc_beat.h> */
+unsigned long ivh_cs_scan = 0UL;
+unsigned long ivh_cs_criterion = 0UL;
+unsigned long ivh_cs_noise_cycles = 22000UL;	/* 10 us at 2.2 GHz */
 
 DEFINE_PER_CPU(u64, ivh_beat_agree_true);
 DEFINE_PER_CPU(u64, ivh_beat_agree_false);
@@ -1535,6 +1540,11 @@ DEFINE_PER_CPU(u64, ivh_cs_check_calls);
 DEFINE_PER_CPU(u64, ivh_cs_abstain_noprev);
 DEFINE_PER_CPU(u64, ivh_cs_fast_lookup_hit);
 DEFINE_PER_CPU(u64, ivh_cs_fast_lookup_miss);
+DEFINE_PER_CPU(u64, ivh_rot_stop_halted);
+DEFINE_PER_CPU(u64, ivh_cs_scan_hit);
+DEFINE_PER_CPU(u64, ivh_cs_scan_miss);
+DEFINE_PER_CPU(u64, ivh_cs_abstain_nolastcs);
+DEFINE_PER_CPU(u64, ivh_cs_bail_suppressed);
 DEFINE_PER_CPU(u64, ivh_cs_abstain_rot);
 DEFINE_PER_CPU(u64, ivh_cs_abstain_tag);
 DEFINE_PER_CPU(u64, ivh_cs_abstain_skew);
@@ -1953,6 +1963,10 @@ static unsigned long ivh_spin_thresh_max = 1UL << 24;
 
 static unsigned long ivh_cs_owed_min = 1UL;
 static unsigned long ivh_cs_owed_max = 64UL;
+static unsigned long ivh_g31_zero = 0UL;
+static unsigned long ivh_g31_one = 1UL;
+static unsigned long ivh_cs_noise_min = 2200UL;		/* 1 us floor */
+static unsigned long ivh_cs_noise_max = 2200000000UL;	/* 1 s */
 /*
  * A tick period is a physical constant of the boot, not a free parameter; the
  * sysctl is writable only so a sweep can deliberately detune it. Floor at
@@ -1995,9 +2009,16 @@ static int ivh_cs_proc_head_probe(const struct ctl_table *table, int write,
 		return -EINVAL;
 	}
 
-	if (val && READ_ONCE(ivh_pv_rot_enable)) {
-		pr_err("IVH: refusing ivh_cs_head_probe=1 while ivh_pv_rot_enable=%lu: handoff rotation rewrites ->next, so the queue head's prev need not be the lock holder.\n",
-		       READ_ONCE(ivh_pv_rot_enable));
+	/*
+	 * G-LOCK-31: rotation may coexist with the detector when the release-side
+	 * clear is on. A head promoted past a skipped waiter has that waiter as
+	 * prev; the waiter cannot hold the lock it is queued on and, with the
+	 * clear on, its slot cannot carry an old stamp of it, so the tag compare
+	 * misses and the head falls back to exhaustion (or ivh_cs_scan finds the
+	 * real holder). Without the clear that argument fails.
+	 */
+	if (val && READ_ONCE(ivh_pv_rot_enable) && READ_ONCE(ivh_cs_owner_clear) != 1) {
+		pr_err("IVH: refusing ivh_cs_head_probe=1 with ivh_pv_rot_enable=1 unless ivh_cs_owner_clear=1\n");
 		return -EINVAL;
 	}
 
@@ -2063,7 +2084,50 @@ static int ivh_cs_proc_owner_clear(const struct ctl_table *table, int write,
 		pr_err("IVH: refusing ivh_cs_owner_clear=0 while ivh_cs_owner_fast=1\n");
 		return -EINVAL;
 	}
+	if (!val && (READ_ONCE(ivh_cs_scan) ||
+		     (READ_ONCE(ivh_pv_rot_enable) &&
+		      (READ_ONCE(ivh_cs_head_probe) || READ_ONCE(ivh_cs_head_bail))))) {
+		pr_err("IVH: refusing ivh_cs_owner_clear=0 while ivh_cs_scan, or rotation together with the head detector, depends on it (G-LOCK-31)\n");
+		return -EINVAL;
+	}
+	if (val && !READ_ONCE(ivh_cs_owner_clear)) {
+		int cpu;
+
+		/*
+		 * G-LOCK-31 flush on 0 -> 1. Locks released while the clear was
+		 * off left {lock, tsc} behind. Turn the clear on, wait for every
+		 * hold that might have started before that to finish (holds run
+		 * with preemption disabled, so an RCU grace period covers them),
+		 * then empty every slot. Wiping a live stamp taken after the
+		 * switch only costs a miss, the safe direction.
+		 */
+		WRITE_ONCE(ivh_cs_owner_clear, val);
+		synchronize_rcu();
+		for_each_possible_cpu(cpu)
+			WRITE_ONCE(per_cpu(ivh_cs_owner, cpu).lock, NULL);
+		return 0;
+	}
 	WRITE_ONCE(ivh_cs_owner_clear, val);
+	return 0;
+}
+
+/* G-LOCK-31: ivh_cs_scan needs the clear, or a released lock's tag misleads the scan. */
+static int ivh_cs_proc_scan(const struct ctl_table *table, int write,
+			    void *buffer, size_t *lenp, loff_t *ppos)
+{
+	struct ctl_table tmp = *table;
+	unsigned long val = READ_ONCE(ivh_cs_scan);
+	int ret;
+
+	tmp.data = &val;
+	ret = proc_doulongvec_minmax(&tmp, write, buffer, lenp, ppos);
+	if (ret || !write)
+		return ret;
+	if (val && READ_ONCE(ivh_cs_owner_clear) != 1) {
+		pr_err("IVH: refusing ivh_cs_scan=1: requires ivh_cs_owner_clear=1\n");
+		return -EINVAL;
+	}
+	WRITE_ONCE(ivh_cs_scan, val);
 	return 0;
 }
 
@@ -2104,9 +2168,8 @@ static int ivh_cs_proc_head_bail(const struct ctl_table *table, int write,
 		return -EINVAL;
 	}
 
-	if (val && READ_ONCE(ivh_pv_rot_enable)) {
-		pr_err("IVH: refusing ivh_cs_head_bail=1 while ivh_pv_rot_enable=%lu: handoff rotation rewrites ->next, so the queue head's prev need not be the lock holder.\n",
-		       READ_ONCE(ivh_pv_rot_enable));
+	if (val && READ_ONCE(ivh_pv_rot_enable) && READ_ONCE(ivh_cs_owner_clear) != 1) {
+		pr_err("IVH: refusing ivh_cs_head_bail=1 with ivh_pv_rot_enable=1 unless ivh_cs_owner_clear=1\n");
 		return -EINVAL;
 	}
 
@@ -2132,9 +2195,10 @@ static int ivh_pv_proc_rot_enable(const struct ctl_table *table, int write,
 	if (ret || !write)
 		return ret;
 
-	if (val && (READ_ONCE(ivh_cs_head_probe) || READ_ONCE(ivh_cs_head_bail))) {
-		pr_err("IVH: refusing ivh_pv_rot_enable=%lu while ivh_cs_head_probe=%lu / ivh_cs_head_bail=%lu: rotation rewrites ->next, which breaks is_cs_preempted()'s prev-is-the-holder premise. Set both to 0 first.\n",
-		       val, READ_ONCE(ivh_cs_head_probe), READ_ONCE(ivh_cs_head_bail));
+	if (val && (READ_ONCE(ivh_cs_head_probe) || READ_ONCE(ivh_cs_head_bail)) &&
+	    READ_ONCE(ivh_cs_owner_clear) != 1) {
+		pr_err("IVH: refusing ivh_pv_rot_enable=%lu with ivh_cs_head_probe/bail on unless ivh_cs_owner_clear=1 (G-LOCK-31)\n",
+		       val);
 		return -EINVAL;
 	}
 
@@ -2277,6 +2341,42 @@ static const struct ctl_table ivh_pv_sysctls[] = {
 		.maxlen		= sizeof(unsigned long),
 		.mode		= 0644,
 		.proc_handler	= ivh_cs_proc_head_bail,
+	},
+	{
+		.procname	= "ivh_pv_tier2_enable",
+		.data		= &ivh_pv_tier2_enable,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+		.extra1		= &ivh_g31_zero,
+		.extra2		= &ivh_g31_one,
+	},
+	{
+		.procname	= "ivh_cs_scan",
+		.data		= &ivh_cs_scan,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= ivh_cs_proc_scan,
+		.extra1		= &ivh_g31_zero,
+		.extra2		= &ivh_g31_one,
+	},
+	{
+		.procname	= "ivh_cs_criterion",
+		.data		= &ivh_cs_criterion,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+		.extra1		= &ivh_g31_zero,
+		.extra2		= &ivh_g31_one,
+	},
+	{
+		.procname	= "ivh_cs_noise_cycles",
+		.data		= &ivh_cs_noise_cycles,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+		.extra1		= &ivh_cs_noise_min,
+		.extra2		= &ivh_cs_noise_max,
 	},
 	{
 		.procname	= "ivh_cs_owed_ticks",
