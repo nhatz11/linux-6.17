@@ -354,3 +354,25 @@ P = PV (1 round). Log `half_contention_loose_*.log`.
 **Summary across both contention levels:** the loose gate (floor 500, band 250)
 matches the old gate at 50% contention and is ~38% faster and far steadier at
 100% contention. Still to check before adopting it: dbench and ebizzy.
+
+## 10. Old vs new gate on dbench and ebizzy (half contention, vCPUs 0-7)
+
+`/root/ivh_tools/gate_dbench_ebizzy.sh`, per workload N L P L N (N = original
+daemon / old gate, L = loose / new gate, 3 rounds each; P = PV, 2 rounds),
+capacity-settled wait before each arm. Commands as in the original wins:
+`dbench -F -t 12 16 -D /root/dbench_test`, `ebizzy -S 20 -t 16 -m -s 4194304`.
+Log/CSV `gate_dbench_ebizzy_*`. (The script exits 1 from its final dmesg test
+when no warning is found; all rounds completed, no warnings, daemon restored.)
+
+| workload | old gate | new gate | PV | old vs PV | new vs PV | new vs old |
+|---|---|---|---|---|---|---|
+| dbench (MB/s) | 280.2 (sd 2.0) | 283.3 (sd 4.4) | 236.3 | +18.6% | +19.9% | +1.1% |
+| ebizzy (records/s) | 1929.5 (sd 10.4) | 1925.7 (sd 11.6) | 897.0 | +115.1% | +114.7% | −0.2% |
+
+Both wins are intact under the new gate; the differences are within round-to-round
+noise. The win sizes differ from the historical +33.7% / +136%, which came from a
+different host setup, so they should not be compared directly.
+
+**Overall verdict on the loose gate (floor 500, band 250):** equal at 50%
+contention on hackbench, dbench and ebizzy; ~38% faster and much steadier on
+hackbench at 100% contention. Not yet the default.
