@@ -142,9 +142,69 @@ Verdicts: **CANDIDATE** (all blocks agree, median >= +5%), **REGRESSION**
 (all blocks agree, median <= -5%), **NOISY** (>= 5% but blocks disagree),
 **neutral** (< 5%).
 
-## 6. Results
+## 6. Results (final, campaign complete 2026-09-15 20:18)
 
-To be filled in when the run completes.
+**1300 measurements, 0 failures, 0 skipped workloads, 18 kernel WARNING lines
+logged (all the pre-existing RCU one).** 19 confirmed wins (8 blocks each),
+21 regressions, 28 neutral, 7 noisy, 1 invalid metric.
+
+### Confirmed wins (8/8 blocks each)
+
+| workload | IVH vs PV | kind |
+|---|---|---|
+| fsmark_tmpfs | **+167.0%** | filesystem metadata (app-level) |
+| perf_sched_pipe | **+146.9%** | micro (2-process ping-pong) |
+| ebizzy_mmap | **+104.3%** | application |
+| stressng_dentry | **+99.5%** | kernel stressor |
+| hackbench_pipe_thr | **+76.3%** | scheduler/IPC |
+| hackbench_sock_thr | **+75.4%** | scheduler/IPC |
+| hackbench_pipe_proc | **+61.8%** | scheduler/IPC |
+| perf_epoll_wait | **+53.9%** | micro |
+| stressng_flock | **+44.2%** | kernel stressor |
+| sysbench_mutex | **+24.4%** | userspace mutex -> futex |
+| stressng_mmap | **+23.4%** | kernel stressor |
+| stressng_sock | **+19.7%** | kernel stressor |
+| dbench_16 | **+19.1%** | file server (app-level) |
+| stressng_pipe | **+15.8%** | kernel stressor |
+| wis_mmap2 | **+11.2%** | micro |
+| wis_mmap1 | **+10.9%** | micro |
+| stressng_futex | **+10.5%** | kernel stressor |
+| perf_syscall_basic | **+8.7%** | micro |
+| schbench | **+7.4%** | scheduler RPS (app-level) |
+
+### Regressions
+
+| workload | IVH vs PV | class |
+|---|---|---|
+| wis_fallocate1 | -5.8% | saturated micro -- inherent, aggregate |
+| wis_pipe1 | -5.9% | saturated micro -- inherent, aggregate |
+| perf_futex_hash | -7.0% | saturated micro -- inherent, aggregate |
+| wis_open1 | -7.2% | saturated micro -- inherent, aggregate |
+| wis_unlink2 | -7.4% | saturated micro -- inherent, aggregate |
+| wis_unlink1 | -7.7% | saturated micro -- inherent, aggregate |
+| phoenix_kmeans | -8.7% | unmodified userspace app |
+| wis_unix1 | -9.0% | saturated micro -- inherent, aggregate |
+| wis_lock2 | -9.1% | saturated micro -- inherent, aggregate |
+| wis_lock1 | -9.9% | saturated micro -- inherent, aggregate |
+| wis_futex2 | -10.1% | saturated micro -- inherent, aggregate |
+| wis_eventfd1 | -11.3% | saturated micro -- inherent, aggregate |
+| wis_dup1 | -12.1% | saturated micro -- inherent, aggregate |
+| wis_futex4 | -16.3% | saturated micro -- inherent, aggregate |
+| netperf_tcp_stream | -18.3% | latency/locality -- FIXABLE |
+| stressng_sem | -18.9% | unmodified userspace (POSIX sem) |
+| wis_tlb_flush1 | -28.8% | migration spreads mm_cpumask -- FIXABLE |
+| sysbench_threads | -29.8% | unmodified userspace + migration churn |
+| iperf3_16 | -34.1% | latency/locality -- FIXABLE |
+| netperf_tcp_rr | -44.3% | latency-bound pair -- FIXABLE (migration gate) |
+| perf_futex_wake_par | -10098.9% | INVALID METRIC -- drop |
+
+### Neutral (<5%)
+
+perf_sched_messaging, perf_epoll_ctl, phoenix_wordcount, libslock_mcs, spinbench_med, wis_pread1, perf_futex_lockpi, wis_getppid1, wis_poll1, wis_write1, fio_tmpfs, wis_posix_semaphore1, wis_futex1, wis_futex3, spinbench_short, wis_sched_yield, wis_lseek1, ebizzy_malloc, spinbench_long, wis_signal1, wis_pwrite1, wis_open2, wis_page_fault1, libslock_ticket, wis_context_switch1, wis_page_fault2, wis_read1, wis_page_fault3.
+
+### Noisy (direction flips between blocks; needs longer runs)
+
+wis_brk1 (+43.2%), perf_futex_wake (+38.5%), wis_tlb_flush2 (+12.9%), libslock_ttas (+11.1%), stressng_fork (+10.1%), libslock_tas (-6.6%), perf_futex_requeue (-6.7%).
 
 ## 7. Full inventory: tried vs not tried, kernel vs userspace
 
