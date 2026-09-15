@@ -376,3 +376,17 @@ different host setup, so they should not be compared directly.
 **Overall verdict on the loose gate (floor 500, band 250):** equal at 50%
 contention on hackbench, dbench and ebizzy; ~38% faster and much steadier on
 hackbench at 100% contention. Not yet the default.
+
+## 11. Adopted as the default (2026-09-15)
+
+Kernel tree `ivh-rebuild-main`: `tools/bpf/MY_ivh_atc.bpf.c` now has
+`IVH_CAP_TOPBAND 250` and `IVH_CAP_HARDFLOOR 500`, with a dated note explaining
+the change. `tools/bpf/Makefile` gained a real `MY_ivh_atc` target (BPF object ->
+skeleton -> loader linked against the patched libbpf in
+`/root/linux-6.17/tools/lib/bpf`, built into `tools/bpf/.ivh_libbpf/`), so
+`goto_mode.sh`'s `make MY_ivh_atc` now actually rebuilds it. The running daemon
+was restarted on the new binary; `bpftool prog dump xlated` shows the 500
+constant and no 700, and a short hackbench produced 2,493 migrations.
+
+Note: `/root/linux-6.17/tools/bpf/MY_ivh_atc.bpf.c` is a stale copy (floor 600,
+band 50) and is not what runs. The kernel tree copy is authoritative.
