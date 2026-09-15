@@ -329,3 +329,28 @@ per arm, capacity-settled wait before each arm. Log `half_contention_*.log`.
 - Not yet run here: the loose gate. By arithmetic it should behave the same (the
   contended half at ~350 is below both the 500 floor and best-minus-250), but that
   is unmeasured.
+
+### 9.1 Same, with the NEW (loose) gate
+
+`/root/ivh_tools/half_contention_loose.sh`, I P P I, I = loose daemon (3 rounds),
+P = PV (1 round). Log `half_contention_loose_*.log`.
+
+| arm | round times (s) | migrations/s | CAP_LOW rejects/s | busy% 0-7 / 8-15 |
+|---|---|---|---|---|
+| IVH+AS, new gate | 12.82 12.34 12.24 | 3,779 | 23,486 | 36 / 80 |
+| PV | 60.65 | 0 | 0 | 65 / 75 |
+| PV | 58.99 | 0 | 0 | 63 / 77 |
+| IVH+AS, new gate | 12.28 12.24 12.30 | 3,869 | 24,108 | 36 / 84 |
+
+- **New gate 12.37 s mean (12.28 s without its first round) vs old gate 12.27 s:
+  the same within noise.** The one slower round (12.82 s) is the first round
+  after the daemon restart.
+- As predicted, the new gate still rejects the contended half (~24k capacity
+  rejects/s, same migration rate as the old gate).
+- No lockup/stall warnings.
+- The two gates were measured ~30 min apart, not interleaved; at half contention
+  IVH is steady enough (sd ~0.06 s) that this is unlikely to matter.
+
+**Summary across both contention levels:** the loose gate (floor 500, band 250)
+matches the old gate at 50% contention and is ~38% faster and far steadier at
+100% contention. Still to check before adopting it: dbench and ebizzy.
