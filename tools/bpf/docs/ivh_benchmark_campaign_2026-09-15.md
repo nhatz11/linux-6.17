@@ -198,6 +198,35 @@ logged (all the pre-existing RCU one).** 19 confirmed wins (8 blocks each),
 | netperf_tcp_rr | -44.3% | latency-bound pair -- FIXABLE (migration gate) |
 | perf_futex_wake_par | -10098.9% | INVALID METRIC -- drop |
 
+### Addendum: Phoenix word_count promoted to the good list (2026-09-15, post-campaign)
+
+Re-measured with a 3-arm test (`/root/ivh_tools/wc_three_arm.sh`, 8 measurements
+per arm, rotating order), timing 5 iterations as one block instead of one:
+
+| arm | time | vs PV |
+|---|---|---|
+| PV (stock, halts at 32768 spins) | 19.79 s | -- |
+| **NOHALT** (spin threshold at max, pure busy spin) | **75.48 s** | **3.8x slower** |
+| IVH | 18.38 s | **+7.1%** |
+
+**word_count is strongly LHP-sensitive despite containing no locks in its source.**
+Removing the halt path costs 3.8x, which can only happen if holders are frequently
+preempted (if holders always ran, spinning would be cheaper than halting).
+Confirmed independently: 139,005 node halts + 4,196 head halts during 3 runs
+(~11 s). Contention comes from page faults on the 123 MB input, mmap, thread
+creation, file reads, and the runtime's futex waits -- none visible in the source.
+
+Phoenix's own synchronisation is minimal and userspace-only: one
+`pthread_mutex_lock` site (`src/pt_mutex.c:49`) behind an `mr_lock_t` abstraction,
+plus a userspace MCS lock (`src/mcs.c`). That one abstraction makes it **cheap to
+port to the AFL later** (one file, one function).
+
+Caveat for the paper: Phoenix is a MapReduce **runtime with sample applications**,
+not a maintained benchmark suite (no standard input, no standard metric -- the
+123 MB input and the timing harness were both invented here). Use it as
+**mechanism evidence**, not as a results row; Metis is the MapReduce workload
+systems papers cite.
+
 ### Neutral (<5%)
 
 perf_sched_messaging, perf_epoll_ctl, phoenix_wordcount, libslock_mcs, spinbench_med, wis_pread1, perf_futex_lockpi, wis_getppid1, wis_poll1, wis_write1, fio_tmpfs, wis_posix_semaphore1, wis_futex1, wis_futex3, spinbench_short, wis_sched_yield, wis_lseek1, ebizzy_malloc, spinbench_long, wis_signal1, wis_pwrite1, wis_open2, wis_page_fault1, libslock_ticket, wis_context_switch1, wis_page_fault2, wis_read1, wis_page_fault3.
