@@ -1,9 +1,23 @@
 # Lock skipping: kill it or embrace it -- the plan, 2026-09-15
 
+> **SUPERSEDED IN PART, 2026-09-16.** The evict-and-requeue design
+> (`ivh_glock33_evict_requeue_design_2026-09-16.md`) removes the tail
+> restriction that both §0 and §7 are built on. **§0 is wrong under eviction**
+> (depth-2 queues are actionable, so hackbench and the campaign winners are
+> valid test workloads) and **§7 is obsolete** (eviction gets the tail case for
+> free). Step 1's opportunity measurement must be re-run with the tail rule
+> lifted before STOP RULE A can kill anything. Steps 2-4 stand as written.
+
 One decision, made on evidence, in a fixed order. Each step has a **stop rule**,
 so the cheapest step that can kill the idea runs first.
 
-## 0. Why hackbench is the wrong workload
+## 0. Why hackbench is the wrong workload [WRONG under evict-and-requeue]
+
+**2026-09-16:** this section holds only for the splice, which cannot move a pick
+whose `->next` is NULL. Eviction never touches the pick's `->next`, so a
+two-waiter queue `H -> S -> L` has `S->next == L` and IS actionable. Under
+G-LOCK-33 hackbench and the other campaign winners become legitimate skipping
+workloads, and the deep-queue argument below applies only to the splice.
 
 hackbench spreads contention across many pipe/socket locks with roughly **two
 waiters each**. With two waiters there is no queue to walk: the successor is the
@@ -121,7 +135,13 @@ again. If Step 1 or Step 2 fails, the answer is kill, and the negative result is
 itself publishable as a design lesson: stealing already rescues the case that
 skipping targets.**
 
-## 7. Possible improvement: splice the tail by moving the tail pointer
+## 7. Possible improvement: splice the tail by moving the tail pointer [OBSOLETE]
+
+**2026-09-16: superseded.** This whole section exists to let the splice move a
+pick that is the tail. Evict-and-requeue does not move the pick at all, so the
+tail case costs nothing there -- no atomic RMW on the lock word, no `encode_tail`
+code stashed in `pv_node`, none of the four hazards below. Kept for the record
+and in case the splice is revived.
 
 **Idea (user, 2026-09-15).** Today both paths refuse to splice a pick whose
 `->next` reads NULL, because the lock word still names that node as the tail and
@@ -173,6 +193,11 @@ there is nothing to act on even counting the tail-blocked cases, this cannot pay
 for itself.
 
 ## 8. Known gap: no starvation cap in the unlock-time path
+
+**2026-09-16: worse under eviction.** A skip that costs one position is a mild
+fairness loss; an eviction costs the whole queue and is uncapped. See
+`ivh_glock33_evict_requeue_design_2026-09-16.md` §7.1 for the `requeues` counter
+that has to exist before any fairness bound is claimed.
 
 G-LOCK-31's promotion-time splice counts skips in the skipped node's `rot_flags`
 (bits 2-7) and promotes it unconditionally at `ivh_pv_rot_skip_max` (default 4).

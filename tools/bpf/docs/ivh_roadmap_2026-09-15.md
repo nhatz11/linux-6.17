@@ -85,7 +85,8 @@ interposition".
 | item | state |
 |---|---|
 | **G-LOCK-31** | built, installed, **never booted**. Adds: skip only preempted (never halted) waiters, `ivh_pv_tier2_enable`, `ivh_cs_criterion` (last-CS test), `ivh_cs_scan`, `spin_mode 6` preset. All default to G-LOCK-30 behaviour |
-| **G-LOCK-32** | designed + independently reviewed (SOUND WITH FIXES), **not built**. Defers the next-waiter choice to unlock. F1 (state change before kick) is mandatory or a waiter can hang. See `ivh_glock32_unlock_skipping_design_2026-09-15.md` §8 |
+| **G-LOCK-32** | built and staged, never booted. Defers the next-waiter choice to unlock. F1 (state change before kick) is mandatory or a waiter can hang. See `ivh_glock32_unlock_skipping_design_2026-09-15.md` §8 |
+| **G-LOCK-33** | designed 2026-09-16, **not built**. Evict-and-requeue replaces rotation repair: a preempted waiter is removed from the queue and tagged `VCPU_SKIPPED`, and re-enters itself on resume (steal, else back of the line). No queue repair, no tail restriction, so depth-2 queues become actionable. Needs a requeue cap before any fairness claim. See `ivh_glock33_evict_requeue_design_2026-09-16.md` |
 | **locktorture** | `CONFIG_LOCK_TORTURE_TEST` is off. Turn it on in the next kernel build; it is the only in-kernel spinlock hammer with tunable hold times |
 
 ---
@@ -159,4 +160,6 @@ RocksDB/LevelDB `db_bench`, Phoenix remaining apps, Metis.
 4. kernel build / kernbench + a database + a KV store **[no reboot]** -- fills the
    thin application column, which is what reviewers will ask for
 5. Migration eligibility gate + re-measure the 4 fixable regressions
-6. Boot and test G-LOCK-31; then build G-LOCK-32 with its F1-F5 fixes
+6. Boot and test G-LOCK-31/32; then build G-LOCK-33 (evict-and-requeue) and
+   re-run Step 1 of the kill-or-embrace plan with the tail rule lifted -- that
+   measurement is now the gate on the whole skipping line of work
