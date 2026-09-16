@@ -327,6 +327,30 @@ static struct qspinlock **pv_hash(struct qspinlock *lock, struct pv_node *node)
 	struct pv_hash_entry *he;
 	int hopcnt = 0;
 
+	/*
+	 * G-LOCK-33 duplicate detector. The invariant is "every blocked lock
+	 * only ever consumes a single entry". If eviction can get one lock
+	 * hashed TWICE -- once by pv_kick_node() for the promoted node, once by
+	 * a requeued node that became head -- then pv_unhash() removes only one
+	 * of them and the other leaks forever. Scan the probe sequence for an
+	 * existing entry naming this lock before inserting. Diagnostic build
+	 * only: O(hops) on an already-cold path, and it answers the one
+	 * remaining hypothesis directly instead of by inference.
+	 */
+	{
+		struct pv_hash_entry *dhe;
+		unsigned long doff;
+
+		for_each_hash_entry(dhe, doff, hash) {
+			if (READ_ONCE(dhe->lock) == lock) {
+				this_cpu_inc(ivh_hash_dup);
+				break;
+			}
+			if (!READ_ONCE(dhe->lock))
+				break;
+		}
+	}
+
 	for_each_hash_entry(he, offset, hash) {
 		struct qspinlock *old = NULL;
 		hopcnt++;

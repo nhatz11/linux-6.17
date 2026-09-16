@@ -1601,6 +1601,7 @@ DEFINE_PER_CPU(u64, ivh_hash_ins_kick);
 DEFINE_PER_CPU(u64, ivh_hash_ins_head);
 DEFINE_PER_CPU(u64, ivh_hash_rel_unhash);
 DEFINE_PER_CPU(u64, ivh_hash_rel_lp);
+DEFINE_PER_CPU(u64, ivh_hash_dup);
 DEFINE_PER_CPU(u64, ivh_evict_requeue_hist[IVH_EVICT_REQ_HIST_BUCKETS]);
 DEFINE_PER_CPU(u64, ivh_cs_abstain_rot);
 DEFINE_PER_CPU(u64, ivh_cs_abstain_tag);
