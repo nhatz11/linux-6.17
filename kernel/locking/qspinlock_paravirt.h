@@ -1413,6 +1413,28 @@ static int pv_wait_node(struct mcs_spinlock *node, struct mcs_spinlock *prev,
 				 */
 				this_cpu_add(ivh_node_spin_success_iters_sum, threshold - loop);
 				this_cpu_inc(ivh_node_spin_success_attempts);
+				/*
+				 * G-LOCK-33 accounting hole. ivh_evict_marked and
+				 * ivh_evict_requeued should balance once every
+				 * evicted vCPU has been rescheduled and looked at
+				 * its own state -- and at idle they did, exactly
+				 * (13308/13308). Under contention 9,091 of 65,884
+				 * evictions (13.8%) never requeued, and the gap did
+				 * NOT close after the machine went quiet.
+				 *
+				 * There are only two exits from this function, and
+				 * PV_WAIT_REQUEUE has one call site that always
+				 * counts. So those nodes must have left through
+				 * HERE -- ->locked set on a node we had already
+				 * marked VCPU_SKIPPED. The walk promotes `after`,
+				 * never the node it just evicted, so that should
+				 * be impossible. Count it rather than theorise:
+				 * ->locked is tested BEFORE the SKIPPED test above,
+				 * so if this fires, the check ordering is where the
+				 * evictions are disappearing.
+				 */
+				if (unlikely(READ_ONCE(pn->state) == VCPU_SKIPPED))
+					this_cpu_inc(ivh_evict_ok_while_skipped);
 				return PV_WAIT_OK;
 			}
 			/*

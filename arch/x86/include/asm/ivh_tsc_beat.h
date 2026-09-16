@@ -995,6 +995,7 @@ DECLARE_PER_CPU(u64, ivh_hash_dup_kick);
 DECLARE_PER_CPU(u64, ivh_hash_dup_head);
 DECLARE_PER_CPU(u64, ivh_head_foreign_hash);
 DECLARE_PER_CPU(u64, ivh_head_foreign_forced);
+DECLARE_PER_CPU(u64, ivh_evict_ok_while_skipped);
 
 /*
  * How many times a single tenure was evicted before it finally acquired.
