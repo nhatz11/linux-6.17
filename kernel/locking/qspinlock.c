@@ -403,6 +403,16 @@ requeue:
 	 */
 	old = xchg_tail(lock, tail);
 	next = NULL;
+	/*
+	 * prev must be re-cleared too. It is assigned only inside the
+	 * `if (old & _Q_TAIL_MASK)` below, so on a REQUEUE that lands on an
+	 * empty tail it would otherwise keep the predecessor from before the
+	 * eviction -- a node that left long ago -- and hand it to
+	 * pv_wait_head_or_lock() as `pp`, poisoning the ivh_cs_* tenure gate
+	 * and prev-hold histograms. Inert while every ivh_cs_* knob is 0, but
+	 * it would bias exactly the population eviction is measured on.
+	 */
+	prev = NULL;
 
 	/*
 	 * if there was a previous node; link it and wait until reaching the

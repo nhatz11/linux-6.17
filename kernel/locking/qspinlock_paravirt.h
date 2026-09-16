@@ -140,6 +140,19 @@ struct pv_node {
 	 * ->head_ctl stays at offset 24.
 	 */
 	u8			requeues;
+	/*
+	 * Set ONLY by pv_defer_promote() on the waiter it defers, cleared on
+	 * every queue entry. The unlock slowpath used to infer "deferred first
+	 * waiter" from mcs.locked == 0, but that premise is false: a thread
+	 * whose xchg_tail() returns an empty tail never has ->locked set by
+	 * anyone and becomes the head with locked == 0. Such a head was being
+	 * misrouted into pv_deferred_handoff(), whose walk starts at the head
+	 * ITSELF -- so the head got evicted, and since pv_wait_head_or_lock()
+	 * never tests VCPU_SKIPPED and overwrites ->state with plain stores,
+	 * the mark was destroyed and the waiter never requeued. Lives in the
+	 * last padding byte; sizeof(struct pv_node) stays 32.
+	 */
+	u8			deferred;
 	u64			head_ctl;
 };
 
@@ -336,8 +349,20 @@ static bool pv_lock_is_hashed(struct qspinlock *lock)
 
 		if (l == lock)
 			return true;
-		if (!l)			/* probe sequence ends at the first hole */
-			return false;
+		/*
+		 * DO NOT stop at a NULL. pv_unhash() deletes with a bare
+		 * WRITE_ONCE(he->lock, NULL) and leaves NO TOMBSTONE, so holes
+		 * appear in the middle of live probe sequences. Stopping at the
+		 * first hole makes this return a false negative: the guard is
+		 * silently bypassed (ivh_head_foreign_hash does not even fire),
+		 * pv_hash() then fills that same hole -- placing the duplicate
+		 * IN FRONT of the original in probe order -- and pv_unhash(),
+		 * which correctly scans the whole sequence, frees the duplicate
+		 * and orphans the original forever. Self-accelerating: every
+		 * orphan lengthens chains and creates more hole-before-entry
+		 * configurations. Scan the full sequence, exactly as pv_unhash()
+		 * does; it is the same bounded walk.
+		 */
 	}
 	return false;
 }
@@ -371,8 +396,8 @@ static struct qspinlock **pv_hash(struct qspinlock *lock, struct pv_node *node, 
 					this_cpu_inc(ivh_hash_dup_kick);
 				break;
 			}
-			if (!READ_ONCE(dhe->lock))
-				break;
+			/* No hole-stop: see pv_lock_is_hashed(). Stopping here made
+			 * ivh_hash_dup a LOWER BOUND, not a count. */
 		}
 	}
 
@@ -1243,6 +1268,7 @@ static void pv_init_node(struct mcs_spinlock *node)
 	 * it across re-entries is exactly what bounds starvation.
 	 */
 	pn->requeues = 0;
+	pn->deferred = 0;
 
 	/*
 	 * IVH heartbeat cold-start seed (build plan sec 2.2, "a second hole").
@@ -1325,6 +1351,7 @@ static void pv_requeue_node(struct mcs_spinlock *node)
 	pn->state = VCPU_RUNNING;
 	pn->head_ctl = HC(0, 0, HEAD_IDLE);
 	pn->rot_flags = 0;
+	pn->deferred = 0;
 
 	/*
 	 * Re-seed the heartbeat for the same reason pv_init_node() does: we are
@@ -2509,7 +2536,6 @@ pv_wait_head_or_lock(struct qspinlock *lock, struct mcs_spinlock *node,
 	 */
 	u64 ep_acq = 0, ep_start = 0, tenure_start = 0;
 	bool ep_any = false, probe, entered_hashed = false;
-	unsigned int foreign_rounds = 0;
 #define IVH_HEAD_FOREIGN_MAX 4
 	u8 cs_gate = IVH_CS_GATE_OK;
 	/*
@@ -2540,6 +2566,15 @@ pv_wait_head_or_lock(struct qspinlock *lock, struct mcs_spinlock *node,
 	lockevent_inc(lock_slowpath);
 
 	for (;; waitcnt++) {
+		/*
+		 * Per-tenure, NOT per-function. Declared outside this loop it
+		 * accumulated across the head's entire stay, so four separate
+		 * tenures that each saw one foreign entry -- and each resolved
+		 * correctly -- would still trip the forced-duplicate path. The
+		 * bound is meant to be "four consecutive observations of the
+		 * SAME stuck entry".
+		 */
+		unsigned int foreign_rounds = 0;
 		/*
 		 * Set correct vCPU state to be used by queue node wait-early
 		 * mechanism.
@@ -2955,6 +2990,7 @@ static bool pv_defer_promote(struct qspinlock *lock, struct mcs_spinlock *node,
 			clear_pending(lock);
 	}
 
+	((struct pv_node *)next)->deferred = 1;
 	this_cpu_inc(ivh_defer_acquires);
 	return true;
 }
@@ -3078,7 +3114,14 @@ __pv_queued_spin_unlock_slowpath(struct qspinlock *lock, u8 locked)
 	 * flipped mid-flight. A promoted head always has mcs.locked == 1; a
 	 * deferred first waiter has never been promoted, so it reads 0.
 	 */
-	if (READ_ONCE(node->mcs.locked) == 0) {
+	/*
+	 * Dispatch on an EXPLICIT marker, not on mcs.locked == 0. See the
+	 * ->deferred comment in struct pv_node: unpromoted heads also have
+	 * locked == 0, and routing them here fed the head itself to
+	 * pv_evict_walk() as candidate 0.
+	 */
+	if (READ_ONCE(((struct pv_node *)node)->deferred)) {
+		node->deferred = 0;
 		pv_deferred_handoff(lock, node);
 		return;
 	}
