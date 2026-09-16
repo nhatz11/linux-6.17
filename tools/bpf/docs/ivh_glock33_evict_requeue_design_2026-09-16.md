@@ -375,3 +375,83 @@ Step 1 of the kill-or-embrace plan, with the tail rule lifted:
 the old 0.0075% figure was measuring under a restriction that no longer
 applies, and it now includes depth-2 queues -- so run it on hackbench and the
 campaign winners, not only on qlockbench.
+
+## 12. The hang, and the invariant that prevents it (2026-09-16)
+
+**Two whole-VM lockups, no oops.** The first killed a 3-arm A/B on the `evict`
+arm; the second hit within seconds of arming eviction, and the previous boot's
+journal simply stops at the log line that `arm_evict_min.sh` produces when it
+sets `adaptive_mode=2`. No panic, no soft-lockup report, nothing -- no CPU got
+far enough to write one.
+
+### 12.1 Root cause
+
+`pv_wait_node()` tested for `VCPU_SKIPPED` **inside its spin loop**, but on loop
+exit -- threshold exhausted, or `pv_wait_early()` breaking out -- it reached:
+
+```c
+smp_store_mb(pn->state, VCPU_HALTED);       /* UNCONDITIONAL */
+if (!READ_ONCE(node->locked))
+        pv_wait(&pn->state, VCPU_HALTED);
+```
+
+An eviction committed between the test and that store was silently overwritten.
+And the overwrite is unrecoverable, because the evictor's `try_cmpxchg` had
+**already succeeded**: it walked past this node and promoted another. So
+
+- the node is out of the queue -- no predecessor will ever set its `->locked`;
+- the evictor kicked the node it promoted, not this one;
+- the waiter sleeps forever in `queued_spin_lock_slowpath` with preemption off,
+  still holding its qnode index;
+- every later acquirer of that lock queues behind the corpse.
+
+One stranded waiter is enough to wedge the machine.
+
+### 12.2 Why it survived the smoke test
+
+The window is the tail of a spin loop of up to 32768 iterations, so it is a
+small fraction of each wait. A 5.5 s run did 327 evictions and got away with it.
+A 400,000-message run did not.
+
+**Lesson: a new lock path surviving a short run is not evidence of correctness.**
+The failure mode is a narrow race whose probability scales with run length, and
+the first real campaign is the worst possible place to discover it.
+
+### 12.3 The invariant
+
+> **Every transition out of `VCPU_RUNNING` on a QUEUED node must be a cmpxchg,
+> never a plain store.**
+
+A plain store cannot express "only if nobody has evicted me", and any write that
+loses that race strands a waiter permanently. The halt transition is now
+`try_cmpxchg(RUNNING -> HALTED)`; failure means `VCPU_SKIPPED` and returns
+`PV_WAIT_REQUEUE`. Ordering is unchanged -- `smp_store_mb` is an `xchg` and a
+non-relaxed `try_cmpxchg` is a `lock cmpxchg`, both full barriers.
+
+All ten writers of `pn->state` were audited; the other nine are safe.
+`pv_init_node` and `pv_requeue_node` run while the node is out of the queue;
+`pv_kick_node`, the post-wait `cmpxchg(HALTED -> RUNNING)` and
+`pv_deferred_handoff` are conditional; the two head-path plain stores act on a
+node that has already been promoted and so can never be an eviction candidate.
+The post-wait cmpxchg is now the recovery path: it fails against `SKIPPED`, the
+outer loop re-enters, and the spin-loop test returns `PV_WAIT_REQUEUE`.
+
+**Section 4 of this document was wrong.** It argued the commit cmpxchg alone
+made the halt race safe, reasoning only about `kvm_wait()` re-reading `*ptr` and
+the post-wait cmpxchg -- both of which run *after* the damage is done.
+
+### 12.4 `ivh_pv_evict_hop_cap`, default 1
+
+Previously hardcoded to `IVH_ROT_HOP_CAP` = 8. Under heavy steal most waiters
+read preempted, so a single handoff could evict a whole queue; every evicted
+waiter then pays an `xchg_tail` on the hottest cacheline in the system,
+reintroducing exactly the contention the MCS queue exists to remove. One
+eviction per handoff still covers the common shape -- successor preempted, the
+node behind it live -- at bounded cost.
+
+### 12.5 `ivh_evict_halt_averted`
+
+Counts waiters that were about to halt, found `VCPU_SKIPPED` on the now-
+conditional cmpxchg, and requeued instead. **Every one of these would have been
+a permanently stranded waiter before the fix.** Read it first on the next run:
+non-zero proves the race is real and that the fix is carrying load.
