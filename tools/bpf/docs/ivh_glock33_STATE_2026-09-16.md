@@ -80,3 +80,52 @@ two release sites -- that localises it in one run.
 ## HARNESS (durable, survives reboot)
 `/root/ivh_tools/evict/`: `arm.sh <pv|control|evict>`, `ab.sh` (ABBA, every run
 `timeout`-bounded, aborts on strand), `capsnap.py`, `gauge.py`.
+
+## UPDATE, 08:50 -- leak localisation instrumented, tax identified
+
+### The leak is 100% eviction-specific (proven)
+`ivh_pv_hash_live` moves ONLY on eviction runs. Across every PV run it is
+**flat**: 17->17, 70->70, 70->70, 168->168. Eviction adds +15..40 per run.
+It occurs with `strand=0, lockups=0, averted=0`, so the "stranded waiter holds
+the entry" theory is DEAD -- entries leak directly.
+
+### Next step is a subtraction, not a search
+Kernel commit `ed5b3feee98d` instruments all four sites. **Needs build +
+reboot.** Then one short eviction run and:
+
+    python3 /root/ivh_tools/evict/hashacct.py
+
+`ins_kick + ins_head - rel_unhash - rel_lp` must equal the live gauge; the
+create site with no matching release is the leak. Five attempts to find this by
+reading the code were each wrong -- do not reason, measure.
+
+### THE TAX (answers "something expensive that isn't eviction")
+`preempt_src=2` makes `pv_init_node()` call `ivh_tsc_beat_publish()` on EVERY
+contended queue entry: an rdtsc plus a store to a cacheline other CPUs read
+remotely. PV skips it entirely. Paid by 100% of acquisitions; eviction acts on
+0.05-0.46%. Prime suspect for control's +3.8% over PV.
+
+Arithmetic from the n=6 paired data: **PV 100, CONTROL 103.8, EVICT 96.3.**
+Eviction's own contribution is real (-7.2%, t=-3.85) but it first has to pay
+back the ~3.8% infrastructure tax, so net vs PV is ~-3.6% and not significant.
+
+`arm.sh control_nobeat` (new) prices the tax exactly: identical to control but
+`preempt_src=0`. control_nobeat vs control = the tax; control_nobeat vs pv =
+what adaptive_mode=2 + tier1 cost alone. Eviction cannot run there (its gate
+requires preempt_src=2), which is the point.
+
+### Live sysctl knobs to sweep once the leak is fixed (no rebuild)
+- `ivh_pv_beat_publish_mask` (4095): higher = publish less often = less
+  coherence traffic, but staler heartbeats.
+- `ivh_pv_beat_threshold` (220000 cyc): controls how readily a waiter reads as
+  preempted, i.e. the eviction rate.
+
+### Latest A/B (contaminated, do not cite)
+PV 9.76 mean; EVICT 13.0 (10.34 excluding a 20.95 s outlier), 5 new lockups.
+The outlier and the lockups ARE the leak showing up inside the measurement.
+**No PV-vs-EVICT number is trustworthy until the leak is fixed.**
+
+### Machine hygiene
+The gauge was left at **168/256**; a reboot clears it. Eviction BUGs at 256.
+`skip_point=0` throughout -- eviction runs at PROMOTION, not at unlock; the
+G-LOCK-32 deferral/hash path never executes.
