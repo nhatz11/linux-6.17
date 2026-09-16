@@ -68,10 +68,13 @@ enum vcpu_state {
 	 * ivh_rot_class() -- treats an evicted node as "not running", which is
 	 * the conservative reading in all of them. See <asm/ivh_tsc_beat.h>.
 	 *
-	 * pv_wait(&pn->state, VCPU_HALTED) is safe against it: kvm_wait()
-	 * re-reads *ptr and declines to halt when it is not VCPU_HALTED, and
-	 * pv_wait_node()'s own cmpxchg(HALTED -> RUNNING) after the wait is
-	 * conditional, so neither can clobber VCPU_SKIPPED.
+	 * EVERY transition out of VCPU_RUNNING on a queued node must be a
+	 * cmpxchg, never a plain store, or it can clobber an eviction that has
+	 * already been committed and strand the waiter permanently. The halt
+	 * transition in pv_wait_node() was an unconditional store when this was
+	 * first written and hung the machine; see the comment there. kvm_wait()
+	 * re-reading *ptr and the post-wait cmpxchg(HALTED -> RUNNING) are NOT
+	 * sufficient on their own -- both run after the damage is done.
 	 */
 	VCPU_SKIPPED,
 };
@@ -1485,7 +1488,57 @@ static int pv_wait_node(struct mcs_spinlock *node, struct mcs_spinlock *prev,
 		 *
 		 * Matches the cmpxchg() from pv_kick_node().
 		 */
-		smp_store_mb(pn->state, VCPU_HALTED);
+		/*
+		 * G-LOCK-33 FIX (hard hang, found 2026-09-16). This was an
+		 * unconditional smp_store_mb(pn->state, VCPU_HALTED), which
+		 * silently CLOBBERED a VCPU_SKIPPED committed by an evictor any
+		 * time the eviction landed between the SKIPPED test in the spin
+		 * loop above and this store.
+		 *
+		 * That is unrecoverable, not merely a missed optimisation: the
+		 * evictor's try_cmpxchg had already succeeded, so it walked past
+		 * this node and promoted somebody else. The node is OUT OF THE
+		 * QUEUE -- no predecessor points at it, so nothing will ever set
+		 * its ->locked, and the evictor kicked the node it promoted, not
+		 * this one. Storing HALTED here and then sleeping in pv_wait()
+		 * parks the waiter forever inside queued_spin_lock_slowpath with
+		 * preemption off and its qnode index held, and every later
+		 * acquirer of that lock queues behind the corpse. Observed as a
+		 * whole-VM hang with no oops, because no CPU got far enough to
+		 * log one.
+		 *
+		 * Making the transition conditional closes it: we may only halt
+		 * if we are still VCPU_RUNNING. The only value that can beat us
+		 * here is VCPU_SKIPPED -- our own CPU is the sole writer of
+		 * RUNNING/HALTED for our node, and VCPU_HASHED requires
+		 * pv_kick_node() to win a HALTED->HASHED cmpxchg, which cannot
+		 * have happened while we are still RUNNING.
+		 *
+		 * Ordering is unchanged. smp_store_mb() is an xchg (full
+		 * barrier) and a non-relaxed try_cmpxchg() is a lock cmpxchg
+		 * (also full), so the required
+		 *     [S] pn->state = HALTED ; MB ; [L] node->locked
+		 * against pv_kick_node()'s
+		 *     [S] next->locked = 1   ; MB ; [RmW] pn->state = HASHED
+		 * still holds on both the success and the failure path.
+		 */
+		{
+			u8 hold = VCPU_RUNNING;
+
+			if (!try_cmpxchg(&pn->state, &hold, VCPU_HALTED)) {
+				if (hold == VCPU_SKIPPED) {
+					this_cpu_inc(ivh_evict_halt_averted);
+					return PV_WAIT_REQUEUE;
+				}
+				/*
+				 * Defensive: VCPU_HASHED is argued impossible
+				 * above. Re-enter the spin loop rather than
+				 * halt; it will observe ->locked and return
+				 * PV_WAIT_OK.
+				 */
+				continue;
+			}
+		}
 
 		if (!READ_ONCE(node->locked)) {
 			lockevent_inc(pv_wait_node);
@@ -1709,15 +1762,27 @@ static noinline struct mcs_spinlock *pv_evict_walk(struct mcs_spinlock *succ)
 	u64 thr = READ_ONCE(ivh_pv_beat_threshold);
 	u64 now = rdtsc();
 	unsigned long cap = READ_ONCE(ivh_pv_requeue_max);
+	unsigned long hopcap = READ_ONCE(ivh_pv_evict_hop_cap);
 	struct mcs_spinlock *cand = succ;
 	int hop, cls;
 
 	if (cap > IVH_REQUEUE_MAX_CAP)
 		cap = IVH_REQUEUE_MAX_CAP;
+	/*
+	 * Default 1. Letting one handoff evict up to IVH_ROT_HOP_CAP waiters is
+	 * a storm amplifier under heavy steal, where MOST waiters read
+	 * preempted: the queue is torn down and rebuilt, and every evicted
+	 * waiter pays an xchg_tail on the single hottest cacheline in the
+	 * system -- reintroducing exactly the contention the MCS queue exists
+	 * to remove. One eviction per handoff still covers the common shape
+	 * (successor preempted, the one behind it live) at bounded cost.
+	 */
+	if (hopcap > IVH_ROT_HOP_CAP)
+		hopcap = IVH_ROT_HOP_CAP;
 
 	this_cpu_inc(ivh_evict_walks);
 
-	for (hop = 0; hop < IVH_ROT_HOP_CAP; hop++) {
+	for (hop = 0; hop < (int)hopcap; hop++) {
 		struct pv_node *pn = (struct pv_node *)cand;
 		struct mcs_spinlock *after;
 		u8 old = VCPU_RUNNING;

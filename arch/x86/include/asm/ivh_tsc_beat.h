@@ -934,6 +934,12 @@ extern unsigned long ivh_pv_evict_enable;
  * the counter byte.
  */
 extern unsigned long ivh_pv_requeue_max;
+
+/*
+ * Max waiters one handoff may evict. Default 1; clamped to IVH_ROT_HOP_CAP.
+ * See pv_evict_walk() for why 8 is a storm amplifier under heavy steal.
+ */
+extern unsigned long ivh_pv_evict_hop_cap;
 #define IVH_REQUEUE_MAX_CAP	255U
 
 /* Evictions committed (cmpxchg RUNNING->SKIPPED won). */
@@ -965,6 +971,13 @@ DECLARE_PER_CPU(u64, ivh_evict_tail_stop);
 DECLARE_PER_CPU(u64, ivh_evict_stop_halted);
 /* Walk ran out of hops with every candidate preempted. */
 DECLARE_PER_CPU(u64, ivh_evict_hop_cap);
+/*
+ * Waiters that were about to halt, found VCPU_SKIPPED on the now-conditional
+ * halt cmpxchg, and requeued instead. EVERY ONE OF THESE WOULD HAVE BEEN A
+ * PERMANENTLY STRANDED WAITER before the 2026-09-16 fix -- if this is non-zero,
+ * the unconditional-store bug would have hung the machine.
+ */
+DECLARE_PER_CPU(u64, ivh_evict_halt_averted);
 
 /*
  * How many times a single tenure was evicted before it finally acquired.

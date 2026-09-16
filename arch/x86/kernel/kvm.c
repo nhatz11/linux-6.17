@@ -1405,6 +1405,9 @@ unsigned long ivh_pv_evict_enable = 0UL;
  * the same nominal fairness budget.
  */
 unsigned long ivh_pv_requeue_max = 4UL;
+
+/* Max evictions per handoff. See pv_evict_walk(). */
+unsigned long ivh_pv_evict_hop_cap = 1UL;
 /*
  * 3,300,000 cycles = 1.5 ms at 2200 MHz -- is_cpu_preempted()'s existing
  * 1,500,000 ns threshold (kernel/sched/cputime.c) expressed in cycles, so
@@ -1593,6 +1596,7 @@ DEFINE_PER_CPU(u64, ivh_evict_cap_refused);
 DEFINE_PER_CPU(u64, ivh_evict_tail_stop);
 DEFINE_PER_CPU(u64, ivh_evict_stop_halted);
 DEFINE_PER_CPU(u64, ivh_evict_hop_cap);
+DEFINE_PER_CPU(u64, ivh_evict_halt_averted);
 DEFINE_PER_CPU(u64, ivh_evict_requeue_hist[IVH_EVICT_REQ_HIST_BUCKETS]);
 DEFINE_PER_CPU(u64, ivh_cs_abstain_rot);
 DEFINE_PER_CPU(u64, ivh_cs_abstain_tag);
@@ -2484,6 +2488,13 @@ static const struct ctl_table ivh_pv_sysctls[] = {
 		.maxlen		= sizeof(unsigned long),
 		.mode		= 0644,
 		.proc_handler	= ivh_pv_proc_evict_enable,
+	},
+	{
+		.procname	= "ivh_pv_evict_hop_cap",
+		.data		= &ivh_pv_evict_hop_cap,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
 	},
 	{
 		.procname	= "ivh_pv_requeue_max",
