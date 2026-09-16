@@ -315,6 +315,10 @@ void __init __pv_init_lock_hash(void)
 	     offset < (1 << pv_lock_hash_bits);						\
 	     offset++, he = &pv_lock_hash[(hash + offset) & ((1 << pv_lock_hash_bits) - 1)])
 
+/* G-LOCK-33: live pv_hash entries; see the leak detector inside pv_hash(). */
+atomic_t ivh_pv_hash_live = ATOMIC_INIT(0);
+EXPORT_SYMBOL_GPL(ivh_pv_hash_live);
+
 static struct qspinlock **pv_hash(struct qspinlock *lock, struct pv_node *node)
 {
 	unsigned long offset, hash = hash_ptr(lock, pv_lock_hash_bits);
@@ -327,6 +331,25 @@ static struct qspinlock **pv_hash(struct qspinlock *lock, struct pv_node *node)
 		if (try_cmpxchg(&he->lock, &old, lock)) {
 			WRITE_ONCE(he->node, node);
 			lockevent_pv_hop(hopcnt);
+			/*
+			 * G-LOCK-33 leak detector. The table cannot legitimately
+			 * fill: entries <= qnodes in use <= 4 * nr_cpus (64 here)
+			 * against 256 slots, because "every blocked lock only ever
+			 * consumes a single entry" and "the lock owner unhashes
+			 * before it releases". A monotonically climbing gauge
+			 * therefore means an entry was hashed whose lock is never
+			 * unlocked through the slowpath again -- i.e. a stuck or
+			 * stranded owner/waiter. Warn with a stack the FIRST time
+			 * we pass a level the invariant says is unreachable, so the
+			 * leak site is identified instead of the eventual BUG() in
+			 * an unrelated caller taking the machine down.
+			 */
+			if (unlikely(atomic_inc_return(&ivh_pv_hash_live) >
+				     (int)(4 * num_possible_cpus()))) {
+				WARN_ONCE(1, "IVH: pv_hash live entries %d exceed 4*nr_cpus=%u -- hash entries are leaking (stranded waiter?)\n",
+					  atomic_read(&ivh_pv_hash_live),
+					  4 * num_possible_cpus());
+			}
 			return &he->lock;
 		}
 	}
@@ -353,6 +376,7 @@ static struct pv_node *pv_unhash(struct qspinlock *lock)
 		if (READ_ONCE(he->lock) == lock) {
 			node = READ_ONCE(he->node);
 			WRITE_ONCE(he->lock, NULL);
+			atomic_dec(&ivh_pv_hash_live);
 			return node;
 		}
 	}
