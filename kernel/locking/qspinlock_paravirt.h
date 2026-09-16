@@ -2487,6 +2487,8 @@ pv_wait_head_or_lock(struct qspinlock *lock, struct mcs_spinlock *node,
 	 */
 	u64 ep_acq = 0, ep_start = 0, tenure_start = 0;
 	bool ep_any = false, probe, entered_hashed = false;
+	unsigned int foreign_rounds = 0;
+#define IVH_HEAD_FOREIGN_MAX 4
 	u8 cs_gate = IVH_CS_GATE_OK;
 	/*
 	 * Stage B: `bail` is the only thing that turns a fired detection into
@@ -2694,7 +2696,25 @@ pv_wait_head_or_lock(struct qspinlock *lock, struct mcs_spinlock *node,
 		 */
 		if (!lp && unlikely(pv_lock_is_hashed(lock))) {
 			this_cpu_inc(ivh_head_foreign_hash);
-			continue;
+			/*
+			 * BOUNDED. The reasoning above assumes the foreign entry
+			 * is LIVE -- that it is what holds lock->locked at
+			 * _Q_SLOW_VAL, so the next slowpath unlock releases it.
+			 * That is true of an entry created by pv_kick_node() or by
+			 * another head. It is NOT true of an ORPHAN: a previously
+			 * leaked entry whose lock is no longer _Q_SLOW_VAL. No
+			 * unlock will ever unhash an orphan, so spinning on one
+			 * would spin forever.
+			 *
+			 * We cannot reliably tell the two apart from here, so bound
+			 * the wait instead of asserting. After a few rounds, fall
+			 * through and hash anyway: that risks one duplicate entry,
+			 * which costs a leaked slot, whereas spinning forever costs
+			 * a wedged vCPU. Liveness beats tidiness.
+			 */
+			if (++foreign_rounds < IVH_HEAD_FOREIGN_MAX)
+				continue;
+			this_cpu_inc(ivh_head_foreign_forced);
 		}
 
 		if (!lp) { /* ONCE */
