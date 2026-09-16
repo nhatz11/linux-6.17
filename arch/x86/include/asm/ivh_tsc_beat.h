@@ -991,6 +991,8 @@ DECLARE_PER_CPU(u64, ivh_hash_rel_lp);
 /* pv_hash() called for a lock that ALREADY has an entry -- the double-hash that
  * would make pv_unhash() leak the other one. Must be 0. */
 DECLARE_PER_CPU(u64, ivh_hash_dup);
+DECLARE_PER_CPU(u64, ivh_hash_dup_kick);
+DECLARE_PER_CPU(u64, ivh_hash_dup_head);
 
 /*
  * How many times a single tenure was evicted before it finally acquired.

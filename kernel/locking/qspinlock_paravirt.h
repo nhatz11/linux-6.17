@@ -321,7 +321,7 @@ EXPORT_SYMBOL_GPL(ivh_pv_hash_live);
 atomic_t ivh_pv_hash_hwm = ATOMIC_INIT(0);
 EXPORT_SYMBOL_GPL(ivh_pv_hash_hwm);
 
-static struct qspinlock **pv_hash(struct qspinlock *lock, struct pv_node *node)
+static struct qspinlock **pv_hash(struct qspinlock *lock, struct pv_node *node, int site)
 {
 	unsigned long offset, hash = hash_ptr(lock, pv_lock_hash_bits);
 	struct pv_hash_entry *he;
@@ -344,6 +344,10 @@ static struct qspinlock **pv_hash(struct qspinlock *lock, struct pv_node *node)
 		for_each_hash_entry(dhe, doff, hash) {
 			if (READ_ONCE(dhe->lock) == lock) {
 				this_cpu_inc(ivh_hash_dup);
+				if (site)
+					this_cpu_inc(ivh_hash_dup_head);
+				else
+					this_cpu_inc(ivh_hash_dup_kick);
 				break;
 			}
 			if (!READ_ONCE(dhe->lock))
@@ -1673,7 +1677,7 @@ static void pv_kick_node(struct qspinlock *lock, struct mcs_spinlock *node)
 	 */
 	WRITE_ONCE(lock->locked, _Q_SLOW_VAL);
 	this_cpu_inc(ivh_hash_ins_kick);
-	(void)pv_hash(lock, pn);
+	(void)pv_hash(lock, pn, 0);	/* site 0 = pv_kick_node */
 
 	/*
 	 * Vanilla upstream sends no wake here, on purpose (see the comment
@@ -2643,7 +2647,7 @@ pv_wait_head_or_lock(struct qspinlock *lock, struct mcs_spinlock *node,
 
 		if (!lp) { /* ONCE */
 			this_cpu_inc(ivh_hash_ins_head);
-			lp = pv_hash(lock, pn);
+			lp = pv_hash(lock, pn, 1);	/* site 1 = head */
 
 			/*
 			 * We must hash before setting _Q_SLOW_VAL, such that
@@ -2842,7 +2846,7 @@ static bool pv_defer_promote(struct qspinlock *lock, struct mcs_spinlock *node,
 	 * charged to a distinct queued qnode, and a lock never has both a
 	 * deferred entry and a halted-head entry.
 	 */
-	(void)pv_hash(lock, pn);
+	(void)pv_hash(lock, pn, 2);
 	WRITE_ONCE(lock->locked, _Q_SLOW_VAL);
 	set_pending(lock);
 
