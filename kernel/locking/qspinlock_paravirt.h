@@ -321,6 +321,27 @@ EXPORT_SYMBOL_GPL(ivh_pv_hash_live);
 atomic_t ivh_pv_hash_hwm = ATOMIC_INIT(0);
 EXPORT_SYMBOL_GPL(ivh_pv_hash_hwm);
 
+/*
+ * G-LOCK-33: does @lock already own a hash entry? Used by the head to avoid
+ * creating a SECOND entry for one lock. Same probe walk pv_hash() would do, so
+ * the cost is identical and it runs only on the head's cold halt path.
+ */
+static bool pv_lock_is_hashed(struct qspinlock *lock)
+{
+	unsigned long offset, hash = hash_ptr(lock, pv_lock_hash_bits);
+	struct pv_hash_entry *he;
+
+	for_each_hash_entry(he, offset, hash) {
+		struct qspinlock *l = READ_ONCE(he->lock);
+
+		if (l == lock)
+			return true;
+		if (!l)			/* probe sequence ends at the first hole */
+			return false;
+	}
+	return false;
+}
+
 static struct qspinlock **pv_hash(struct qspinlock *lock, struct pv_node *node, int site)
 {
 	unsigned long offset, hash = hash_ptr(lock, pv_lock_hash_bits);
@@ -2643,6 +2664,37 @@ pv_wait_head_or_lock(struct qspinlock *lock, struct mcs_spinlock *node,
 
 			ivh_cs_ep_close(&ep_acq, ep_start, now, IVH_CS_EP_EXHAUST);
 			ivh_cs_tenure_record(tenure_start, now, ep_any);
+		}
+
+		/*
+		 * G-LOCK-33 LEAK FIX. The guard above ("am I VCPU_HASHED?") asks
+		 * whether pv_kick_node() hashed THIS node. Under stock PV that is
+		 * sufficient, because the node pv_kick_node() hashes for is always
+		 * the node that becomes the head -- entry owner and head are the
+		 * same node by construction.
+		 *
+		 * EVICTION BREAKS THAT IDENTITY. The holder promotes `after` and
+		 * pv_kick_node() hashes for it, while the node we EVICTED requeues
+		 * and can reach the head role on the same lock. The head is then A
+		 * while the outstanding entry belongs to B; A's own state reads
+		 * VCPU_RUNNING (it was never kicked), the guard passes, and A
+		 * hashes too. Two entries for one lock; pv_unhash() frees one and
+		 * the other leaks forever. Measured: ivh_hash_dup_head 126 vs
+		 * ivh_hash_dup_kick 3, and the live gauge never returns to zero.
+		 *
+		 * So ask about the LOCK, not about ourselves. And when the lock is
+		 * already hashed by somebody else we must ALSO NOT HALT: the entry
+		 * names B, so the unlock would pv_unhash() B and kick B, and
+		 * nothing would ever wake us. Spin another round instead. The
+		 * foreign entry is released by the very next slowpath unlock (it
+		 * is what keeps lock->locked at _Q_SLOW_VAL), so this resolves
+		 * immediately and cannot loop indefinitely.
+		 *
+		 * Rare by construction: 129 events against 31,428 evictions.
+		 */
+		if (!lp && unlikely(pv_lock_is_hashed(lock))) {
+			this_cpu_inc(ivh_head_foreign_hash);
+			continue;
 		}
 
 		if (!lp) { /* ONCE */
