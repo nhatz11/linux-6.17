@@ -318,6 +318,8 @@ void __init __pv_init_lock_hash(void)
 /* G-LOCK-33: live pv_hash entries; see the leak detector inside pv_hash(). */
 atomic_t ivh_pv_hash_live = ATOMIC_INIT(0);
 EXPORT_SYMBOL_GPL(ivh_pv_hash_live);
+atomic_t ivh_pv_hash_hwm = ATOMIC_INIT(0);
+EXPORT_SYMBOL_GPL(ivh_pv_hash_hwm);
 
 static struct qspinlock **pv_hash(struct qspinlock *lock, struct pv_node *node)
 {
@@ -332,23 +334,28 @@ static struct qspinlock **pv_hash(struct qspinlock *lock, struct pv_node *node)
 			WRITE_ONCE(he->node, node);
 			lockevent_pv_hop(hopcnt);
 			/*
-			 * G-LOCK-33 leak detector. The table cannot legitimately
+			 * G-LOCK-33 leak gauge. The table cannot legitimately
 			 * fill: entries <= qnodes in use <= 4 * nr_cpus (64 here)
 			 * against 256 slots, because "every blocked lock only ever
 			 * consumes a single entry" and "the lock owner unhashes
-			 * before it releases". A monotonically climbing gauge
-			 * therefore means an entry was hashed whose lock is never
-			 * unlocked through the slowpath again -- i.e. a stuck or
-			 * stranded owner/waiter. Warn with a stack the FIRST time
-			 * we pass a level the invariant says is unreachable, so the
-			 * leak site is identified instead of the eventual BUG() in
-			 * an unrelated caller taking the machine down.
+			 * before it releases". A climbing high-water mark means an
+			 * entry was hashed whose lock never reaches the unlock
+			 * slowpath again -- a stuck or stranded owner/waiter.
+			 *
+			 * DELIBERATELY NO WARN/printk HERE. pv_hash() runs from the
+			 * qspinlock slowpath with the lock held and preemption off;
+			 * printk takes locks of its own and re-enters this very
+			 * path. An earlier version WARNed here and deadlocked the
+			 * machine during boot. Record a high-water mark instead and
+			 * let userspace poll ivh_pv_hash_hwm -- same diagnostic,
+			 * no reentrancy.
 			 */
-			if (unlikely(atomic_inc_return(&ivh_pv_hash_live) >
-				     (int)(4 * num_possible_cpus()))) {
-				WARN_ONCE(1, "IVH: pv_hash live entries %d exceed 4*nr_cpus=%u -- hash entries are leaking (stranded waiter?)\n",
-					  atomic_read(&ivh_pv_hash_live),
-					  4 * num_possible_cpus());
+			{
+				int live = atomic_inc_return(&ivh_pv_hash_live);
+				int hwm = atomic_read(&ivh_pv_hash_hwm);
+
+				if (unlikely(live > hwm))
+					atomic_cmpxchg(&ivh_pv_hash_hwm, hwm, live);
 			}
 			return &he->lock;
 		}
@@ -2630,6 +2637,13 @@ pv_wait_head_or_lock(struct qspinlock *lock, struct mcs_spinlock *node,
 				 */
 				WRITE_ONCE(lock->locked, _Q_LOCKED_VAL);
 				WRITE_ONCE(*lp, NULL);
+				/*
+				 * G-LOCK-33 gauge: this clears the entry WITHOUT
+				 * going through pv_unhash(), so it must decrement
+				 * here too. Missing this made the gauge climb
+				 * monotonically during entirely healthy operation.
+				 */
+				atomic_dec(&ivh_pv_hash_live);
 				goto gotlock;
 			}
 		}
