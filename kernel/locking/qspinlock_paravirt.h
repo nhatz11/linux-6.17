@@ -383,6 +383,7 @@ static struct pv_node *pv_unhash(struct qspinlock *lock)
 		if (READ_ONCE(he->lock) == lock) {
 			node = READ_ONCE(he->node);
 			WRITE_ONCE(he->lock, NULL);
+			this_cpu_inc(ivh_hash_rel_unhash);
 			atomic_dec(&ivh_pv_hash_live);
 			return node;
 		}
@@ -1647,6 +1648,7 @@ static void pv_kick_node(struct qspinlock *lock, struct mcs_spinlock *node)
 	 * needed.
 	 */
 	WRITE_ONCE(lock->locked, _Q_SLOW_VAL);
+	this_cpu_inc(ivh_hash_ins_kick);
 	(void)pv_hash(lock, pn);
 
 	/*
@@ -2616,6 +2618,7 @@ pv_wait_head_or_lock(struct qspinlock *lock, struct mcs_spinlock *node,
 		}
 
 		if (!lp) { /* ONCE */
+			this_cpu_inc(ivh_hash_ins_head);
 			lp = pv_hash(lock, pn);
 
 			/*
@@ -2637,6 +2640,7 @@ pv_wait_head_or_lock(struct qspinlock *lock, struct mcs_spinlock *node,
 				 */
 				WRITE_ONCE(lock->locked, _Q_LOCKED_VAL);
 				WRITE_ONCE(*lp, NULL);
+				this_cpu_inc(ivh_hash_rel_lp);
 				/*
 				 * G-LOCK-33 gauge: this clears the entry WITHOUT
 				 * going through pv_unhash(), so it must decrement

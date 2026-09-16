@@ -980,6 +980,16 @@ DECLARE_PER_CPU(u64, ivh_evict_hop_cap);
 DECLARE_PER_CPU(u64, ivh_evict_halt_averted);
 
 /*
+ * G-LOCK-33 pv_hash accounting. Exactly two create sites and two release
+ * sites; ins_kick + ins_head - rel_unhash - rel_lp must equal the live gauge.
+ * Whichever create site has no matching release is the leak.
+ */
+DECLARE_PER_CPU(u64, ivh_hash_ins_kick);
+DECLARE_PER_CPU(u64, ivh_hash_ins_head);
+DECLARE_PER_CPU(u64, ivh_hash_rel_unhash);
+DECLARE_PER_CPU(u64, ivh_hash_rel_lp);
+
+/*
  * How many times a single tenure was evicted before it finally acquired.
  * Bucket i = exactly i evictions, top bucket saturates. THIS HISTOGRAM IS THE
  * FAIRNESS EVIDENCE for ivh_pv_requeue_max -- a claim that eviction is
