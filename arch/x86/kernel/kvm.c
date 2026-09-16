@@ -1386,6 +1386,25 @@ unsigned long ivh_pv_rot_enable = 0UL;
  * pv_node.rot_flags and must not overflow into the class bits.
  */
 unsigned long ivh_pv_rot_skip_max = 4UL;
+
+/*
+ * G-LOCK-33 evict-and-requeue. Default OFF: this kernel carries all three
+ * handoff policies so they can be A/B'd live in one boot --
+ *   rot_enable=0 evict_enable=0   upstream FIFO handoff
+ *   rot_enable=1 evict_enable=0   rotation repair (G-LOCK-31)
+ *   evict_enable=1               eviction (G-LOCK-33), which takes precedence
+ * and it works at either promotion point, selected by ivh_pv_skip_point.
+ */
+unsigned long ivh_pv_evict_enable = 0UL;
+
+/*
+ * Eviction starvation bound: how many times one tenure may be evicted before
+ * the walk refuses and promotes it regardless. 0 disables eviction entirely.
+ * Clamped to IVH_REQUEUE_MAX_CAP (255) at use -- pv_node.requeues is a byte.
+ * Default 4, matching ivh_pv_rot_skip_max so the two policies are compared at
+ * the same nominal fairness budget.
+ */
+unsigned long ivh_pv_requeue_max = 4UL;
 /*
  * 3,300,000 cycles = 1.5 ms at 2200 MHz -- is_cpu_preempted()'s existing
  * 1,500,000 ns threshold (kernel/sched/cputime.c) expressed in cycles, so
@@ -1562,6 +1581,19 @@ DEFINE_PER_CPU(u64, ivh_defer_skips);
 DEFINE_PER_CPU(u64, ivh_defer_stop_halted);
 DEFINE_PER_CPU(u64, ivh_defer_kicks);
 DEFINE_PER_CPU(u64, ivh_defer_no_successor);
+
+/* G-LOCK-33 evict-and-requeue. See <asm/ivh_tsc_beat.h> for what each means. */
+DEFINE_PER_CPU(u64, ivh_evict_marked);
+DEFINE_PER_CPU(u64, ivh_evict_walks);
+DEFINE_PER_CPU(u64, ivh_evict_walks_acted);
+DEFINE_PER_CPU(u64, ivh_evict_requeued);
+DEFINE_PER_CPU(u64, ivh_evict_steal_ok);
+DEFINE_PER_CPU(u64, ivh_evict_halt_race);
+DEFINE_PER_CPU(u64, ivh_evict_cap_refused);
+DEFINE_PER_CPU(u64, ivh_evict_tail_stop);
+DEFINE_PER_CPU(u64, ivh_evict_stop_halted);
+DEFINE_PER_CPU(u64, ivh_evict_hop_cap);
+DEFINE_PER_CPU(u64, ivh_evict_requeue_hist[IVH_EVICT_REQ_HIST_BUCKETS]);
 DEFINE_PER_CPU(u64, ivh_cs_abstain_rot);
 DEFINE_PER_CPU(u64, ivh_cs_abstain_tag);
 DEFINE_PER_CPU(u64, ivh_cs_abstain_skew);
@@ -2132,6 +2164,50 @@ static int ivh_cs_proc_owner_clear(const struct ctl_table *table, int write,
  * G-LOCK-32: deferring the choice to unlock requires the owner stamp and the
  * release-side clear, the same premises is_cs_preempted() needs (review F3).
  */
+/*
+ * G-LOCK-33. Eviction acts on the SAME signal as rotation (ivh_rot_class()),
+ * so it carries the same precondition: at ivh_pv_preempt_src != 2 the liveness
+ * test degrades to vcpu_is_preempted(), which is hardwired false on a host with
+ * no real steal-time page (this one). Every node would then read live, nothing
+ * would ever be evicted, and an A/B against rotation would silently compare two
+ * identical arms. Refuse rather than quietly do nothing.
+ *
+ * Also refuses to run alongside rotation. The two are mutually exclusive by
+ * dispatch (eviction is tested first in both pv_handoff_rotate() and
+ * pv_deferred_handoff()), so enabling both is never a queue-safety problem --
+ * but it silently disables rotation, and a run recorded as "rotation on" that
+ * actually measured eviction would be worse than a failed write.
+ */
+static int ivh_pv_proc_evict_enable(const struct ctl_table *table, int write,
+				    void *buffer, size_t *lenp, loff_t *ppos)
+{
+	unsigned long val = READ_ONCE(ivh_pv_evict_enable);
+	struct ctl_table tmp = *table;
+	int ret;
+
+	tmp.data = &val;
+	ret = proc_doulongvec_minmax(&tmp, write, buffer, lenp, ppos);
+	if (ret || !write)
+		return ret;
+
+	if (val > 1) {
+		pr_err("IVH: refusing ivh_pv_evict_enable=%lu: valid values are 0 and 1\n",
+		       val);
+		return -EINVAL;
+	}
+	if (val && READ_ONCE(ivh_pv_preempt_src) != 2) {
+		pr_err("IVH: refusing ivh_pv_evict_enable=1: requires ivh_pv_preempt_src=2 (otherwise nothing is ever classified preempted)\n");
+		return -EINVAL;
+	}
+	if (val && READ_ONCE(ivh_pv_rot_enable)) {
+		pr_err("IVH: refusing ivh_pv_evict_enable=1 with ivh_pv_rot_enable=1: set ivh_pv_rot_enable=0 first (eviction would silently override rotation)\n");
+		return -EINVAL;
+	}
+
+	WRITE_ONCE(ivh_pv_evict_enable, val);
+	return 0;
+}
+
 static int ivh_pv_proc_skip_point(const struct ctl_table *table, int write,
 				  void *buffer, size_t *lenp, loff_t *ppos)
 {
@@ -2243,6 +2319,12 @@ static int ivh_pv_proc_rot_enable(const struct ctl_table *table, int write,
 	if (val && (READ_ONCE(ivh_cs_head_probe) || READ_ONCE(ivh_cs_head_bail)) &&
 	    READ_ONCE(ivh_cs_owner_clear) != 1) {
 		pr_err("IVH: refusing ivh_pv_rot_enable=%lu with ivh_cs_head_probe/bail on unless ivh_cs_owner_clear=1 (G-LOCK-31)\n",
+		       val);
+		return -EINVAL;
+	}
+
+	if (val && READ_ONCE(ivh_pv_evict_enable)) {
+		pr_err("IVH: refusing ivh_pv_rot_enable=%lu with ivh_pv_evict_enable=1: set ivh_pv_evict_enable=0 first (eviction takes precedence and would silently override rotation)\n",
 		       val);
 		return -EINVAL;
 	}
@@ -2395,6 +2477,20 @@ static const struct ctl_table ivh_pv_sysctls[] = {
 		.proc_handler	= proc_doulongvec_minmax,
 		.extra1		= &ivh_g31_zero,
 		.extra2		= &ivh_g31_one,
+	},
+	{
+		.procname	= "ivh_pv_evict_enable",
+		.data		= &ivh_pv_evict_enable,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= ivh_pv_proc_evict_enable,
+	},
+	{
+		.procname	= "ivh_pv_requeue_max",
+		.data		= &ivh_pv_requeue_max,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
 	},
 	{
 		.procname	= "ivh_pv_skip_point",

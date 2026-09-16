@@ -865,6 +865,116 @@ DECLARE_PER_CPU(u64, ivh_cs_bail_suppressed);
 extern unsigned long ivh_pv_skip_point;
 extern unsigned long ivh_pv_unlock_reserve;
 DECLARE_PER_CPU(u64, ivh_defer_acquires);	/* holds that deferred a promotion */
+/*
+ * ============================================================================
+ * G-LOCK-33: evict-and-requeue (ivh_pv_evict_enable)
+ * ============================================================================
+ *
+ * An alternative to rotation repair (ivh_pv_rot_enable), sharing ITS walk
+ * rules but not its queue surgery. Instead of splicing a live waiter in front
+ * of a preempted one and leaving the preempted one in the queue one position
+ * back, the preempted waiter is REMOVED from the queue and tagged
+ * VCPU_SKIPPED; it re-enters the lock itself when its vCPU next runs, trying
+ * an opportunistic trylock first and otherwise joining the tail.
+ *
+ * WHY IT IS SIMPLER. The evicted node needs no repair at all. The walker is
+ * the lock holder (pre-CS) or the unlocker, and is leaving the queue anyway,
+ * so "removing" a node it was going to promote is just declining to promote
+ * it and promoting something further along instead. ZERO ->next stores, and
+ * the promotion protocol downstream (arch_mcs_spin_unlock_contended() +
+ * pv_kick_node(), or pv_deferred_handoff()'s F1 promote) is untouched.
+ *
+ * WHY IT REACHES MORE. Rotation must move the chosen node to the front, so it
+ * refuses any pick whose ->next reads NULL (ivh_rot_splice_blocked_tail).
+ * Eviction never touches the pick's ->next, so the pick may be the tail. The
+ * only surviving rule is "do not evict a node whose ->next is NULL", which is
+ * self-enforcing: a NULL ->next means there is nobody to move on to, so the
+ * walk stops and promotes that node anyway. Consequence: a two-waiter queue
+ * (holder -> S -> L) is actionable under eviction and is not under rotation.
+ *
+ * THE COMMIT POINT IS A cmpxchg, AND IT IS ALSO THE HALT-RACE GUARD. A
+ * candidate is evicted only by try_cmpxchg(&pn->state, VCPU_RUNNING,
+ * VCPU_SKIPPED). Success means the candidate was RUNNING by its own account --
+ * host-preempted vCPUs read VCPU_RUNNING, which is tier 2's whole premise --
+ * so it is spinning or off-CPU and will observe VCPU_SKIPPED in its own spin
+ * loop with no kick, no hypercall and no IPI. Failure means it reached
+ * VCPU_HALTED under us, so it is NOT evicted: it is promoted and woken exactly
+ * as today. That is G-LOCK-31's fairness rule (never skip a waiter that halted
+ * on purpose) enforced atomically rather than by a racy pre-read.
+ *
+ * THE WALK NEVER BACKTRACKS. Because an eviction is a removal, the queue is
+ * well formed after every single step, so the walk commits incrementally and
+ * always ends by promoting the node it is currently looking at -- on LIVE, on
+ * HALTED, on a NULL ->next, on the hop cap, on the requeue cap, and on a lost
+ * cmpxchg. Invariant: the node whose predecessor was evicted is always the
+ * node that gets promoted, so no waiter is ever left spinning behind an
+ * orphan.
+ *
+ * FREEZE ARGUMENT, RESTATED FOR REMOVAL. A queued waiter cannot leave the
+ * queue except by having its ->locked set, and only the current holder does
+ * that -- so while we hold the lock, every node we walk is frozen and its
+ * ->next is stable. Eviction does not weaken this: it is the holder's own
+ * action, and an evicted node clears its ->next and republishes its tail code
+ * only from pv_requeue_node(), i.e. after we are done with it.
+ *
+ * WHAT IT GIVES UP. Rotation costs a skipped waiter one position, bounded by
+ * ivh_pv_rot_skip_max. Eviction costs it the whole queue, so the bound has to
+ * be rebuilt explicitly -- see ivh_pv_requeue_max and pv_node.requeues.
+ */
+extern unsigned long ivh_pv_evict_enable;
+
+/*
+ * Starvation bound for eviction. pv_node.requeues counts how many times THIS
+ * tenure has been evicted (pv_init_node() zeroes it on genuine queue entry;
+ * pv_requeue_node() deliberately does NOT, which is the whole point). At the
+ * cap the walk refuses to evict and promotes the node instead, so a waiter
+ * reaches the front at most ivh_pv_requeue_max + 1 times before it is served.
+ *
+ * Default 4, matching ivh_pv_rot_skip_max. Clamped at use to 255, the width of
+ * the counter byte.
+ */
+extern unsigned long ivh_pv_requeue_max;
+#define IVH_REQUEUE_MAX_CAP	255U
+
+/* Evictions committed (cmpxchg RUNNING->SKIPPED won). */
+DECLARE_PER_CPU(u64, ivh_evict_marked);
+/* Walks entered, i.e. handoffs examined with eviction on. The denominator. */
+DECLARE_PER_CPU(u64, ivh_evict_walks);
+/* Walks that evicted at least one waiter. */
+DECLARE_PER_CPU(u64, ivh_evict_walks_acted);
+/* Waiters that observed VCPU_SKIPPED and re-entered the lock. */
+DECLARE_PER_CPU(u64, ivh_evict_requeued);
+/* ... and took the lock on the opportunistic trylock instead of re-queueing. */
+DECLARE_PER_CPU(u64, ivh_evict_steal_ok);
+/*
+ * Candidate halted between classification and commit, so it was promoted
+ * rather than evicted. This is the fairness rule firing, not an error; if it
+ * is a large fraction of ivh_evict_marked the classification is stale.
+ */
+DECLARE_PER_CPU(u64, ivh_evict_halt_race);
+/* Walk stopped because the candidate is at ivh_pv_requeue_max. Starvation bound. */
+DECLARE_PER_CPU(u64, ivh_evict_cap_refused);
+/*
+ * Walk stopped on a NULL ->next. Under rotation this was
+ * ivh_rot_splice_blocked_tail, a REFUSED opportunity; under eviction it is
+ * simply "the queue ended here", i.e. genuinely nothing to move on to. The
+ * two must not be compared directly.
+ */
+DECLARE_PER_CPU(u64, ivh_evict_tail_stop);
+/* Walk stopped on a HALTED candidate (G-LOCK-31 fairness rule). */
+DECLARE_PER_CPU(u64, ivh_evict_stop_halted);
+/* Walk ran out of hops with every candidate preempted. */
+DECLARE_PER_CPU(u64, ivh_evict_hop_cap);
+
+/*
+ * How many times a single tenure was evicted before it finally acquired.
+ * Bucket i = exactly i evictions, top bucket saturates. THIS HISTOGRAM IS THE
+ * FAIRNESS EVIDENCE for ivh_pv_requeue_max -- a claim that eviction is
+ * starvation-bounded is not supportable without it.
+ */
+#define IVH_EVICT_REQ_HIST_BUCKETS 8
+DECLARE_PER_CPU(u64, ivh_evict_requeue_hist[IVH_EVICT_REQ_HIST_BUCKETS]);
+
 DECLARE_PER_CPU(u64, ivh_defer_handoffs);	/* unlocks that took the deferred path */
 DECLARE_PER_CPU(u64, ivh_defer_skips);		/* handoffs that skipped >= 1 preempted waiter */
 DECLARE_PER_CPU(u64, ivh_defer_stop_halted);	/* walk stopped at a halted waiter */

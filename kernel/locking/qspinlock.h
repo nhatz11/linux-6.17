@@ -10,6 +10,22 @@
 
 #include <asm-generic/percpu.h>
 #include <linux/percpu-defs.h>
+
+/*
+ * pv_wait_node() return values (G-LOCK-33). Defined here rather than in
+ * qspinlock_paravirt.h because qspinlock.c is compiled twice -- once natively
+ * and once as the PV slowpath -- and the native pass needs the same values for
+ * its __pv_wait_node() stub, which is declared before the PV header is pulled
+ * in.
+ *
+ * PV_WAIT_REQUEUE: this node was EVICTED from the MCS queue while waiting (it
+ * looked host-preempted to the holder) and is no longer reachable from any
+ * predecessor, so nobody will ever set its ->locked. The caller must NOT fall
+ * through to arch_mcs_spin_lock_contended(); it must reset the node and
+ * re-enter the acquire path. Never returned by the native stub.
+ */
+#define PV_WAIT_OK		0
+#define PV_WAIT_REQUEUE		1
 #include <asm-generic/qspinlock.h>
 #include <asm-generic/mcs_spinlock.h>
 

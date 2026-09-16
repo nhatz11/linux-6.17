@@ -148,9 +148,12 @@ DEFINE_PER_CPU(unsigned long, qlock_slowpath_caller_ip);
  */
 
 static __always_inline void __pv_init_node(struct mcs_spinlock *node) { }
-static __always_inline void __pv_wait_node(struct mcs_spinlock *node,
+static __always_inline int  __pv_wait_node(struct mcs_spinlock *node,
 					   struct mcs_spinlock *prev,
-					   struct qspinlock *lock) { }
+					   struct qspinlock *lock)
+					   { return PV_WAIT_OK; }
+static __always_inline void __pv_requeue_node(struct mcs_spinlock *node) { }
+static __always_inline void __pv_requeue_steal(struct mcs_spinlock *node) { }
 static __always_inline void __pv_kick_node(struct qspinlock *lock,
 					   struct mcs_spinlock *node) { }
 static __always_inline u32  __pv_wait_head_or_lock(struct qspinlock *lock,
@@ -171,6 +174,8 @@ static __always_inline void __pv_handoff_ack(struct qspinlock *lock,
 
 #define pv_init_node		__pv_init_node
 #define pv_wait_node		__pv_wait_node
+#define pv_requeue_node		__pv_requeue_node
+#define pv_requeue_steal	__pv_requeue_steal
 #define pv_kick_node		__pv_kick_node
 #define pv_wait_head_or_lock	__pv_wait_head_or_lock
 #define pv_handoff_rotate	__pv_handoff_rotate
@@ -359,13 +364,28 @@ pv_queue:
 	node->next = NULL;
 	pv_init_node(node);
 
+requeue:
 	/*
 	 * We touched a (possibly) cold cacheline in the per-cpu queue node;
 	 * attempt the trylock once more in the hope someone let go while we
 	 * weren't watching.
+	 *
+	 * G-LOCK-33 re-enters here after an eviction, which is why the label
+	 * sits ABOVE this trylock and above the smp_wmb() below rather than at
+	 * the xchg_tail(). It gets both for free and in the right order: the
+	 * trylock IS the "try to steal it outright" half of the retry (we were
+	 * just passed over, so the lock may well be free), and the smp_wmb()
+	 * is exactly the barrier pv_requeue_node()'s reset needs before this
+	 * node's tail code is published again.
+	 *
+	 * @idx, @node and @tail are all still ours across the retry -- the
+	 * qnodes[] slot was never released -- so this must NOT re-run
+	 * node->count++ above. One push, one pop, per acquisition.
 	 */
-	if (queued_spin_trylock(lock))
+	if (queued_spin_trylock(lock)) {
+		pv_requeue_steal(node);
 		goto release;
+	}
 
 	/*
 	 * Ensure that the initialisation of @node is complete before we
@@ -394,7 +414,22 @@ pv_queue:
 		/* Link @node into the waitqueue. */
 		WRITE_ONCE(prev->next, node);
 
-		pv_wait_node(node, prev, lock);
+		/*
+		 * G-LOCK-33: PV_WAIT_REQUEUE means the holder evicted us from
+		 * the queue because we looked host-preempted. No predecessor
+		 * points at us any more, so node->locked will never be set and
+		 * falling through to arch_mcs_spin_lock_contended() would hang
+		 * forever. Re-arm and re-enter instead; pv_requeue_node() keeps
+		 * the eviction count that bounds how often this can happen.
+		 * Never taken in the native build, where the stub returns
+		 * PV_WAIT_OK unconditionally and this compiles out.
+		 */
+		if (unlikely(pv_wait_node(node, prev, lock) == PV_WAIT_REQUEUE)) {
+			pv_requeue_node(node);
+			node->locked = 0;
+			node->next = NULL;
+			goto requeue;
+		}
 		arch_mcs_spin_lock_contended(&node->locked);
 
 		/*
@@ -569,6 +604,8 @@ EXPORT_SYMBOL(queued_spin_lock_slowpath);
 
 #undef pv_init_node
 #undef pv_wait_node
+#undef pv_requeue_node
+#undef pv_requeue_steal
 #undef pv_kick_node
 #undef pv_wait_head_or_lock
 #undef pv_defer_promote

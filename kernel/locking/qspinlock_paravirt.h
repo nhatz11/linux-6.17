@@ -47,13 +47,33 @@
 #define PV_PREV_CHECK_MASK	0xff
 
 /*
- * Queue node uses: VCPU_RUNNING & VCPU_HALTED.
+ * Queue node uses: VCPU_RUNNING & VCPU_HALTED (& VCPU_SKIPPED).
  * Queue head uses: VCPU_RUNNING & VCPU_HASHED.
  */
 enum vcpu_state {
 	VCPU_RUNNING = 0,
 	VCPU_HALTED,		/* Used only in pv_wait_node */
 	VCPU_HASHED,		/* = pv_hash'ed + VCPU_HALTED */
+	/*
+	 * G-LOCK-33: this node has been EVICTED FROM THE QUEUE by the holder
+	 * because it looked host-preempted, and must re-enter the lock itself.
+	 * Written only by pv_evict_walk(), via try_cmpxchg() from VCPU_RUNNING
+	 * so it can never displace a VCPU_HALTED (a waiter that halted on
+	 * purpose is never evicted) or a VCPU_HASHED (only the queue head is
+	 * ever hashed, and the head is never an eviction candidate). Cleared by
+	 * the evicted node's own pv_requeue_node().
+	 *
+	 * Deliberately > VCPU_RUNNING so that every existing
+	 * `state != VCPU_RUNNING` test -- tier 1 in pv_wait_early(),
+	 * ivh_rot_class() -- treats an evicted node as "not running", which is
+	 * the conservative reading in all of them. See <asm/ivh_tsc_beat.h>.
+	 *
+	 * pv_wait(&pn->state, VCPU_HALTED) is safe against it: kvm_wait()
+	 * re-reads *ptr and declines to halt when it is not VCPU_HALTED, and
+	 * pv_wait_node()'s own cmpxchg(HALTED -> RUNNING) after the wait is
+	 * conditional, so neither can clobber VCPU_SKIPPED.
+	 */
+	VCPU_SKIPPED,
 };
 
 /*
@@ -105,6 +125,18 @@ struct pv_node {
 	 * changes. Written only under ivh_pv_rot_probe.
 	 */
 	u8			rot_flags;
+	/*
+	 * G-LOCK-33 starvation bound. How many times THIS tenure has been
+	 * evicted by pv_evict_walk(). Zeroed by pv_init_node() on genuine queue
+	 * entry and deliberately NOT by pv_requeue_node(), so it accumulates
+	 * across re-entries; at ivh_pv_requeue_max the walk refuses to evict.
+	 * Written only by its own CPU (pv_requeue_node) and read by the walker;
+	 * a distinct byte from ->state and ->rot_flags, and byte stores do not
+	 * tear into each other on x86. Lives in the padding hole after
+	 * ->rot_flags, so sizeof(struct pv_node) stays exactly 32 and
+	 * ->head_ctl stays at offset 24.
+	 */
+	u8			requeues;
 	u64			head_ctl;
 };
 
@@ -1121,6 +1153,12 @@ static void pv_init_node(struct mcs_spinlock *node)
 	 * qnodes[] slot -- including across a toggle of ivh_pv_rot_probe.
 	 */
 	pn->rot_flags = 0;
+	/*
+	 * G-LOCK-33: the eviction count is per-TENURE, and this is the only
+	 * place it is cleared. pv_requeue_node() must not clear it -- carrying
+	 * it across re-entries is exactly what bounds starvation.
+	 */
+	pn->requeues = 0;
 
 	/*
 	 * IVH heartbeat cold-start seed (build plan sec 2.2, "a second hole").
@@ -1143,11 +1181,107 @@ static void pv_init_node(struct mcs_spinlock *node)
 }
 
 /*
+ * G-LOCK-33: re-arm an EVICTED node so its owner can re-enter the acquire
+ * path. Called only from queued_spin_lock_slowpath() after pv_wait_node()
+ * returns PV_WAIT_REQUEUE, on the node's own CPU, with preemption disabled.
+ *
+ * Deliberately NOT pv_init_node(): that would clear ->requeues, which is the
+ * starvation bound and must accumulate across re-entries. Everything else is
+ * reset, because the node is about to republish its tail code and must look
+ * exactly like a fresh arrival to anyone who links behind it.
+ *
+ * ORDERING. ->state must return to VCPU_RUNNING and ->next must be NULL before
+ * the caller's xchg_tail() publishes this node's encode_tail(cpu, idx) code
+ * again, or a later holder could reach a node that still reads VCPU_SKIPPED
+ * (and would evict it a second time on stale evidence) or could follow a stale
+ * ->next into a node that is no longer behind us. The caller's existing
+ * smp_wmb() before xchg_tail() provides exactly that barrier -- the requeue
+ * path jumps to a label above it, so this is free and not separately barriered
+ * here.
+ *
+ * The node's memory is safe throughout: an evicted waiter has not left
+ * queued_spin_lock_slowpath(), so it still owns its qnodes[] index and no
+ * other user on this CPU can take that slot.
+ */
+static void pv_requeue_node(struct mcs_spinlock *node)
+{
+	struct pv_node *pn = (struct pv_node *)node;
+	unsigned int r = READ_ONCE(pn->requeues);
+
+	this_cpu_inc(ivh_evict_requeued);
+	if (r < 255)
+		pn->requeues = (u8)(r + 1);
+
+	/*
+	 * G-LOCK-33 fairness evidence, recorded HERE and nowhere else.
+	 *
+	 * Incrementing bucket min(new count, top) on every eviction makes the
+	 * array a SURVIVAL CURVE: bucket i counts tenures that reached i
+	 * evictions, so it is monotonically non-increasing and the highest
+	 * non-empty bucket is the observed starvation bound directly. That is
+	 * strictly better evidence than sampling ->requeues at acquisition,
+	 * and -- more importantly -- it is complete. A tenure can acquire by
+	 * three different routes (the trylock at requeue:, promotion out of
+	 * pv_wait_node(), or finding an empty queue after xchg_tail() and
+	 * going straight to the head loop), and any per-acquisition sampling
+	 * site would silently miss at least one of them.
+	 *
+	 * ivh_pv_requeue_max is clamped to IVH_REQUEUE_MAX_CAP (255), so the
+	 * top bucket saturating is a real possibility and is documented as
+	 * ">= that many", not "exactly".
+	 */
+	{
+		unsigned int b = pn->requeues;
+
+		if (b >= IVH_EVICT_REQ_HIST_BUCKETS)
+			b = IVH_EVICT_REQ_HIST_BUCKETS - 1;
+		this_cpu_inc(ivh_evict_requeue_hist[b]);
+	}
+
+	pn->state = VCPU_RUNNING;
+	pn->head_ctl = HC(0, 0, HEAD_IDLE);
+	pn->rot_flags = 0;
+
+	/*
+	 * Re-seed the heartbeat for the same reason pv_init_node() does: we are
+	 * about to become somebody's predecessor again, and a stamp left over
+	 * from before the eviction would read stale to them immediately.
+	 */
+	if (unlikely(READ_ONCE(ivh_pv_preempt_src))) {
+		ivh_tsc_beat_publish();
+		this_cpu_inc(ivh_beat_publishes);
+	}
+}
+
+/*
+ * G-LOCK-33: the evicted waiter took the lock on the opportunistic trylock at
+ * queued_spin_lock_slowpath()'s requeue: label instead of re-joining the tail.
+ * That is the better half of the retry -- we were passed over precisely because
+ * the holder was handing off, so the lock is often free by the time we look.
+ *
+ * Called on EVERY slowpath entry, not just retries, because it shares the
+ * existing post-init trylock; hence the ->requeues test, which is one byte load
+ * from the cacheline pv_init_node() just wrote and a predicted-not-taken branch.
+ */
+static __always_inline void pv_requeue_steal(struct mcs_spinlock *node)
+{
+	struct pv_node *pn = (struct pv_node *)node;
+
+	if (unlikely(READ_ONCE(pn->requeues)))
+		this_cpu_inc(ivh_evict_steal_ok);
+}
+
+/*
  * Wait for node->locked to become true, halt the vcpu after a short spin.
  * pv_kick_node() is used to set _Q_SLOW_VAL and fill in hash table on its
  * behalf.
+ *
+ * G-LOCK-33: returns PV_WAIT_REQUEUE if this node was evicted from the queue
+ * while waiting, in which case node->locked will NEVER be set and the caller
+ * must re-enter rather than spin. PV_WAIT_OK otherwise, with node->locked
+ * already 1 (the caller still does the load-acquire for us).
  */
-static void pv_wait_node(struct mcs_spinlock *node, struct mcs_spinlock *prev,
+static int pv_wait_node(struct mcs_spinlock *node, struct mcs_spinlock *prev,
 			  struct qspinlock *lock)
 {
 	struct pv_node *pn = (struct pv_node *)node;
@@ -1195,8 +1329,31 @@ static void pv_wait_node(struct mcs_spinlock *node, struct mcs_spinlock *prev,
 				 */
 				this_cpu_add(ivh_node_spin_success_iters_sum, threshold - loop);
 				this_cpu_inc(ivh_node_spin_success_attempts);
-				return;
+				return PV_WAIT_OK;
 			}
+			/*
+			 * G-LOCK-33: evicted. Checked SECOND, after node->locked
+			 * and before anything expensive, and on every iteration:
+			 * pn->state lives at offset 20 of this same 32-byte
+			 * pv_node, so it is the same cacheline the load above
+			 * just brought in exclusive -- an L1 hit against a
+			 * cpu_relax() measured at ~26 cycles.
+			 *
+			 * Ordering against the evictor is trivially safe in both
+			 * directions: the eviction is a try_cmpxchg from
+			 * VCPU_RUNNING, so it cannot fire once we have stored
+			 * VCPU_HALTED below, and if it fired before that store
+			 * the evictor promoted somebody else and nobody will
+			 * ever set our ->locked -- which is precisely what this
+			 * return tells the caller.
+			 *
+			 * This is also the ONLY site that needs the check. A
+			 * halted node is never evicted (the cmpxchg requires
+			 * VCPU_RUNNING), and after a wakeup we fall back through
+			 * the outer for(;;) into this loop again.
+			 */
+			if (unlikely(READ_ONCE(pn->state) == VCPU_SKIPPED))
+				return PV_WAIT_REQUEUE;
 			cause = pv_wait_early(pp, loop);
 			if (cause) {
 				wait_early = true;
@@ -1361,7 +1518,11 @@ static void pv_wait_node(struct mcs_spinlock *node, struct mcs_spinlock *prev,
 	 * By now our node->locked should be 1 and our caller will not actually
 	 * spin-wait for it. We do however rely on our caller to do a
 	 * load-acquire for us.
+	 *
+	 * Unreachable: the for(;;) above is exited only by the two returns in
+	 * the inner loop. Kept so the compiler sees a value on every path.
 	 */
+	return PV_WAIT_OK;
 }
 
 /*
@@ -1505,6 +1666,168 @@ static __always_inline int ivh_rot_class(struct mcs_spinlock *n, unsigned long s
 
 	return (s64)(now - READ_ONCE(per_cpu(ivh_tsc_beat, pn->cpu).stamp)) > (s64)thr ?
 		IVH_ROT_PREEMPTED : IVH_ROT_LIVE;
+}
+
+/*
+ * ============================================================================
+ * G-LOCK-33: pv_evict_walk() -- the shared eviction logic
+ * ============================================================================
+ *
+ * ONE function, used by BOTH promotion points, so the two cannot drift:
+ *
+ *   ivh_pv_skip_point == 0  pv_handoff_rotate(), called by the thread that has
+ *                           just acquired the lock, before its critical
+ *                           section. Classification is pre-CS state.
+ *   ivh_pv_skip_point == 1  pv_deferred_handoff(), called from the unlock
+ *                           slowpath after pv_unhash(). Classification is
+ *                           current state, which is the entire point of
+ *                           G-LOCK-32.
+ *
+ * Both callers are in the same structural position -- they hold, or have just
+ * held, the lock, and every node reachable from @succ is FROZEN: a queued
+ * waiter cannot leave until somebody sets its ->locked, and only the holder
+ * does that. So ->next reads are stable and cannot fault.
+ *
+ * Returns the node to promote. The caller promotes it exactly as it would have
+ * promoted @succ -- no ->next pointer is rewritten here, because the evicted
+ * nodes are simply not promoted and the walker is leaving the queue anyway.
+ *
+ * Every exit promotes the node currently under examination. There is no
+ * backtracking, and that is load-bearing: because an eviction is a removal
+ * rather than a reordering, the queue is well formed after every single
+ * iteration, so committing incrementally is safe. The consequence worth
+ * stating is that the node whose predecessor got evicted is ALWAYS the node
+ * that gets promoted, so no waiter is ever left spinning behind an orphan.
+ *
+ * ONE rdtsc for the whole walk, and src/threshold/cap read once, matching
+ * ivh_rot_probe_walk()'s discipline: a single timestamp is a consistent
+ * snapshot of the queue rather than one smeared across up to HOP_CAP readings.
+ */
+static noinline struct mcs_spinlock *pv_evict_walk(struct mcs_spinlock *succ)
+{
+	unsigned long src = READ_ONCE(ivh_pv_preempt_src);
+	u64 thr = READ_ONCE(ivh_pv_beat_threshold);
+	u64 now = rdtsc();
+	unsigned long cap = READ_ONCE(ivh_pv_requeue_max);
+	struct mcs_spinlock *cand = succ;
+	int hop, cls;
+
+	if (cap > IVH_REQUEUE_MAX_CAP)
+		cap = IVH_REQUEUE_MAX_CAP;
+
+	this_cpu_inc(ivh_evict_walks);
+
+	for (hop = 0; hop < IVH_ROT_HOP_CAP; hop++) {
+		struct pv_node *pn = (struct pv_node *)cand;
+		struct mcs_spinlock *after;
+		u8 old = VCPU_RUNNING;
+
+		/*
+		 * LIVE  -- the node we came for.
+		 * HALTED -- G-LOCK-31's fairness rule: a waiter that halted on
+		 *           purpose is never skipped. Promote it; pv_kick_node()
+		 *           (skip_point 0) or the F1 promote in
+		 *           pv_deferred_handoff() (skip_point 1) wakes it.
+		 * Either way: stop and promote @cand.
+		 */
+		cls = ivh_rot_class(cand, src, thr, now);
+		if (cls != IVH_ROT_PREEMPTED) {
+			/*
+			 * Count only the HALTED stop: that is the fairness rule
+			 * firing (we found a waiter that halted on purpose and
+			 * refused to pass it). A LIVE stop is the ordinary and
+			 * overwhelmingly common outcome -- the successor could
+			 * use the lock -- and folding the two together would
+			 * make the fairness rule look like it fires on nearly
+			 * every handoff.
+			 */
+			if (cls == IVH_ROT_HALTED)
+				this_cpu_inc(ivh_evict_stop_halted);
+			goto out;
+		}
+
+		/*
+		 * THE ONLY STRUCTURAL RULE LEFT: never evict a node whose
+		 * ->next reads NULL.
+		 *
+		 * Under rotation this was a REFUSED opportunity -- the chosen
+		 * node had to be moved to the front, and moving the tail would
+		 * detach it from the lock word (or race an enqueuer that has
+		 * done xchg_tail() but not yet stored into prev->next). Here it
+		 * is not a refusal at all: a NULL ->next means there is nobody
+		 * further along to promote instead, so evicting @cand could
+		 * only leave the lock with no successor. Promote it.
+		 *
+		 * That is why eviction has no tail problem. It never writes the
+		 * promoted node's ->next, so the promoted node is allowed to BE
+		 * the tail -- which is what makes a two-waiter queue
+		 * (holder -> cand -> after) actionable here and not under
+		 * rotation.
+		 */
+		after = READ_ONCE(cand->next);
+		if (!after) {
+			this_cpu_inc(ivh_evict_tail_stop);
+			goto out;
+		}
+
+		/*
+		 * STARVATION BOUND. ->requeues counts evictions within this
+		 * tenure and is cleared only by pv_init_node(), so a waiter
+		 * reaches the front at most ivh_pv_requeue_max + 1 times before
+		 * it is served regardless of how preempted it looks. cap == 0
+		 * disables eviction entirely.
+		 */
+		if (READ_ONCE(pn->requeues) >= cap) {
+			this_cpu_inc(ivh_evict_cap_refused);
+			goto out;
+		}
+
+		/*
+		 * THE COMMIT POINT, and the halt-race guard in one operation.
+		 *
+		 * Success: @cand was VCPU_RUNNING by its own account. A
+		 * host-preempted vCPU still reads VCPU_RUNNING -- that is tier
+		 * 2's whole premise -- so @cand is either spinning (and will
+		 * see this on its next iteration) or off-CPU (and will see it
+		 * the moment the host schedules it). No kick, no hypercall, no
+		 * IPI: the eviction is free on this path, which is the one
+		 * holding the lock.
+		 *
+		 * Failure: @cand reached VCPU_HALTED between the classification
+		 * above and here, so by the fairness rule it must NOT be
+		 * evicted. Promote it. VCPU_HASHED cannot occur -- only the
+		 * queue head is ever hashed and the head is never reachable
+		 * from a holder's ->next -- and VCPU_SKIPPED cannot occur
+		 * because an already-evicted node is not in the queue.
+		 *
+		 * Full try_cmpxchg (not _relaxed): it must order the ->next and
+		 * ->state reads above against the caller's subsequent promotion
+		 * store, and it is taken at most once per evicted waiter.
+		 */
+		if (!try_cmpxchg(&pn->state, &old, VCPU_SKIPPED)) {
+			this_cpu_inc(ivh_evict_halt_race);
+			goto out;
+		}
+
+		this_cpu_inc(ivh_evict_marked);
+		cand = after;
+	}
+	this_cpu_inc(ivh_evict_hop_cap);
+
+out:
+	if (cand != succ) {
+		this_cpu_inc(ivh_evict_walks_acted);
+		/*
+		 * The promoted node is LIVE (or HALTED-and-about-to-be-woken)
+		 * as of the decision, so its Phase 0b class is 0 -- not the
+		 * evicted nodes' class. Depositing anything else here would
+		 * label a healthy new head as stale and corrupt
+		 * ivh_rot_idle_hist[]. Same store, same reason, as
+		 * pv_handoff_rotate()'s "Store 5".
+		 */
+		WRITE_ONCE(((struct pv_node *)cand)->rot_flags, 0);
+	}
+	return cand;
 }
 
 /*
@@ -1660,6 +1983,21 @@ static __always_inline void pv_handoff_rotate(struct qspinlock *lock,
 	/* lock/node unused: rotation needs neither, by design. */
 	(void)lock;
 	(void)node;
+
+	/*
+	 * G-LOCK-33, PROMOTION POINT 0 (pre-CS). Eviction takes precedence over
+	 * rotation: they are two answers to the same question and running both
+	 * would splice a queue we are also removing nodes from. Checked before
+	 * the probe|enable gate so eviction is reachable with rotation entirely
+	 * off, which is how the A/B is run -- one kernel, three modes
+	 * (off / rotate / evict), selected live.
+	 */
+	if (unlikely(READ_ONCE(ivh_pv_evict_enable))) {
+		succ = *nextp;
+		if (succ)
+			*nextp = pv_evict_walk(succ);
+		return;
+	}
 
 	/*
 	 * Both knobs off == upstream, to the instruction: one load of each
@@ -2406,7 +2744,16 @@ static void pv_deferred_handoff(struct qspinlock *lock, struct pv_node *first)
 
 	this_cpu_inc(ivh_defer_handoffs);
 
-	if (READ_ONCE(ivh_pv_rot_enable)) {
+	/*
+	 * G-LOCK-33, PROMOTION POINT 1 (unlock). Same walk, same rules, same
+	 * function as the pre-CS path -- only the timing of the classification
+	 * differs, which is the entire reason skip_point=1 exists. Takes
+	 * precedence over the splice below for the same reason as in
+	 * pv_handoff_rotate().
+	 */
+	if (unlikely(READ_ONCE(ivh_pv_evict_enable)))
+		pick = pv_evict_walk(pick);
+	else if (READ_ONCE(ivh_pv_rot_enable)) {
 		unsigned long src = READ_ONCE(ivh_pv_preempt_src);
 		u64 thr = READ_ONCE(ivh_pv_beat_threshold);
 		u64 now = rdtsc();
