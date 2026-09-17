@@ -1450,6 +1450,8 @@ unsigned long ivh_pv_evict_cheap_now __read_mostly = 1UL;
  * A sane first value is ~10x ivh_pv_beat_threshold.
  */
 unsigned long ivh_pv_evict_quiet __read_mostly = 0UL;
+/* Design D; packed with the other fast-path tunables. See <asm/ivh_tsc_beat.h>. */
+unsigned long ivh_pv_evict_node_stamp __read_mostly = 0UL;
 /*
  * ... and its storage. Deliberately NOT in the read-mostly block above: it is
  * written (rarely) at runtime, and sharing a line with the tunables would let
@@ -2558,6 +2560,13 @@ static const struct ctl_table ivh_pv_sysctls[] = {
 	{
 		.procname	= "ivh_pv_evict_cheap_now",
 		.data		= &ivh_pv_evict_cheap_now,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_pv_evict_node_stamp",
+		.data		= &ivh_pv_evict_node_stamp,
 		.maxlen		= sizeof(unsigned long),
 		.mode		= 0644,
 		.proc_handler	= proc_doulongvec_minmax,

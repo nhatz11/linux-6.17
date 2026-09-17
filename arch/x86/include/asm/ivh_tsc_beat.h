@@ -959,6 +959,14 @@ extern unsigned long ivh_pv_evict_debug;
 extern unsigned long ivh_pv_evict_cheap_now;
 
 /*
+ * Design D. 0 (default) = judge a successor's staleness from its CPU's per-cpu
+ * heartbeat line (a cross-CPU read on every handoff). 1 = from a coarse stamp
+ * the waiter keeps in its own pv_node (head_ctl upper 32 bits), on a line the
+ * holder already owns. Same threshold and meaning; A/B-able on one boot.
+ */
+extern unsigned long ivh_pv_evict_node_stamp;
+
+/*
  * G-LOCK-33 ENTRY-COST GATE ("global quiet hint"). 0 (default) = OFF, current
  * behaviour exactly. Non-zero = a staleness window in RAW TSC CYCLES.
  *

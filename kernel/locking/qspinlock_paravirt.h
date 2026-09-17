@@ -1106,6 +1106,54 @@ static noinline bool ivh_cs_head_probe_one(struct qspinlock *lock,
  * The src check is placed FIRST and reads a read-mostly global, so the
  * default path is one predicted branch and no rdtsc.
  */
+/*
+ * DESIGN D (2026-09-17): a per-NODE staleness stamp, read by the holder from a
+ * cacheline it already owns.
+ *
+ * The eviction pre-filter decided "is the successor preempted?" by reading
+ * per_cpu(ivh_tsc_beat, pn->cpu).stamp -- ANOTHER vCPU's per-cpu line, on
+ * every contended handoff. This stores the same information INSIDE the
+ * waiter's own pv_node instead: a coarse TSC stamp in head_ctl's upper 32 bits
+ * (the `gen` field of HC(), written as 0 everywhere and never read -- both
+ * readers mask with & 0xffff, nothing cmpxchgs head_ctl, and no file outside
+ * this one touches it).
+ *
+ * The successor's 32-byte pv_node sits in ONE cacheline, and the promotion
+ * store (next->locked = 1) and pv_kick_node()'s state cmpxchg write that line
+ * anyway, so this read moves no cacheline between CPUs.
+ *
+ * Single writer: head_ctl is written ONLY by the node's own CPU (pv_init_node,
+ * pv_requeue_node, its own spin loops). The holder only reads, so a u64 load is
+ * never torn.
+ *
+ * Units: (rdtsc >> 8) truncated to u32, i.e. 256-cycle resolution. The signed
+ * 32-bit difference is correct for real ages below 2^31 * 256 cycles (~250 s
+ * at 2.2 GHz), far beyond any wait.
+ */
+#define IVH_NODE_STAMP(t)	((u32)((t) >> 8))
+
+static __always_inline void ivh_node_stamp_set(struct pv_node *pn, u64 t)
+{
+	/* preserve the low 32 bits (yields | head state) */
+	u64 lo = READ_ONCE(pn->head_ctl) & 0xffffffffULL;
+
+	WRITE_ONCE(pn->head_ctl, ((u64)IVH_NODE_STAMP(t) << 32) | lo);
+}
+
+static __always_inline bool ivh_node_stale(struct pv_node *pn, u64 now, u64 thr)
+{
+	u32 st = (u32)(READ_ONCE(pn->head_ctl) >> 32);
+
+	/*
+	 * 0 = never stamped (queued before the knob was switched on, or a head,
+	 * whose loop writes HC(0, ...)). Treat as UNKNOWN, i.e. not stale: a
+	 * zero stamp would otherwise read as ancient and cause a false eviction.
+	 */
+	if (!st)
+		return false;
+	return (s32)(IVH_NODE_STAMP(now) - st) > (s32)(thr >> 8);
+}
+
 static __always_inline void ivh_beat_publish_in_spin(unsigned long loop)
 {
 	if (likely(!READ_ONCE(ivh_pv_preempt_src)))
@@ -1115,6 +1163,24 @@ static __always_inline void ivh_beat_publish_in_spin(unsigned long loop)
 
 	ivh_tsc_beat_publish();
 	this_cpu_inc(ivh_beat_publishes);
+}
+
+/* As above, and also refresh this waiter's per-node stamp (design D). */
+static __always_inline void ivh_node_publish_in_spin(struct pv_node *pn,
+						     unsigned long loop)
+{
+	u64 t;
+
+	if (likely(!READ_ONCE(ivh_pv_preempt_src)))
+		return;
+	if (loop & READ_ONCE(ivh_pv_beat_publish_mask))
+		return;
+
+	t = rdtsc();
+	this_cpu_write(ivh_tsc_beat.stamp, t);
+	this_cpu_inc(ivh_beat_publishes);
+	if (READ_ONCE(ivh_pv_evict_node_stamp))
+		ivh_node_stamp_set(pn, t);
 }
 
 /*
@@ -1301,8 +1367,12 @@ static void pv_init_node(struct mcs_spinlock *node)
 	 * dirtying store on EVERY qspinlock slowpath entry to buy nothing.
 	 */
 	if (unlikely(READ_ONCE(ivh_pv_preempt_src))) {
-		ivh_tsc_beat_publish();
+		u64 t = rdtsc();
+
+		this_cpu_write(ivh_tsc_beat.stamp, t);
 		this_cpu_inc(ivh_beat_publishes);
+		if (READ_ONCE(ivh_pv_evict_node_stamp))
+			ivh_node_stamp_set(pn, t);
 	}
 }
 
@@ -1375,8 +1445,12 @@ static void pv_requeue_node(struct mcs_spinlock *node)
 	 * from before the eviction would read stale to them immediately.
 	 */
 	if (unlikely(READ_ONCE(ivh_pv_preempt_src))) {
-		ivh_tsc_beat_publish();
+		u64 t = rdtsc();
+
+		this_cpu_write(ivh_tsc_beat.stamp, t);
 		this_cpu_inc(ivh_beat_publishes);
+		if (READ_ONCE(ivh_pv_evict_node_stamp))
+			ivh_node_stamp_set(pn, t);
 	}
 }
 
@@ -1598,7 +1672,7 @@ static int pv_wait_node(struct mcs_spinlock *node, struct mcs_spinlock *prev,
 				}
 				break;
 			}
-			ivh_beat_publish_in_spin(loop);
+			ivh_node_publish_in_spin(pn, loop);
 			cpu_relax();
 		}
 
@@ -1943,9 +2017,18 @@ static __always_inline bool pv_evict_can_skip(struct mcs_spinlock *succ)
 		goto skip;
 
 	/* The expensive one: a remote per-CPU cacheline. */
-	if ((s64)(now - READ_ONCE(per_cpu(ivh_tsc_beat, pn->cpu).stamp)) >
-	    (s64)READ_ONCE(ivh_pv_beat_threshold))
+	/*
+	 * Design D: with ivh_pv_evict_node_stamp set, judge staleness from the
+	 * successor's OWN pv_node line instead of its CPU's per-cpu heartbeat
+	 * line. Same threshold, same meaning, no cross-CPU cacheline read.
+	 */
+	if (READ_ONCE(ivh_pv_evict_node_stamp)) {
+		if (ivh_node_stale(pn, now, READ_ONCE(ivh_pv_beat_threshold)))
+			return false;		/* candidate: do the real walk */
+	} else if ((s64)(now - READ_ONCE(per_cpu(ivh_tsc_beat, pn->cpu).stamp)) >
+		   (s64)READ_ONCE(ivh_pv_beat_threshold)) {
 		return false;			/* candidate: do the real walk */
+	}
 skip:
 	return !READ_ONCE(ivh_pv_evict_debug);
 }
@@ -2058,7 +2141,22 @@ static noinline struct mcs_spinlock *pv_evict_walk(struct mcs_spinlock *succ)
 		 *           pv_deferred_handoff() (skip_point 1) wakes it.
 		 * Either way: stop and promote @cand.
 		 */
-		cls = ivh_rot_class(cand, src, thr, now);
+		/*
+		 * Design D: same three-way classification as ivh_rot_class(),
+		 * but staleness comes from the node's own stamp. State is still
+		 * read FIRST, so a halted waiter is never judged by its stamp.
+		 */
+		if (READ_ONCE(ivh_pv_evict_node_stamp) && src == 2) {
+			struct pv_node *cpn = (struct pv_node *)cand;
+
+			if (READ_ONCE(cpn->state) != VCPU_RUNNING)
+				cls = IVH_ROT_HALTED;
+			else
+				cls = ivh_node_stale(cpn, now, thr) ?
+				      IVH_ROT_PREEMPTED : IVH_ROT_LIVE;
+		} else {
+			cls = ivh_rot_class(cand, src, thr, now);
+		}
 		if (cls == IVH_ROT_PREEMPTED) {
 			/*
 			 * Keep the ivh_pv_evict_quiet gate open for as long as
