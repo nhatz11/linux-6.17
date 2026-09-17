@@ -1408,6 +1408,10 @@ unsigned long ivh_pv_requeue_max = 4UL;
 
 /* Max evictions per handoff. See pv_evict_walk(). */
 unsigned long ivh_pv_evict_hop_cap = 1UL;
+
+/* See <asm/ivh_tsc_beat.h>. Both default to the CHEAP path. */
+unsigned long ivh_pv_evict_debug = 0UL;
+unsigned long ivh_pv_evict_cheap_now = 1UL;
 /*
  * 3,300,000 cycles = 1.5 ms at 2200 MHz -- is_cpu_preempted()'s existing
  * 1,500,000 ns threshold (kernel/sched/cputime.c) expressed in cycles, so
@@ -2498,6 +2502,20 @@ static const struct ctl_table ivh_pv_sysctls[] = {
 		.maxlen		= sizeof(unsigned long),
 		.mode		= 0644,
 		.proc_handler	= ivh_pv_proc_evict_enable,
+	},
+	{
+		.procname	= "ivh_pv_evict_debug",
+		.data		= &ivh_pv_evict_debug,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_pv_evict_cheap_now",
+		.data		= &ivh_pv_evict_cheap_now,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
 	},
 	{
 		.procname	= "ivh_pv_evict_hop_cap",

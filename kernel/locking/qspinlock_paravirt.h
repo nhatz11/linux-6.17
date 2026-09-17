@@ -1889,13 +1889,46 @@ static __always_inline int ivh_rot_class(struct mcs_spinlock *n, unsigned long s
  */
 static noinline struct mcs_spinlock *pv_evict_walk(struct mcs_spinlock *succ)
 {
-	unsigned long src = READ_ONCE(ivh_pv_preempt_src);
-	u64 thr = READ_ONCE(ivh_pv_beat_threshold);
-	u64 now = rdtsc();
-	unsigned long cap = READ_ONCE(ivh_pv_requeue_max);
-	unsigned long hopcap = READ_ONCE(ivh_pv_evict_hop_cap);
+	unsigned long src, cap, hopcap;
+	u64 thr, now;
 	struct mcs_spinlock *cand = succ;
 	int hop, cls;
+	bool dbg = READ_ONCE(ivh_pv_evict_debug);
+
+	/*
+	 * ENTRY-COST OPTIMISATION (2026-09-17). The sweep showed this walk costs
+	 * ~3.4% of throughput even at a threshold where it evicts ESSENTIALLY
+	 * NOTHING (acted == 1) -- so the cost is the walk's fixed entry price,
+	 * paid on 100% of handoffs to serve the ~0.3% that act, not the evicting.
+	 *
+	 * Cheap gate first: a successor that is not VCPU_RUNNING is HALTED (or
+	 * HASHED) and is promoted unchanged by the fairness rule, so decide that
+	 * with ONE byte load from a cacheline this handoff already owns -- before
+	 * any rdtsc or any read-mostly global.
+	 */
+	if (READ_ONCE(((struct pv_node *)succ)->state) != VCPU_RUNNING) {
+		if (dbg) {
+			this_cpu_inc(ivh_evict_walks);
+			this_cpu_inc(ivh_evict_stop_halted);
+		}
+		return succ;
+	}
+
+	src = READ_ONCE(ivh_pv_preempt_src);
+	thr = READ_ONCE(ivh_pv_beat_threshold);
+	cap = READ_ONCE(ivh_pv_requeue_max);
+	hopcap = READ_ONCE(ivh_pv_evict_hop_cap);
+
+	/*
+	 * "now" without rdtsc. rdtsc is ~20-25 cycles against a handoff measured
+	 * at ~720, i.e. ~3% on its own -- the same order as the whole observed
+	 * regression. Our OWN heartbeat stamp is in the identical time base and
+	 * is an L1 read of a per-CPU line. It can lag (publish is every 4096 spin
+	 * iterations plus every tick), which makes the computed age SMALLER and
+	 * therefore classifies FEWER waiters as preempted -- conservative, never
+	 * a false eviction. Knob-selectable so both can be measured.
+	 */
+	now = READ_ONCE(ivh_pv_evict_cheap_now) ? ivh_beat_now_cheap() : rdtsc();
 
 	if (cap > IVH_REQUEUE_MAX_CAP)
 		cap = IVH_REQUEUE_MAX_CAP;
@@ -1911,7 +1944,8 @@ static noinline struct mcs_spinlock *pv_evict_walk(struct mcs_spinlock *succ)
 	if (hopcap > IVH_ROT_HOP_CAP)
 		hopcap = IVH_ROT_HOP_CAP;
 
-	this_cpu_inc(ivh_evict_walks);
+	if (dbg)
+		this_cpu_inc(ivh_evict_walks);
 
 	for (hop = 0; hop < (int)hopcap; hop++) {
 		struct pv_node *pn = (struct pv_node *)cand;
@@ -1938,7 +1972,8 @@ static noinline struct mcs_spinlock *pv_evict_walk(struct mcs_spinlock *succ)
 			 * every handoff.
 			 */
 			if (cls == IVH_ROT_HALTED)
-				this_cpu_inc(ivh_evict_stop_halted);
+				if (dbg)
+					this_cpu_inc(ivh_evict_stop_halted);
 			goto out;
 		}
 
@@ -1962,6 +1997,8 @@ static noinline struct mcs_spinlock *pv_evict_walk(struct mcs_spinlock *succ)
 		 */
 		after = READ_ONCE(cand->next);
 		if (!after) {
+			if (dbg)
+				if (dbg)
 			this_cpu_inc(ivh_evict_tail_stop);
 			goto out;
 		}
@@ -1974,6 +2011,8 @@ static noinline struct mcs_spinlock *pv_evict_walk(struct mcs_spinlock *succ)
 		 * disables eviction entirely.
 		 */
 		if (READ_ONCE(pn->requeues) >= cap) {
+			if (dbg)
+				if (dbg)
 			this_cpu_inc(ivh_evict_cap_refused);
 			goto out;
 		}
@@ -2001,6 +2040,8 @@ static noinline struct mcs_spinlock *pv_evict_walk(struct mcs_spinlock *succ)
 		 * store, and it is taken at most once per evicted waiter.
 		 */
 		if (!try_cmpxchg(&pn->state, &old, VCPU_SKIPPED)) {
+			if (dbg)
+				if (dbg)
 			this_cpu_inc(ivh_evict_halt_race);
 			goto out;
 		}
@@ -2012,7 +2053,8 @@ static noinline struct mcs_spinlock *pv_evict_walk(struct mcs_spinlock *succ)
 
 out:
 	if (cand != succ) {
-		this_cpu_inc(ivh_evict_walks_acted);
+		if (dbg)
+			this_cpu_inc(ivh_evict_walks_acted);
 		/*
 		 * The promoted node is LIVE (or HALTED-and-about-to-be-woken)
 		 * as of the decision, so its Phase 0b class is 0 -- not the

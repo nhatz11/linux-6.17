@@ -940,6 +940,29 @@ extern unsigned long ivh_pv_requeue_max;
  * See pv_evict_walk() for why 8 is a storm amplifier under heavy steal.
  */
 extern unsigned long ivh_pv_evict_hop_cap;
+
+/*
+ * Diagnostic counters in the eviction walk are gated on this. Default 0: the
+ * walk runs on EVERY handoff, so a handful of this_cpu_inc()s there are a
+ * per-handoff tax paid to observe an event that fires ~0.3% of the time.
+ * Set to 1 when you need the full counter set; leave 0 when measuring.
+ */
+extern unsigned long ivh_pv_evict_debug;
+
+/*
+ * 1 (default) = derive "now" from this CPU's own heartbeat stamp instead of
+ * rdtsc in the eviction walk. Same time base, L1 read, no ~20-25 cycle rdtsc on
+ * every handoff. The stamp can lag, which SHRINKS the computed age and so
+ * classifies fewer waiters as preempted -- conservative by construction.
+ * 0 = use rdtsc, for comparison.
+ */
+extern unsigned long ivh_pv_evict_cheap_now;
+
+/* This CPU's own last published heartbeat, in the same time base as rdtsc(). */
+static __always_inline u64 ivh_beat_now_cheap(void)
+{
+	return raw_cpu_read(ivh_tsc_beat.stamp);
+}
 #define IVH_REQUEUE_MAX_CAP	255U
 
 /* Evictions committed (cmpxchg RUNNING->SKIPPED won). */
