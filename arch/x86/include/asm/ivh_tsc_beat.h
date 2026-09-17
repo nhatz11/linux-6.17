@@ -1098,6 +1098,17 @@ DECLARE_PER_CPU(u64, ivh_head_foreign_forced);
 DECLARE_PER_CPU(u64, ivh_evict_ok_while_skipped);
 
 /*
+ * Age of the evidence each eviction acted on. See ivh_evict_age_record() in
+ * kernel/locking/qspinlock_paravirt.h. Off by default (costs an rdtsc per
+ * committed eviction). log2 buckets in raw TSC cycles; bucket 0 = zero/negative.
+ */
+extern unsigned long ivh_pv_evict_age_hist;
+DECLARE_PER_CPU(u64, ivh_evict_age_used_hist[IVH_BEAT_AGE_HIST_BUCKETS]);
+DECLARE_PER_CPU(u64, ivh_evict_age_true_hist[IVH_BEAT_AGE_HIST_BUCKETS]);
+DECLARE_PER_CPU(u64, ivh_evict_cpubeat_hist[IVH_BEAT_AGE_HIST_BUCKETS]);
+DECLARE_PER_CPU(u64, ivh_evict_age_negative);
+
+/*
  * How many times a single tenure was evicted before it finally acquired.
  * Bucket i = exactly i evictions, top bucket saturates. THIS HISTOGRAM IS THE
  * FAIRNESS EVIDENCE for ivh_pv_requeue_max -- a claim that eviction is

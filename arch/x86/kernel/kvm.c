@@ -1658,6 +1658,11 @@ DEFINE_PER_CPU(u64, ivh_hash_dup_head);
 DEFINE_PER_CPU(u64, ivh_head_foreign_hash);
 DEFINE_PER_CPU(u64, ivh_head_foreign_forced);
 DEFINE_PER_CPU(u64, ivh_evict_ok_while_skipped);
+unsigned long ivh_pv_evict_age_hist = 0UL;
+DEFINE_PER_CPU(u64, ivh_evict_age_used_hist[IVH_BEAT_AGE_HIST_BUCKETS]);
+DEFINE_PER_CPU(u64, ivh_evict_age_true_hist[IVH_BEAT_AGE_HIST_BUCKETS]);
+DEFINE_PER_CPU(u64, ivh_evict_cpubeat_hist[IVH_BEAT_AGE_HIST_BUCKETS]);
+DEFINE_PER_CPU(u64, ivh_evict_age_negative);
 DEFINE_PER_CPU(u64, ivh_evict_requeue_hist[IVH_EVICT_REQ_HIST_BUCKETS]);
 DEFINE_PER_CPU(u64, ivh_cs_abstain_rot);
 DEFINE_PER_CPU(u64, ivh_cs_abstain_tag);
@@ -2560,6 +2565,13 @@ static const struct ctl_table ivh_pv_sysctls[] = {
 	{
 		.procname	= "ivh_pv_evict_cheap_now",
 		.data		= &ivh_pv_evict_cheap_now,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_pv_evict_age_hist",
+		.data		= &ivh_pv_evict_age_hist,
 		.maxlen		= sizeof(unsigned long),
 		.mode		= 0644,
 		.proc_handler	= proc_doulongvec_minmax,

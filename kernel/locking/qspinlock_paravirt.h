@@ -2068,6 +2068,60 @@ skip:
  * ivh_rot_probe_walk()'s discipline: a single timestamp is a consistent
  * snapshot of the queue rather than one smeared across up to HOP_CAP readings.
  */
+/*
+ * G-LOCK-33 DIAGNOSTIC (ivh_pv_evict_age_hist): how old was the evidence each
+ * eviction acted on?
+ *
+ * Motivation, measured: with NO host contention (capacity ~1020) eviction still
+ * fired ~22,000 times per 10 s on qlockbench. With no host steal nobody is
+ * host-preempted, so every one of those is a FALSE eviction of a waiter that
+ * was actually running. Two reasoned explanations each held only partly:
+ *   - a wake-up window (stamp still pre-halt): ruled out as the main cause, halts
+ *     ran 2-600 per run against ~22,000 evictions;
+ *   - the 4096-iteration update interval exceeding the 100 us threshold: a real
+ *     contributor (updating every 256 iterations cut evictions 4-9x) but not the
+ *     whole story, thousands remained at ~11 us between updates.
+ * Instead of a third guess, record the ages directly. Three histograms, same
+ * log2 bucketing as ivh_beat_age_hist_raw (bucket i = 2^i..2^(i+1)-1 cycles,
+ * bucket 0 = zero or negative):
+ *   used    -- the age the decision was actually made on (cheap now or rdtsc)
+ *   true    -- the same stamp against a fresh rdtsc() at the same moment
+ *   cpubeat -- the evicted node's CPU's per-cpu heartbeat age. If the node's
+ *              stamp is stale but its CPU's beat is fresh, that CPU is alive and
+ *              running something other than this waiter's spin loop.
+ * noinline and counter-only: it runs only on a committed eviction, and there is
+ * no printk anywhere on this path.
+ */
+static __always_inline int ivh_age_bucket(s64 age)
+{
+	int b = (age > 0) ? ilog2((u64)age) : 0;
+
+	return b >= IVH_BEAT_AGE_HIST_BUCKETS ? IVH_BEAT_AGE_HIST_BUCKETS - 1 : b;
+}
+
+static noinline void ivh_evict_age_record(unsigned long src, u64 now,
+					  u32 snap_node, u64 snap_cpu)
+{
+	u64 tnow = rdtsc();
+	s64 used, truth, cpu_age;
+
+	if (READ_ONCE(ivh_pv_evict_node_stamp) && src == 2) {
+		/* multiply, never left-shift: the difference may be negative */
+		used  = (s64)(s32)(IVH_NODE_STAMP(now)  - snap_node) * 256;
+		truth = (s64)(s32)(IVH_NODE_STAMP(tnow) - snap_node) * 256;
+	} else {
+		used  = (s64)(now  - snap_cpu);
+		truth = (s64)(tnow - snap_cpu);
+	}
+	cpu_age = (s64)(tnow - snap_cpu);
+
+	if (used < 0)
+		this_cpu_inc(ivh_evict_age_negative);
+	this_cpu_inc(ivh_evict_age_used_hist[ivh_age_bucket(used)]);
+	this_cpu_inc(ivh_evict_age_true_hist[ivh_age_bucket(truth)]);
+	this_cpu_inc(ivh_evict_cpubeat_hist[ivh_age_bucket(cpu_age)]);
+}
+
 static noinline struct mcs_spinlock *pv_evict_walk(struct mcs_spinlock *succ)
 {
 	unsigned long src, cap, hopcap;
@@ -2131,6 +2185,9 @@ static noinline struct mcs_spinlock *pv_evict_walk(struct mcs_spinlock *succ)
 	for (hop = 0; hop < (int)hopcap; hop++) {
 		struct pv_node *pn = (struct pv_node *)cand;
 		struct mcs_spinlock *after;
+		bool agesnap;
+		u32 snap_node = 0;
+		u64 snap_cpu = 0;
 		u8 old = VCPU_RUNNING;
 
 		/*
@@ -2241,6 +2298,18 @@ static noinline struct mcs_spinlock *pv_evict_walk(struct mcs_spinlock *succ)
 		 * ->state reads above against the caller's subsequent promotion
 		 * store, and it is taken at most once per evicted waiter.
 		 */
+		/*
+		 * Snapshot the evidence BEFORE committing. A falsely evicted
+		 * waiter is by definition running, so it can write a fresh stamp
+		 * moments after the cmpxchg; reading afterwards would drag every
+		 * sample toward zero and fake a "the stamp is fine" result.
+		 */
+		agesnap = unlikely(READ_ONCE(ivh_pv_evict_age_hist));
+		if (agesnap) {
+			snap_node = (u32)(READ_ONCE(pn->head_ctl) >> 32);
+			snap_cpu  = READ_ONCE(per_cpu(ivh_tsc_beat, pn->cpu).stamp);
+		}
+
 		if (!try_cmpxchg(&pn->state, &old, VCPU_SKIPPED)) {
 			if (dbg)
 				this_cpu_inc(ivh_evict_halt_race);
@@ -2248,6 +2317,8 @@ static noinline struct mcs_spinlock *pv_evict_walk(struct mcs_spinlock *succ)
 		}
 
 		this_cpu_inc(ivh_evict_marked);
+		if (agesnap)
+			ivh_evict_age_record(src, now, snap_node, snap_cpu);
 		cand = after;
 	}
 	this_cpu_inc(ivh_evict_hop_cap);
