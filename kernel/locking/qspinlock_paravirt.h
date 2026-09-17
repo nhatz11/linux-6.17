@@ -542,6 +542,22 @@ static inline bool is_wait_preempted(int cpu, bool tier2)
 	}
 
 	/*
+	 * G-LOCK-33 entry-cost gate feed. This is the ONE place in the tree
+	 * that already decides "some vCPU looks preempted" for a reason of its
+	 * own and on traffic that is independent of eviction, which is exactly
+	 * what ivh_pv_evict_quiet needs to keep the gate from self-latching.
+	 * Inside `if (beat)`, so it costs nothing on the overwhelmingly common
+	 * fresh-heartbeat verdict, and nothing at all with the gate disarmed
+	 * (ivh_pv_evict_quiet == 0, the default) beyond one read-mostly load.
+	 *
+	 * ivh_beat_now_cheap() rather than a second rdtsc: same time base as
+	 * the walk's own "now", an L1 read, and it lags -- which ages the hint
+	 * and therefore suppresses MORE evictions, never fewer.
+	 */
+	if (beat)
+		ivh_beat_note_preempted(ivh_beat_now_cheap());
+
+	/*
 	 * Unconditional (src==1 AND src==2) raw age histogram -- added
 	 * 2026-09-07. The EXISTING ivh_beat_age_hist_running/preempted below
 	 * are gated behind src==1's ground-truth comparison, which is dead on
@@ -1854,6 +1870,88 @@ static __always_inline int ivh_rot_class(struct mcs_spinlock *n, unsigned long s
 
 /*
  * ============================================================================
+ * pv_evict_can_skip() -- the inline pre-filter in front of pv_evict_walk()
+ * ============================================================================
+ *
+ * ENTRY-COST OPTIMISATION, step 2 (2026-09-17). The threshold sweep put the
+ * walk's FIXED entry cost at ~3.4% of throughput at a threshold where it
+ * evicted essentially nothing (1 eviction in 20 s), so the cost is paid on
+ * 100% of contended handoffs to serve the ~0.3% that act. Step 1 (the
+ * ->state gate + cheap "now" + debug-gated counters) removed the rdtsc and
+ * the unconditional counters but left the call itself, and the call is not
+ * free: pv_evict_walk() is noinline, so every handoff pays call/ret plus the
+ * caller-saved spill/reload that a call forces on queued_spin_lock_slowpath(),
+ * and then re-loads four read-mostly globals the fast path never uses
+ * (ivh_pv_evict_debug, ivh_pv_requeue_max, ivh_pv_evict_hop_cap) and re-reads
+ * ->state a second time inside ivh_rot_class().
+ *
+ * So: decide the fast path HERE, inlined at the call site, and enter the walk
+ * only when the successor actually looks like an eviction candidate. Returns
+ * true iff the caller may promote @succ unchanged without calling the walk.
+ *
+ * SEMANTICS. Every "true" here is a case in which pv_evict_walk() would have
+ * returned @succ unchanged as well:
+ *   - ->state != VCPU_RUNNING  -- the walk's own cheap gate, verbatim.
+ *   - src != 2 and !vcpu_is_preempted()  -- ivh_rot_class()'s src != 2 arm,
+ *     verbatim (and eviction cannot legally be armed at src != 2 anyway; the
+ *     proc handler refuses it).
+ *   - fresh heartbeat  -- ivh_rot_class()'s IVH_ROT_LIVE, verbatim, using the
+ *     same "now" and the same threshold.
+ * When it returns false the walk runs and re-derives everything from scratch,
+ * so an eviction requires BOTH reads to say PREEMPTED. That is a strict SUBSET
+ * of what the single-read version evicted -- conservative by construction, and
+ * it can never evict a waiter the previous code would not have.
+ *
+ * ivh_pv_evict_debug forces the slow path so the walk's counters (notably
+ * ivh_evict_walks, the denominator) keep their exact pre-filter meaning when
+ * you are actually measuring. That load is placed on the RESULT of the test,
+ * not in front of it, so it never sits on the dependency chain of the
+ * heartbeat read.
+ */
+static __always_inline bool pv_evict_can_skip(struct mcs_spinlock *succ)
+{
+	struct pv_node *pn = (struct pv_node *)succ;
+	unsigned long src, quiet;
+	u64 now;
+
+	/*
+	 * One byte, from the very cacheline this handoff is about to write
+	 * (->state is at offset 20 of a 32-byte pv_node, ->mcs.locked at 8, so
+	 * the promotion store that follows needs this line regardless).
+	 */
+	if (READ_ONCE(pn->state) != VCPU_RUNNING)
+		goto skip;
+
+	src = READ_ONCE(ivh_pv_preempt_src);
+	if (unlikely(src != 2)) {
+		if (vcpu_is_preempted(pn->cpu))
+			return false;
+		goto skip;
+	}
+
+	now = READ_ONCE(ivh_pv_evict_cheap_now) ? ivh_beat_now_cheap() : rdtsc();
+
+	/*
+	 * THE GLOBAL QUIET GATE, tested BEFORE the remote heartbeat read
+	 * because skipping that read is its entire purpose. Disarmed by default
+	 * (ivh_pv_evict_quiet == 0), in which case this is one load off the
+	 * dependency chain and one predicted-not-taken branch. See
+	 * <asm/ivh_tsc_beat.h> for why it can only suppress evictions.
+	 */
+	quiet = READ_ONCE(ivh_pv_evict_quiet);
+	if (quiet && (s64)(now - READ_ONCE(ivh_beat_preempt_stamp)) > (s64)quiet)
+		goto skip;
+
+	/* The expensive one: a remote per-CPU cacheline. */
+	if ((s64)(now - READ_ONCE(per_cpu(ivh_tsc_beat, pn->cpu).stamp)) >
+	    (s64)READ_ONCE(ivh_pv_beat_threshold))
+		return false;			/* candidate: do the real walk */
+skip:
+	return !READ_ONCE(ivh_pv_evict_debug);
+}
+
+/*
+ * ============================================================================
  * G-LOCK-33: pv_evict_walk() -- the shared eviction logic
  * ============================================================================
  *
@@ -1961,6 +2059,14 @@ static noinline struct mcs_spinlock *pv_evict_walk(struct mcs_spinlock *succ)
 		 * Either way: stop and promote @cand.
 		 */
 		cls = ivh_rot_class(cand, src, thr, now);
+		if (cls == IVH_ROT_PREEMPTED) {
+			/*
+			 * Keep the ivh_pv_evict_quiet gate open for as long as
+			 * eviction is finding real work. Rare path (~0.3% of
+			 * handoffs), and a no-op with the gate disarmed.
+			 */
+			ivh_beat_note_preempted(now);
+		}
 		if (cls != IVH_ROT_PREEMPTED) {
 			/*
 			 * Count only the HALTED stop: that is the fairness rule
@@ -1998,8 +2104,7 @@ static noinline struct mcs_spinlock *pv_evict_walk(struct mcs_spinlock *succ)
 		after = READ_ONCE(cand->next);
 		if (!after) {
 			if (dbg)
-				if (dbg)
-			this_cpu_inc(ivh_evict_tail_stop);
+				this_cpu_inc(ivh_evict_tail_stop);
 			goto out;
 		}
 
@@ -2012,8 +2117,7 @@ static noinline struct mcs_spinlock *pv_evict_walk(struct mcs_spinlock *succ)
 		 */
 		if (READ_ONCE(pn->requeues) >= cap) {
 			if (dbg)
-				if (dbg)
-			this_cpu_inc(ivh_evict_cap_refused);
+				this_cpu_inc(ivh_evict_cap_refused);
 			goto out;
 		}
 
@@ -2041,8 +2145,7 @@ static noinline struct mcs_spinlock *pv_evict_walk(struct mcs_spinlock *succ)
 		 */
 		if (!try_cmpxchg(&pn->state, &old, VCPU_SKIPPED)) {
 			if (dbg)
-				if (dbg)
-			this_cpu_inc(ivh_evict_halt_race);
+				this_cpu_inc(ivh_evict_halt_race);
 			goto out;
 		}
 
@@ -2210,8 +2313,7 @@ static __always_inline void pv_handoff_rotate(struct qspinlock *lock,
 					      struct mcs_spinlock *node,
 					      struct mcs_spinlock **nextp)
 {
-	unsigned long probe = READ_ONCE(ivh_pv_rot_probe);
-	unsigned long enable = READ_ONCE(ivh_pv_rot_enable);
+	unsigned long probe, enable;
 	struct mcs_spinlock *succ, *after;
 	struct ivh_rot_pick pick;
 	unsigned long cap;
@@ -2229,13 +2331,30 @@ static __always_inline void pv_handoff_rotate(struct qspinlock *lock,
 	 * the probe|enable gate so eviction is reachable with rotation entirely
 	 * off, which is how the A/B is run -- one kernel, three modes
 	 * (off / rotate / evict), selected live.
+	 *
+	 * ENTRY-COST OPTIMISATION (2026-09-17): ivh_pv_rot_probe and
+	 * ivh_pv_rot_enable are now loaded BELOW this gate, not above it. They
+	 * were READ_ONCE(), i.e. volatile, so the compiler was not permitted to
+	 * sink them past the volatile read of ivh_pv_evict_enable -- every
+	 * handoff in evict mode paid two loads of globals it then never looked
+	 * at. Behaviour is unchanged: the two knobs are independent and the
+	 * evict arm returns before either is consulted.
 	 */
 	if (unlikely(READ_ONCE(ivh_pv_evict_enable))) {
 		succ = *nextp;
-		if (succ)
+		/*
+		 * pv_evict_can_skip() is the whole common case, inlined: on a
+		 * live successor it is a ->state byte (already-needed line),
+		 * one heartbeat compare and a not-taken branch, with no call,
+		 * no spill, and none of the walk's read-mostly loads.
+		 */
+		if (succ && !pv_evict_can_skip(succ))
 			*nextp = pv_evict_walk(succ);
 		return;
 	}
+
+	probe = READ_ONCE(ivh_pv_rot_probe);
+	enable = READ_ONCE(ivh_pv_rot_enable);
 
 	/*
 	 * Both knobs off == upstream, to the instruction: one load of each
@@ -3058,9 +3177,16 @@ static void pv_deferred_handoff(struct qspinlock *lock, struct pv_node *first)
 	 * precedence over the splice below for the same reason as in
 	 * pv_handoff_rotate().
 	 */
-	if (unlikely(READ_ONCE(ivh_pv_evict_enable)))
-		pick = pv_evict_walk(pick);
-	else if (READ_ONCE(ivh_pv_rot_enable)) {
+	if (unlikely(READ_ONCE(ivh_pv_evict_enable))) {
+		/*
+		 * Same inline pre-filter as promotion point 0. Applied at BOTH
+		 * sites deliberately: the two points must not drift, and with
+		 * the filter at only one of them an eviction would need two
+		 * consecutive PREEMPTED reads there and one here.
+		 */
+		if (!pv_evict_can_skip(pick))
+			pick = pv_evict_walk(pick);
+	} else if (READ_ONCE(ivh_pv_rot_enable)) {
 		unsigned long src = READ_ONCE(ivh_pv_preempt_src);
 		u64 thr = READ_ONCE(ivh_pv_beat_threshold);
 		u64 now = rdtsc();

@@ -1360,7 +1360,36 @@ DEFINE_PER_CPU(u64, ivh_slowpath_wait_events);
 DEFINE_PER_CPU_ALIGNED(struct ivh_tsc_beat, ivh_tsc_beat);
 EXPORT_PER_CPU_SYMBOL_GPL(ivh_tsc_beat);
 
-unsigned long ivh_pv_preempt_src = 0UL;		/* 0 = KVM bit (default) */
+/*
+ * ENTRY-COST OPTIMISATION (2026-09-17), and the reason for the __read_mostly /
+ * __aligned(64) on this block.
+ *
+ * pv_evict_can_skip() reads, on EVERY contended handoff in evict mode:
+ *   ivh_pv_evict_enable, ivh_pv_preempt_src, ivh_pv_evict_cheap_now,
+ *   ivh_pv_evict_quiet, ivh_pv_beat_threshold, ivh_pv_evict_debug
+ * -- six unsigned longs, 48 bytes. Without this they are split by their
+ * initialisers: the zero-initialised ones (preempt_src, evict_enable,
+ * evict_debug, evict_quiet) land in .bss and the non-zero ones
+ * (evict_cheap_now = 1, beat_threshold = 3300000) land in .data, i.e. two
+ * unrelated and arbitrarily distant cachelines, both of which the handoff
+ * path then has to keep resident. Forcing all six into .data..read_mostly in
+ * declaration order, 64-byte aligned at the head, packs the whole set into a
+ * single line that is never written after boot.
+ *
+ * ivh_pv_rm_line_pad exists only to give .data..read_mostly in THIS object a
+ * 64-byte alignment requirement, so the six land at the head of a line rather
+ * than wherever an 8-byte-aligned concatenation happens to drop them. Putting
+ * __aligned(64) on one of the six instead does not work: gcc then emits that
+ * one LAST, at offset 0x40, splitting the set across two lines.
+ *
+ * Best-effort, not a guarantee (the linker concatenates .data..read_mostly
+ * across objects); verify with
+ *   nm -n vmlinux | grep -E 'ivh_pv_(preempt_src|evict_enable|evict_debug|evict_cheap_now|evict_quiet|beat_threshold)'
+ * and check the span is <= 64 bytes with an aligned base. Worst case it is
+ * neutral, never worse than the split it replaces.
+ */
+static unsigned long ivh_pv_rm_line_pad __read_mostly __aligned(64) __used;
+unsigned long ivh_pv_preempt_src __read_mostly = 0UL;	/* 0 = KVM bit (default) */
 unsigned long ivh_pv_tier1_confirm = 0UL;		/* 0 = upstream tier-1, bit-identical */
 
 /*
@@ -1395,7 +1424,7 @@ unsigned long ivh_pv_rot_skip_max = 4UL;
  *   evict_enable=1               eviction (G-LOCK-33), which takes precedence
  * and it works at either promotion point, selected by ivh_pv_skip_point.
  */
-unsigned long ivh_pv_evict_enable = 0UL;
+unsigned long ivh_pv_evict_enable __read_mostly = 0UL;
 
 /*
  * Eviction starvation bound: how many times one tenure may be evicted before
@@ -1410,8 +1439,24 @@ unsigned long ivh_pv_requeue_max = 4UL;
 unsigned long ivh_pv_evict_hop_cap = 1UL;
 
 /* See <asm/ivh_tsc_beat.h>. Both default to the CHEAP path. */
-unsigned long ivh_pv_evict_debug = 0UL;
-unsigned long ivh_pv_evict_cheap_now = 1UL;
+unsigned long ivh_pv_evict_debug __read_mostly = 0UL;
+unsigned long ivh_pv_evict_cheap_now __read_mostly = 1UL;
+/*
+ * G-LOCK-33 entry-cost gate. 0 = OFF (default), i.e. exactly today's
+ * behaviour. Non-zero = skip the eviction walk entirely, before the remote
+ * heartbeat read, when nothing in the guest has looked preempted for this many
+ * raw TSC cycles. THE ONE KNOB HERE THAT CAN CHANGE WHICH WAITERS ARE EVICTED
+ * -- and only ever by evicting FEWER. Full argument in <asm/ivh_tsc_beat.h>.
+ * A sane first value is ~10x ivh_pv_beat_threshold.
+ */
+unsigned long ivh_pv_evict_quiet __read_mostly = 0UL;
+/*
+ * ... and its storage. Deliberately NOT in the read-mostly block above: it is
+ * written (rarely) at runtime, and sharing a line with the tunables would let
+ * every observation of a preempted vCPU invalidate the handoff path's hottest
+ * read-only line on all 16 vCPUs.
+ */
+u64 ivh_beat_preempt_stamp ____cacheline_aligned = 0;
 /*
  * 3,300,000 cycles = 1.5 ms at 2200 MHz -- is_cpu_preempted()'s existing
  * 1,500,000 ns threshold (kernel/sched/cputime.c) expressed in cycles, so
@@ -1419,7 +1464,7 @@ unsigned long ivh_pv_evict_cheap_now = 1UL;
  * signal this tree already has. Recomputed from the live tsc_khz at
  * late_initcall so the knob survives a different host.
  */
-unsigned long ivh_pv_beat_threshold = 3300000UL;
+unsigned long ivh_pv_beat_threshold __read_mostly = 3300000UL;
 #define IVH_BEAT_THRESHOLD_US	1500ULL
 unsigned long ivh_pv_beat_publish_mask = 0xfffUL;
 
@@ -2513,6 +2558,13 @@ static const struct ctl_table ivh_pv_sysctls[] = {
 	{
 		.procname	= "ivh_pv_evict_cheap_now",
 		.data		= &ivh_pv_evict_cheap_now,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_pv_evict_quiet",
+		.data		= &ivh_pv_evict_quiet,
 		.maxlen		= sizeof(unsigned long),
 		.mode		= 0644,
 		.proc_handler	= proc_doulongvec_minmax,

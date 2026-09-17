@@ -958,11 +958,80 @@ extern unsigned long ivh_pv_evict_debug;
  */
 extern unsigned long ivh_pv_evict_cheap_now;
 
+/*
+ * G-LOCK-33 ENTRY-COST GATE ("global quiet hint"). 0 (default) = OFF, current
+ * behaviour exactly. Non-zero = a staleness window in RAW TSC CYCLES.
+ *
+ * WHY. Even with the state gate and the cheap "now", pv_evict_walk()'s
+ * classification of the immediate successor ends in
+ *
+ *	READ_ONCE(per_cpu(ivh_tsc_beat, succ->cpu).stamp)
+ *
+ * which is a read of ANOTHER vCPU's heartbeat cacheline. That line is owned
+ * and repeatedly rewritten by its owner (every ivh_pv_beat_publish_mask + 1
+ * spin iterations, plus every tick), so from here it is a coherence miss on
+ * essentially every contended handoff -- ~100-200 cycles against a handoff
+ * measured at ~720. It is by far the largest single item left on the path,
+ * and it is paid to answer a question whose answer is "live" ~99.7% of the
+ * time.
+ *
+ * THE HINT. ivh_beat_preempt_stamp is the most recent time at which ANY vCPU
+ * in this guest was observed to look preempted. It is fed from the places that
+ * already compute that fact for their own reasons and therefore pay nothing
+ * extra for it:
+ *   - is_wait_preempted()'s heartbeat verdict (`beat`), i.e. every tier-2
+ *     check a node waiter already makes in pv_wait_early(). This feed is
+ *     INDEPENDENT of eviction, which is what stops the gate from being a
+ *     self-latching loop: eviction can go completely quiet and the waiters'
+ *     own tier-2 traffic still reopens it.
+ *   - pv_evict_walk() itself, when a candidate classifies PREEMPTED, so the
+ *     gate stays open for as long as eviction is actually finding work.
+ *
+ * If nothing has looked preempted for longer than ivh_pv_evict_quiet, then no
+ * waiter can classify PREEMPTED either, so the walk could only return its
+ * successor unchanged -- so it is skipped BEFORE the remote read.
+ *
+ * DIRECTION OF ERROR. The gate can only SUPPRESS evictions, never create one:
+ * it is tested before any classification and its only effect is an early
+ * "promote the successor unchanged". Both feeds publish a stamp at or BEHIND
+ * true "now" (ivh_beat_now_cheap() lags rdtsc), which makes the window look
+ * older and therefore skips MORE, never less. It is nevertheless a BEHAVIOUR
+ * knob, not a pure cost knob -- hence default 0.
+ *
+ * SIZING. Must be comfortably larger than ivh_pv_beat_threshold (a vCPU that
+ * is preempted right now was, by definition, observed preempted no earlier
+ * than one threshold ago) and larger than the interval at which node waiters
+ * run their tier-2 checks. Start at ~10x ivh_pv_beat_threshold.
+ */
+extern unsigned long ivh_pv_evict_quiet;
+
+/*
+ * Last time ANY vCPU was observed to look preempted, in ivh_tsc_beat's time
+ * base. Rarely written, read on every handoff when the gate is armed, so it
+ * gets its own line rather than invalidating the read-mostly tunables beside
+ * it. Plain u64 + WRITE_ONCE: last-writer-wins is exactly the semantics
+ * wanted, and a torn read is impossible for an aligned 8-byte access.
+ */
+extern u64 ivh_beat_preempt_stamp;
+
 /* This CPU's own last published heartbeat, in the same time base as rdtsc(). */
 static __always_inline u64 ivh_beat_now_cheap(void)
 {
 	return raw_cpu_read(ivh_tsc_beat.stamp);
 }
+
+/*
+ * Feed for the gate above. Called only from paths that have ALREADY decided
+ * something looks preempted, so the cost when the gate is disarmed is one load
+ * of a read-mostly global and one predicted-not-taken branch, on a branch that
+ * is already rare.
+ */
+static __always_inline void ivh_beat_note_preempted(u64 now)
+{
+	if (unlikely(READ_ONCE(ivh_pv_evict_quiet)))
+		WRITE_ONCE(ivh_beat_preempt_stamp, now);
+}
+
 #define IVH_REQUEUE_MAX_CAP	255U
 
 /* Evictions committed (cmpxchg RUNNING->SKIPPED won). */
