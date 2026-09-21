@@ -307,6 +307,20 @@ extern unsigned long ivh_adaptive_irqoff_bail_gate;
  */
 extern unsigned long ivh_slowpath_wait_measure;
 DECLARE_PER_CPU(u64, ivh_slowpath_wait_ns);
+
+/*
+ * G-LOCK-38 item 1: the TRUE denominator. One ungated inc per xchg_tail()
+ * call (the single site, qspinlock.c) and one for arrivals that found a
+ * NON-EMPTY queue. Together these measure the route-shift hypothesis: that
+ * eviction pushes acquisitions off the unfair-steal fast path onto the
+ * queued slow path.
+ */
+DECLARE_PER_CPU(u64, ivh_xchg_tail_calls);
+DECLARE_PER_CPU(u64, ivh_xchg_tail_nonempty);
+/* G-LOCK-38 item 4: ivh_pv_requeue_none outcomes. */
+DECLARE_PER_CPU(u64, ivh_requeue_none_won);
+DECLARE_PER_CPU(u64, ivh_requeue_none_fellback);
+extern unsigned long ivh_pv_requeue_none;
 DECLARE_PER_CPU(u64, ivh_slowpath_wait_events);
 
 /*

@@ -1117,6 +1117,223 @@ DECLARE_PER_CPU(u64, ivh_evict_age_negative);
 #define IVH_EVICT_REQ_HIST_BUCKETS 8
 DECLARE_PER_CPU(u64, ivh_evict_requeue_hist[IVH_EVICT_REQ_HIST_BUCKETS]);
 
+/*
+ * G-LOCK-33 gap histogram: how long the evicted vCPU was ACTUALLY away.
+ *
+ * ivh_evict_age_* answers the question backwards -- how stale did this node
+ * LOOK to the walker at the moment it was evicted. That says nothing about
+ * whether evicting it bought anything, because a node can look stale by the
+ * detection threshold and then be back on-CPU a microsecond later.
+ *
+ * This is the forward half: measured in pv_requeue_node() by the evicted
+ * node's OWN cpu, against its OWN last heartbeat stamp, so there is no
+ * cross-CPU write and head_ctl's single-writer invariant is untouched.
+ *
+ *   median in the MICROSECONDS  -> the walker is evicting vCPUs that were
+ *                                  about to run anyway; the eviction rescued
+ *                                  nothing and the detector is the problem.
+ *   median in the HUNDREDS of us -> each eviction skipped a real stall, and
+ *                                  the mechanism has per-event value that the
+ *                                  workload benchmarks are too noisy to see.
+ *
+ * Lower bound by construction: if this cpu published from some other path
+ * between the eviction and the requeue, the measured gap is SHORTER than the
+ * true absence. That is the conservative direction.
+ *
+ * log2 buckets in raw TSC cycles, same scale as ivh_evict_age_*.
+ */
+/*
+ * G-LOCK-34: the eviction instant, deposited by the EVICTOR into the victim's
+ * slot. Indexed by the victim's qnode index, so nesting levels do not collide.
+ *
+ * Why the victim cannot time its own absence: the only clock it owns is
+ * ivh_tsc_beat.stamp, and that is the SAME variable ivh_rot_class() evicted it
+ * on -- so the gap it could measure is >= the staleness threshold by
+ * construction. Worse, account_process_tick() republishes that stamp at
+ * CONFIG_HZ=1000 on every cpu (this kernel boots nohz=off), and a vcpu
+ * returning from host preemption takes its latched timer interrupt before the
+ * spin loop makes progress. The measurement is therefore erased most
+ * completely for exactly the longest absences -- anti-correlated with the
+ * signal. Only an evictor-side stamp escapes that.
+ */
+#define IVH_EVICT_MAX_NODES 4
+DECLARE_PER_CPU(u64, ivh_evict_stamp[IVH_EVICT_MAX_NODES]);
+
+/*
+ * G-LOCK-38 item 2: promotion -> acquisition latency, EVICTION-ONLY.
+ * pv_evict_walk() stamps the node it promotes; pv_handoff_ack() reads the
+ * stamp when that node finally acquires and buckets the delta by log2(cycles).
+ * Direct test of BLIND PROMOTION: at hop_cap=1 the promoted node is never
+ * classified, so if it is itself off-CPU the lock sits idle until the host
+ * reschedules it (~1 ms). Costs nothing when eviction is off -- the stamp is
+ * only ever written by an eviction.
+ */
+DECLARE_PER_CPU(u64, ivh_evict_promo_stamp[IVH_EVICT_MAX_NODES]);
+DECLARE_PER_CPU(u64, ivh_evict_promo_hist[IVH_BEAT_AGE_HIST_BUCKETS]);
+DECLARE_PER_CPU(u64, ivh_evict_promo_unknown);
+DECLARE_PER_CPU(u64, ivh_evict_lookahead_refused);
+extern unsigned long ivh_pv_evict_promo_hist;
+
+/* G-LOCK-38 item 5: look-ahead eviction. Commit the VCPU_SKIPPED cmpxchgs
+ * only once a LIVE replacement has been found by a read-only pass; if the
+ * walk runs out of hops without finding one, evict NOBODY and promote the
+ * original successor. This is the user's professor's rule. Code motion only:
+ * the walk is already read-only up to the commit, and no back-out is needed
+ * because nothing is committed until a live node is confirmed.
+ */
+extern unsigned long ivh_pv_evict_lookahead;
+
+/*
+ * G-LOCK-38 item 6: how long does a caller CAMP in
+ * pv_hybrid_queued_unfair_trylock()'s for(;;)? Trips are counted in a local
+ * register and flushed once at exit, and the flush itself is behind
+ * ivh_pv_camp_probe so the disarmed path costs one read-mostly load on the
+ * hottest function in the tree. Exit reasons: win / empty tail / pending set.
+ */
+DECLARE_PER_CPU(u64, ivh_camp_trips);
+DECLARE_PER_CPU(u64, ivh_camp_entries);
+DECLARE_PER_CPU(u64, ivh_camp_exit_win);
+DECLARE_PER_CPU(u64, ivh_camp_exit_empty);
+DECLARE_PER_CPU(u64, ivh_camp_exit_pending);
+extern unsigned long ivh_pv_camp_probe;
+DECLARE_PER_CPU(u64, ivh_evict_gap_negative);
+
+/*
+ * HEAD BYPASS, STAGE 1 -- OBSERVATION ONLY (G-LOCK-35).
+ *
+ * The question nobody has measured: when the queue head is host-preempted
+ * mid-tenure, how much lock time is actually LOST? A count of "head stale and
+ * lock free" is not the answer -- a RUNNING head converts a free lock into an
+ * acquisition within one ~26-cycle iteration, so loss is proportional to the
+ * DURATION of free-and-blocked episodes, not to how often one is sampled.
+ *
+ * Three-way split of the lock word at each sample, from ONE u16 load:
+ *   held        - lock->locked set; nothing to do.
+ *   free_open   - locked_pending == 0: free AND already stealable. A bypass
+ *                 adds NOTHING here, because pv_hybrid_queued_unfair_trylock()
+ *                 is already walking in. Counting these as opportunity is the
+ *                 error that makes the old ivh_head_yield_ok_* figures look
+ *                 bigger than they are.
+ *   actionable  - locked_pending == _Q_PENDING_VAL: free, and stealers are
+ *                 locked out by a pending bit whose owner is not running.
+ *                 THIS IS THE ONLY POPULATION A BYPASS CAN SERVE.
+ *
+ * ivh_head_blocked_cycles / (elapsed x nr_cpus) is the fraction of vCPU time
+ * spent free-but-blocked. A perfect, zero-cost bypass cannot recover more than
+ * that, so it is the gate: below ~0.5%, the mechanism is dead on arithmetic.
+ *
+ * BIAS DIRECTION (an earlier version of this comment had it backwards): the
+ * net is a strong UNDERSTATEMENT. Episodes shorter than the ~3 us sample
+ * interval are dropped entirely, and censoring at loop exit (see trunc_cycles
+ * below) removes most of a typical absence. The only inflating term is an
+ * observer that is itself descheduled. Treat blocked_cycles as a LOWER bound.
+ */
+/*
+ * G-LOCK-36: relax the head's own acquire so a third party clearing the
+ * pending bit does not lock the head out of its whole tenure.
+ *
+ * trylock_clear_pending() as shipped hardcodes `u16 old = _Q_PENDING_VAL`, so
+ * it can ONLY acquire from {locked=0, pending=1}. If anyone clears pending
+ * mid-tenure the head can never win it again: it burns all
+ * ivh_pv_spin_threshold iterations and falls through to the one-shot
+ * xchg(&lock->locked, _Q_SLOW_VAL) escape, paying hash + possibly
+ * pv_wait()/remote pv_kick(). That makes a head-bypass false positive
+ * expensive and lands the cost on the vCPU furthest along.
+ *
+ * This is NOT a novel relaxation -- upstream's own _Q_PENDING_BITS != 8
+ * variant already does exactly this (reject if locked, else cmpxchg from
+ * whatever was read, which may be 0). The two variants are simply not
+ * equivalent today. No retry loop: that would break the exact-iteration
+ * invariant the tree checks (head_spin_iters_sum/attempts == spin_threshold).
+ *
+ * Measured ALONE, before any bypass exists, because it is also a mild
+ * fairness change: pending stops being a reliable "a head is spinning" flag
+ * for pv_hybrid_queued_unfair_trylock(), so stealers get in slightly more
+ * often during a live head's tenure. Bundling it with the mechanism would
+ * recreate the two-variable confound that produced the bogus -7.75%.
+ */
+extern unsigned long ivh_pv_trylock_relaxed;
+
+/*
+ * G-LOCK-38 DIAGNOSTIC, default 0. 1 = a requeued (evicted) node skips the
+ * opportunistic trylock at qspinlock.c's requeue: label and goes straight to
+ * xchg_tail(). Isolates the cost of the unfair-steal CAMP loop
+ * (pv_hybrid_queued_unfair_trylock, a for(;;) that exits only on a win, an
+ * empty tail, or pending set) from every other part of eviction.
+ * Expected if the camping hypothesis holds: ivh_head_spin_enter falls toward
+ * the no-eviction baseline, ivh_evict_steal_ok goes to 0, p99.9 improves,
+ * p99.99 worsens. This is a measurement knob; it is NOT a proposed fix.
+ */
+extern unsigned long ivh_pv_requeue_nosteal;
+
+extern unsigned long ivh_head_bypass_probe;
+
+/*
+ * G-LOCK-37 HEAD BYPASS. The head's successor clears a pending bit stranded by
+ * an absent head, reopening pv_hybrid_queued_unfair_trylock() for the rest of
+ * the absence. Requires ivh_pv_trylock_relaxed=1, else the returning head is
+ * locked out of the remainder of its own tenure.
+ *
+ * Firing needs BOTH a consecutive-sample run and a wall-clock hold, and they
+ * are not redundant. The hold (default one beat_threshold, 100us) removes the
+ * short-gap band where the idle-host control measured ~27% false positives.
+ * The run count defeats a different error: if the OBSERVER is itself
+ * descheduled, `now` jumps and a single sample satisfies the hold although no
+ * time was actually watched; requiring consecutive samples makes that
+ * impossible, because the intervening samples never happened.
+ *
+ * Starvation: pending is upstream's only anti-starvation guard for the head,
+ * so firing is capped per pv_wait_node() call. That bound is stronger than a
+ * per-tenure one, because only ONE node can ever bypass a given head -- its
+ * immediate MCS successor, which cannot advance while the head is stuck. The
+ * cap therefore spans every tenure that head has while we are queued behind it.
+ * NOTE: it is reset if we are evicted and re-enter via requeue:, so it is void
+ * if ivh_pv_evict_enable is ever combined with this.
+ */
+extern unsigned long ivh_head_bypass_enable;	/* master, default 0 */
+extern unsigned long ivh_head_bypass_runs;	/* consecutive samples, default 3 */
+extern unsigned long ivh_head_bypass_hold;	/* cycles open, default 220000 */
+extern unsigned long ivh_head_bypass_max;	/* fires per call, default 4 */
+extern unsigned long ivh_head_bypass_onexit;	/* parting shot, default 1 */
+DECLARE_PER_CPU(u64, ivh_head_bypass_fired);
+DECLARE_PER_CPU(u64, ivh_head_bypass_fired_exit);
+DECLARE_PER_CPU(u64, ivh_head_bypass_raced_locked);
+DECLARE_PER_CPU(u64, ivh_head_bypass_raced_clear);
+DECLARE_PER_CPU(u64, ivh_head_bypass_capped);
+DECLARE_PER_CPU(u64, ivh_head_bypass_open_cycles);
+DECLARE_PER_CPU(u64, ivh_head_bypass_open_events);
+DECLARE_PER_CPU(u64, ivh_head_bypass_open_trunc);
+DECLARE_PER_CPU(u64, ivh_head_obs_samples);	/* HEAD_SPINNING && RUNNING */
+DECLARE_PER_CPU(u64, ivh_head_obs_stale);
+DECLARE_PER_CPU(u64, ivh_head_obs_held);
+DECLARE_PER_CPU(u64, ivh_head_obs_free_open);
+DECLARE_PER_CPU(u64, ivh_head_obs_actionable);
+DECLARE_PER_CPU(u64, ivh_head_blocked_cycles);
+DECLARE_PER_CPU(u64, ivh_head_blocked_hist[IVH_BEAT_AGE_HIST_BUCKETS]);
+DECLARE_PER_CPU(u64, ivh_head_blocked_events);
+/*
+ * CENSORED episodes: the observer left pv_wait_node()'s spin loop (halted,
+ * promoted, requeued, or exhausted its threshold) while an episode was still
+ * open. These MUST be accounted separately, because the observation window is
+ * structurally SHORTER than the phenomenon:
+ *
+ *   waiter spin budget   32768 iters x ~26 cyc = 387 us
+ *   staleness threshold                          100 us
+ *   => longest episode this instrument can CLOSE  287 us
+ *   median host absence (measured)                953 us, 69-77% >= 1 ms
+ *
+ * So for a typical absence the head does NOT return before the waiter gives
+ * up, and a complete-episodes-only total would report near zero for purely
+ * instrumental reasons -- indistinguishable from "no opportunity", and in the
+ * direction that falsely kills the mechanism. Report the bracket
+ * [blocked_cycles, blocked_cycles + trunc_cycles] and never the low end alone.
+ */
+DECLARE_PER_CPU(u64, ivh_head_blocked_trunc_cycles);
+DECLARE_PER_CPU(u64, ivh_head_blocked_trunc_events);
+
+extern unsigned long ivh_pv_evict_gap_hist;
+DECLARE_PER_CPU(u64, ivh_evict_gap_hist[IVH_BEAT_AGE_HIST_BUCKETS]);
+
 DECLARE_PER_CPU(u64, ivh_defer_handoffs);	/* unlocks that took the deferred path */
 DECLARE_PER_CPU(u64, ivh_defer_skips);		/* handoffs that skipped >= 1 preempted waiter */
 DECLARE_PER_CPU(u64, ivh_defer_stop_halted);	/* walk stopped at a halted waiter */

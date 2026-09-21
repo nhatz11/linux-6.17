@@ -181,12 +181,34 @@ struct pv_node {
  * on not heavily contended locks).
  */
 #define queued_spin_trylock(l)	pv_hybrid_queued_unfair_trylock(l)
+/*
+ * G-LOCK-38 item 6. Flush the register-local camp trip count exactly once, and
+ * only when armed. Disarmed cost on the hottest function in the tree: one
+ * read-mostly load and a predicted-not-taken branch, no per-iteration work.
+ */
+static __always_inline void ivh_camp_flush(unsigned int trips, unsigned int reason)
+{
+	if (likely(!READ_ONCE(ivh_pv_camp_probe)))
+		return;
+	this_cpu_inc(ivh_camp_entries);
+	this_cpu_add(ivh_camp_trips, trips);
+	if (reason == 0)
+		this_cpu_inc(ivh_camp_exit_win);
+	else if (reason == 2)
+		this_cpu_inc(ivh_camp_exit_pending);
+	else
+		this_cpu_inc(ivh_camp_exit_empty);
+}
+
 static inline bool pv_hybrid_queued_unfair_trylock(struct qspinlock *lock)
 {
 	/*
 	 * Stay in unfair lock mode as long as queued mode waiters are
 	 * present in the MCS wait queue but the pending bit isn't set.
 	 */
+	unsigned int ivh_trips = 0;	/* G-LOCK-38 item 6, register-local */
+	unsigned int ivh_reason = 1;	/* 0=win 1=empty tail 2=pending */
+
 	for (;;) {
 		int val = atomic_read(&lock->val);
 		u8 old = 0;
@@ -214,14 +236,20 @@ static inline bool pv_hybrid_queued_unfair_trylock(struct qspinlock *lock)
 			if (unlikely(READ_ONCE(ivh_lock_holder_enabled) &
 				     IVH_HOLDER_EN_CS_FAST))
 				__ivh_cs_owner_stamp(lock);
+			ivh_reason = 0;
+			ivh_camp_flush(ivh_trips, ivh_reason);
 			return true;
 		}
-		if (!(val & _Q_TAIL_MASK) || (val & _Q_PENDING_MASK))
+		if (!(val & _Q_TAIL_MASK) || (val & _Q_PENDING_MASK)) {
+			ivh_reason = (val & _Q_PENDING_MASK) ? 2 : 1;
 			break;
+		}
 
+		ivh_trips++;
 		cpu_relax();
 	}
 
+	ivh_camp_flush(ivh_trips, ivh_reason);
 	return false;
 }
 
@@ -243,6 +271,16 @@ static __always_inline void set_pending(struct qspinlock *lock)
 static __always_inline bool trylock_clear_pending(struct qspinlock *lock)
 {
 	u16 old = _Q_PENDING_VAL;
+
+	/* See ivh_pv_trylock_relaxed in <asm/ivh_tsc_beat.h>. */
+	if (unlikely(READ_ONCE(ivh_pv_trylock_relaxed))) {
+		old = READ_ONCE(lock->locked_pending);
+		if (old & _Q_LOCKED_MASK)
+			return false;
+		/* old is 0 or _Q_PENDING_VAL; accept either. */
+		return try_cmpxchg_acquire(&lock->locked_pending, &old,
+					   _Q_LOCKED_VAL);
+	}
 
 	return !READ_ONCE(lock->locked) &&
 	       try_cmpxchg_acquire(&lock->locked_pending, &old, _Q_LOCKED_VAL);
@@ -1333,6 +1371,7 @@ static void pv_init_node(struct mcs_spinlock *node)
 	struct pv_node *pn = (struct pv_node *)node;
 
 	BUILD_BUG_ON(sizeof(struct pv_node) > sizeof(struct qnode));
+	BUILD_BUG_ON(IVH_EVICT_MAX_NODES != _Q_MAX_NODES);
 
 	pn->cpu = smp_processor_id();
 	pn->state = VCPU_RUNNING;
@@ -1440,6 +1479,39 @@ static void pv_requeue_node(struct mcs_spinlock *node)
 	pn->deferred = 0;
 
 	/*
+	 * G-LOCK-33 gap measurement -- how long this vCPU was ACTUALLY away.
+	 * See ivh_evict_gap_hist in <asm/ivh_tsc_beat.h> for what the two
+	 * outcomes mean.
+	 *
+	 * MUST run before the re-seed below, which overwrites the very stamp it
+	 * reads. Own-cpu read of an own-cpu stamp, so no cross-CPU write and
+	 * head_ctl's single-writer invariant is untouched. ivh_age_bucket()
+	 * lives further down this file with the walker, so the two-line bucket
+	 * computation is open-coded here rather than reordering existing code.
+	 */
+	if (unlikely(READ_ONCE(ivh_pv_evict_gap_hist))) {
+		long ni = (struct qnode *)pn - this_cpu_ptr(&qnodes[0]);
+
+		if ((unsigned long)ni < IVH_EVICT_MAX_NODES) {
+			u64 *slot = this_cpu_ptr(&ivh_evict_stamp[ni]);
+			u64 st = READ_ONCE(*slot);
+
+			/* 0 = never stamped (gap accounting off when evicted). */
+			if (st) {
+				s64 gap = (s64)(rdtsc() - st);
+				int b = (gap > 0) ? ilog2((u64)gap) : 0;
+
+				if (b >= IVH_BEAT_AGE_HIST_BUCKETS)
+					b = IVH_BEAT_AGE_HIST_BUCKETS - 1;
+				this_cpu_inc(ivh_evict_gap_hist[b]);
+				if (gap <= 0)
+					this_cpu_inc(ivh_evict_gap_negative);
+				WRITE_ONCE(*slot, 0);	/* never reuse a stale stamp */
+			}
+		}
+	}
+
+	/*
 	 * Re-seed the heartbeat for the same reason pv_init_node() does: we are
 	 * about to become somebody's predecessor again, and a stamp left over
 	 * from before the eviction would read stale to them immediately.
@@ -1452,6 +1524,193 @@ static void pv_requeue_node(struct mcs_spinlock *node)
 		if (READ_ONCE(ivh_pv_evict_node_stamp))
 			ivh_node_stamp_set(pn, t);
 	}
+}
+
+/*
+ * Close an open free-but-blocked episode. @truncated means the observer is
+ * LEAVING pv_wait_node()'s spin loop with the episode still open (halt,
+ * promotion, requeue, or threshold exhaustion) -- the head never came back
+ * while we were watching. Those are censored observations and are accounted
+ * separately; see ivh_head_blocked_trunc_cycles in <asm/ivh_tsc_beat.h> for
+ * why ignoring them would manufacture a false "no opportunity" result.
+ */
+/*
+ * Per-observer bypass state. Stack-only, owned by ONE pv_wait_node() call on
+ * one CPU: no atomics, no barriers, no bytes in pv_node (pinned at 32) and no
+ * writes to head_ctl (single-writer, owned by the head).
+ *
+ * SCOPE SPLIT, and it matters:
+ *   blk_start / fire_start / run  are PER SPIN ATTEMPT, reset at the top of the
+ *     outer for(;;) so an episode can never span a halt and absorb its duration.
+ *   fires is PER pv_wait_node() CALL and deliberately survives our own halts:
+ *     it bounds how many times ONE head can be bypassed by ONE successor, and a
+ *     head's absence routinely outlives a single 387us spin attempt.
+ */
+struct ivh_hb_state {
+	u64	blk_start;	/* open free-but-blocked episode, 0 = none   */
+	u64	fire_start;	/* open post-bypass window (valve open by us) */
+	u32	run;		/* consecutive actionable samples            */
+	u32	fires;		/* successful fires, this pv_wait_node() call */
+};
+
+/* Close the stealers-locked-out half at a caller-supplied @now. */
+static __always_inline void __ivh_blk_close_at(struct ivh_hb_state *hb,
+					       u64 now, bool truncated)
+{
+	s64 d;
+	int b;
+
+	if (!hb->blk_start)
+		return;
+	d = (s64)(now - hb->blk_start);
+	b = (d > 0) ? ilog2((u64)d) : 0;
+	if (b >= IVH_BEAT_AGE_HIST_BUCKETS)
+		b = IVH_BEAT_AGE_HIST_BUCKETS - 1;
+	this_cpu_inc(ivh_head_blocked_hist[b]);
+	if (d > 0) {
+		if (truncated) {
+			this_cpu_add(ivh_head_blocked_trunc_cycles, (u64)d);
+			this_cpu_inc(ivh_head_blocked_trunc_events);
+		} else {
+			this_cpu_add(ivh_head_blocked_cycles, (u64)d);
+			this_cpu_inc(ivh_head_blocked_events);
+		}
+	}
+	hb->blk_start = 0;
+}
+
+/* Close the post-bypass window: time the valve stood open because of us. */
+static __always_inline void __ivh_fire_close_at(struct ivh_hb_state *hb,
+						u64 now, bool truncated)
+{
+	s64 d;
+
+	if (!hb->fire_start)
+		return;
+	d = (s64)(now - hb->fire_start);
+	if (d > 0) {
+		this_cpu_add(ivh_head_bypass_open_cycles, (u64)d);
+		this_cpu_inc(ivh_head_bypass_open_events);
+		if (truncated)
+			this_cpu_inc(ivh_head_bypass_open_trunc);
+	}
+	hb->fire_start = 0;
+}
+
+static __always_inline void ivh_head_blk_close(struct ivh_hb_state *hb,
+					       bool truncated)
+{
+	u64 now;
+
+	hb->run = 0;			/* any non-actionable sample breaks the run */
+	if (!hb->blk_start && !hb->fire_start)
+		return;
+	now = rdtsc();
+	__ivh_fire_close_at(hb, now, truncated);
+	__ivh_blk_close_at(hb, now, truncated);
+}
+
+/*
+ * Head-bypass Stage 1 observer. See ivh_head_bypass_probe in
+ * <asm/ivh_tsc_beat.h> for what the counters mean and why free_open must NOT
+ * be counted as opportunity. OBSERVE ONLY: reads cachelines it already owns or
+ * already needs, writes only per-cpu counters, and never touches the lock word
+ * or any node field. Behaviour-neutral by construction.
+ *
+ * @blk_start is a stack local owned by pv_wait_node() and reset per tenure, so
+ * a blocked episode can never span a halt and absorb the halt's duration.
+ */
+static __always_inline void ivh_head_observe(struct qspinlock *lock,
+					     struct pv_node *pp,
+					     struct ivh_hb_state *hb)
+{
+	u64 now, stamp, thr;
+	u16 lp;
+
+	/*
+	 * Not the head, or the head is HALTED rather than preempted. A halted
+	 * head cleared pending on its way out, so there is no bit stranded by
+	 * an absent owner and nothing for a bypass to do.
+	 */
+	if ((READ_ONCE(pp->head_ctl) & 0xffff) != HEAD_SPINNING ||
+	    READ_ONCE(pp->state) != VCPU_RUNNING)
+		goto close;
+
+	this_cpu_inc(ivh_head_obs_samples);
+
+	/*
+	 * Same predicate as ivh_rot_class()'s src==2 arm, open-coded rather
+	 * than calling is_wait_preempted(): that helper carries mandatory
+	 * counter side effects which would corrupt tier 2's own fire-rate
+	 * population.
+	 */
+	thr   = READ_ONCE(ivh_pv_beat_threshold);
+	now   = rdtsc();
+	stamp = READ_ONCE(per_cpu(ivh_tsc_beat, pp->cpu).stamp);
+	if ((s64)(now - stamp) <= (s64)thr)
+		goto close;
+
+	this_cpu_inc(ivh_head_obs_stale);
+
+	/* ONE u16 load from the lock cacheline, which is already hot. */
+	lp = READ_ONCE(lock->locked_pending);
+	if (lp & _Q_LOCKED_MASK) {
+		this_cpu_inc(ivh_head_obs_held);
+		goto close;
+	}
+	if (!lp) {
+		/* Free AND already stealable -- a bypass adds nothing here. */
+		this_cpu_inc(ivh_head_obs_free_open);
+		goto close;
+	}
+
+	/* locked_pending == _Q_PENDING_VAL: free, stealers locked out. */
+	this_cpu_inc(ivh_head_obs_actionable);
+	if (!hb->blk_start)
+		hb->blk_start = now;
+	hb->run++;
+
+	/* ------------------- HEAD BYPASS (G-LOCK-37) ------------------- */
+	if (likely(!READ_ONCE(ivh_head_bypass_enable)))
+		return;
+	if (hb->fire_start)			/* valve already open by us */
+		return;
+	if (hb->run < READ_ONCE(ivh_head_bypass_runs))
+		return;
+	if ((s64)(now - hb->blk_start) < (s64)READ_ONCE(ivh_head_bypass_hold))
+		return;
+	if (hb->fires >= READ_ONCE(ivh_head_bypass_max)) {
+		this_cpu_inc(ivh_head_bypass_capped);
+		return;
+	}
+	{
+		u16 old = _Q_PENDING_VAL;
+
+		/*
+		 * cmpxchg, never clear_pending(): a blind store would clear a
+		 * NEWER tenure's reservation if the head returned, acquired,
+		 * released and re-armed inside our observation window. Binding
+		 * the write to the state we classified also yields the
+		 * raced_* diagnostics, without which the mechanism is
+		 * unfalsifiable. x86: locked RMW, full fence; the tail lives in
+		 * the separate high u16 and is structurally unreachable here.
+		 */
+		if (try_cmpxchg_relaxed(&lock->locked_pending, &old, 0)) {
+			hb->fires++;
+			this_cpu_inc(ivh_head_bypass_fired);
+			/* Lockout ended at a known instant: COMPLETE, not censored. */
+			__ivh_blk_close_at(hb, now, false);
+			hb->fire_start = now;
+		} else if (old & _Q_LOCKED_MASK) {
+			this_cpu_inc(ivh_head_bypass_raced_locked);
+		} else {
+			this_cpu_inc(ivh_head_bypass_raced_clear);
+		}
+	}
+	return;
+
+close:
+	ivh_head_blk_close(hb, false);
 }
 
 /*
@@ -1470,6 +1729,20 @@ static __always_inline void pv_requeue_steal(struct mcs_spinlock *node)
 
 	if (unlikely(READ_ONCE(pn->requeues)))
 		this_cpu_inc(ivh_evict_steal_ok);
+}
+
+/*
+ * G-LOCK-38: true iff this node is re-entering after an eviction AND the
+ * diagnostic knob is armed. One byte load from the cacheline pv_init_node()
+ * just wrote, plus one read-mostly global; both are already hot here.
+ * Default 0 -- this is a measurement gate, not a fix.
+ */
+static __always_inline bool pv_requeue_nosteal(struct mcs_spinlock *node)
+{
+	struct pv_node *pn = (struct pv_node *)node;
+
+	return unlikely(READ_ONCE(pn->requeues)) &&
+	       unlikely(READ_ONCE(ivh_pv_requeue_nosteal));
 }
 
 /*
@@ -1492,8 +1765,14 @@ static int pv_wait_node(struct mcs_spinlock *node, struct mcs_spinlock *prev,
 	unsigned long loop;
 	unsigned long threshold;
 	u64 halt_tsc;
+	struct ivh_hb_state hb = { };
 
 	for (;;) {
+		/* per-ATTEMPT reset; hb.fires deliberately survives (see struct) */
+		hb.blk_start = 0;
+		hb.fire_start = 0;
+		hb.run = 0;
+
 		/*
 		 * G-LOCK-21-spin: read once per attempt, not per iteration --
 		 * a live sysctl change only takes effect on the next attempt,
@@ -1552,6 +1831,7 @@ static int pv_wait_node(struct mcs_spinlock *node, struct mcs_spinlock *prev,
 				 */
 				if (unlikely(READ_ONCE(pn->state) == VCPU_SKIPPED))
 					this_cpu_inc(ivh_evict_ok_while_skipped);
+				ivh_head_blk_close(&hb, true);
 				return PV_WAIT_OK;
 			}
 			/*
@@ -1575,8 +1855,19 @@ static int pv_wait_node(struct mcs_spinlock *node, struct mcs_spinlock *prev,
 			 * VCPU_RUNNING), and after a wakeup we fall back through
 			 * the outer for(;;) into this loop again.
 			 */
-			if (unlikely(READ_ONCE(pn->state) == VCPU_SKIPPED))
+			if (unlikely(READ_ONCE(pn->state) == VCPU_SKIPPED)) {
+				ivh_head_blk_close(&hb, true);
 				return PV_WAIT_REQUEUE;
+			}
+			/*
+			 * Independent of pv_wait_early(): the Stage 0 block
+			 * below is unreachable for HEAD_SPINNING whenever
+			 * tier 2 is off, which is every arm we ship.
+			 */
+			if (unlikely(READ_ONCE(ivh_head_bypass_probe)) &&
+			    !(loop & PV_PREV_CHECK_MASK))
+				ivh_head_observe(lock, pp, &hb);
+
 			cause = pv_wait_early(pp, loop);
 			if (cause) {
 				wait_early = true;
@@ -1677,6 +1968,43 @@ static int pv_wait_node(struct mcs_spinlock *node, struct mcs_spinlock *prev,
 		}
 
 		/*
+		 * Inner loop is over -- exhaustion or an early bail. Any episode
+		 * still open is CENSORED: we stopped watching before the head
+		 * came back. Accounted separately; see ivh_head_blk_close().
+		 *
+		 * PARTING SHOT: exhaustion is the single most common way an
+		 * episode ends censored (the observer's 387us attempt is far
+		 * shorter than a ~953us median absence), so fire here if the
+		 * hold is satisfied -- this is the last moment we will watch.
+		 * Only at THIS exit: PV_WAIT_OK means the head already
+		 * released, and the requeue exits mean we were evicted, which
+		 * is not our business. We halt straight after, so it cannot
+		 * oscillate, and the resulting state (pending clear, head
+		 * spinning unprotected) is exactly what upstream reaches
+		 * anyway when the head exhausts and calls clear_pending().
+		 */
+		if (unlikely(READ_ONCE(ivh_head_bypass_enable)) &&
+		    READ_ONCE(ivh_head_bypass_onexit) && hb.blk_start &&
+		    !hb.fire_start && hb.fires < READ_ONCE(ivh_head_bypass_max)) {
+			u64 now = rdtsc();
+
+			if ((s64)(now - hb.blk_start) >=
+			    (s64)READ_ONCE(ivh_head_bypass_hold)) {
+				u16 old = _Q_PENDING_VAL;
+
+				if (try_cmpxchg_relaxed(&lock->locked_pending,
+							&old, 0)) {
+					hb.fires++;
+					this_cpu_inc(ivh_head_bypass_fired);
+					this_cpu_inc(ivh_head_bypass_fired_exit);
+					__ivh_blk_close_at(&hb, now, false);
+					hb.fire_start = now;
+				}
+			}
+		}
+		ivh_head_blk_close(&hb, true);
+
+		/*
 		 * Spin-iteration accounting (GLOCK-10): record how many of the
 		 * SPIN_THRESHOLD iterations were actually spent before this pass
 		 * gave up on lock-free acquisition -- SPIN_THRESHOLD - loop.
@@ -1748,6 +2076,7 @@ static int pv_wait_node(struct mcs_spinlock *node, struct mcs_spinlock *prev,
 			if (!try_cmpxchg(&pn->state, &hold, VCPU_HALTED)) {
 				if (hold == VCPU_SKIPPED) {
 					this_cpu_inc(ivh_evict_halt_averted);
+					ivh_head_blk_close(&hb, true);
 					return PV_WAIT_REQUEUE;
 				}
 				/*
@@ -2122,6 +2451,75 @@ static noinline void ivh_evict_age_record(unsigned long src, u64 now,
 	this_cpu_inc(ivh_evict_cpubeat_hist[ivh_age_bucket(cpu_age)]);
 }
 
+/*
+ * G-LOCK-38: the exact three-way classification pv_evict_walk() uses, factored
+ * out so the item-5 look-ahead pass cannot drift from the committing pass.
+ */
+static __always_inline int ivh_evict_classify(struct mcs_spinlock *n,
+					      unsigned long src, u64 thr, u64 now)
+{
+	if (READ_ONCE(ivh_pv_evict_node_stamp) && src == 2) {
+		struct pv_node *cpn = (struct pv_node *)n;
+
+		if (READ_ONCE(cpn->state) != VCPU_RUNNING)
+			return IVH_ROT_HALTED;
+		return ivh_node_stale(cpn, now, thr) ? IVH_ROT_PREEMPTED
+						     : IVH_ROT_LIVE;
+	}
+	return ivh_rot_class(n, src, thr, now);
+}
+
+/*
+ * G-LOCK-38 item 5 -- LOOK-AHEAD (ivh_pv_evict_lookahead, default 0).
+ * Read-only pass: is there a non-PREEMPTED node reachable within @hopcap hops
+ * PAST the successor? Returns false when the walk would evict one or more
+ * waiters and still hand the lock to a node it never classified -- which at
+ * hop_cap=1 is 100% of evictions (measured). On false the caller evicts
+ * NOBODY and promotes the original successor, which is exactly the rule
+ * "if no live waiter was found after the max hops, give the lock to the
+ * preempted head waiter". Touches no state and commits nothing.
+ */
+static __always_inline bool ivh_evict_lookahead_ok(struct mcs_spinlock *succ,
+						   unsigned long src, u64 thr,
+						   u64 now, unsigned long cap,
+						   int hopcap)
+{
+	struct mcs_spinlock *c = succ;
+	int h;
+
+	for (h = 0; h < hopcap; h++) {
+		struct mcs_spinlock *nx;
+
+		if (ivh_evict_classify(c, src, thr, now) != IVH_ROT_PREEMPTED)
+			return h > 0;	/* h == 0: succ itself is fine, no eviction anyway */
+		nx = READ_ONCE(c->next);
+		if (!nx)
+			return false;
+		if (READ_ONCE(((struct pv_node *)c)->requeues) >= cap)
+			return false;
+		c = nx;
+	}
+	return false;			/* ran out of hops, never found a live node */
+}
+
+/*
+ * G-LOCK-38 item 2 -- stamp the PROMOTED node at the instant of promotion.
+ * Cross-CPU write to a dedicated array, never to the pv_node, so head_ctl's
+ * single-writer invariant is untouched (same argument as ivh_evict_stamp).
+ */
+static __always_inline void ivh_evict_promo_mark(struct mcs_spinlock *cand)
+{
+	struct pv_node *pn = (struct pv_node *)cand;
+	long ni;
+
+	if (likely(!READ_ONCE(ivh_pv_evict_promo_hist)))
+		return;
+	ni = (struct qnode *)pn - per_cpu_ptr(&qnodes[0], pn->cpu);
+	if ((unsigned long)ni < IVH_EVICT_MAX_NODES)
+		WRITE_ONCE(*per_cpu_ptr(&ivh_evict_promo_stamp[ni], pn->cpu),
+			   rdtsc());
+}
+
 static noinline struct mcs_spinlock *pv_evict_walk(struct mcs_spinlock *succ)
 {
 	unsigned long src, cap, hopcap;
@@ -2182,6 +2580,13 @@ static noinline struct mcs_spinlock *pv_evict_walk(struct mcs_spinlock *succ)
 	if (dbg)
 		this_cpu_inc(ivh_evict_walks);
 
+	/* G-LOCK-38 item 5: commit nothing unless a LIVE replacement exists. */
+	if (unlikely(READ_ONCE(ivh_pv_evict_lookahead)) &&
+	    !ivh_evict_lookahead_ok(succ, src, thr, now, cap, (int)hopcap)) {
+		this_cpu_inc(ivh_evict_lookahead_refused);
+		return succ;
+	}
+
 	for (hop = 0; hop < (int)hopcap; hop++) {
 		struct pv_node *pn = (struct pv_node *)cand;
 		struct mcs_spinlock *after;
@@ -2203,17 +2608,7 @@ static noinline struct mcs_spinlock *pv_evict_walk(struct mcs_spinlock *succ)
 		 * but staleness comes from the node's own stamp. State is still
 		 * read FIRST, so a halted waiter is never judged by its stamp.
 		 */
-		if (READ_ONCE(ivh_pv_evict_node_stamp) && src == 2) {
-			struct pv_node *cpn = (struct pv_node *)cand;
-
-			if (READ_ONCE(cpn->state) != VCPU_RUNNING)
-				cls = IVH_ROT_HALTED;
-			else
-				cls = ivh_node_stale(cpn, now, thr) ?
-				      IVH_ROT_PREEMPTED : IVH_ROT_LIVE;
-		} else {
-			cls = ivh_rot_class(cand, src, thr, now);
-		}
+		cls = ivh_evict_classify(cand, src, thr, now);
 		if (cls == IVH_ROT_PREEMPTED) {
 			/*
 			 * Keep the ivh_pv_evict_quiet gate open for as long as
@@ -2310,6 +2705,24 @@ static noinline struct mcs_spinlock *pv_evict_walk(struct mcs_spinlock *succ)
 			snap_cpu  = READ_ONCE(per_cpu(ivh_tsc_beat, pn->cpu).stamp);
 		}
 
+		/*
+		 * Deposit the eviction instant in the VICTIM's slot, BEFORE the
+		 * commit. Plain store ahead of a locked cmpxchg: on x86-TSO
+		 * anyone who observes VCPU_SKIPPED also observes this, so no
+		 * barrier is needed. It is a cross-CPU write to a dedicated
+		 * array, never to the pv_node, so head_ctl's single-writer
+		 * invariant is untouched.
+		 */
+		if (unlikely(READ_ONCE(ivh_pv_evict_gap_hist))) {
+			long ni = (struct qnode *)pn - per_cpu_ptr(&qnodes[0], pn->cpu);
+
+			if ((unsigned long)ni < IVH_EVICT_MAX_NODES) {
+				u64 *slot = per_cpu_ptr(&ivh_evict_stamp[ni], pn->cpu);
+
+				WRITE_ONCE(*slot, rdtsc());
+			}
+		}
+
 		if (!try_cmpxchg(&pn->state, &old, VCPU_SKIPPED)) {
 			if (dbg)
 				this_cpu_inc(ivh_evict_halt_race);
@@ -2327,6 +2740,7 @@ out:
 	if (cand != succ) {
 		if (dbg)
 			this_cpu_inc(ivh_evict_walks_acted);
+		ivh_evict_promo_mark(cand);	/* G-LOCK-38 item 2 */
 		/*
 		 * The promoted node is LIVE (or HALTED-and-about-to-be-woken)
 		 * as of the decision, so its Phase 0b class is 0 -- not the
@@ -2834,10 +3248,42 @@ static __always_inline void ivh_rot_ack(struct qspinlock *lock,
  * symmetric: rotate() runs at the promotion end of a handoff, ack() at the
  * acquisition end of the same handoff, one queue position later.
  */
+/*
+ * G-LOCK-38 item 2 read side: this node has just ACQUIRED. If it was promoted
+ * by an eviction, bucket promotion -> acquisition by log2(cycles). A blind
+ * promotion onto an off-CPU vCPU shows up here as a ~1 ms bucket.
+ */
+static __always_inline void ivh_evict_promo_ack(struct mcs_spinlock *node)
+{
+	struct pv_node *pn = (struct pv_node *)node;
+	long ni;
+	u64 st;
+	s64 d;
+	int b;
+
+	if (likely(!READ_ONCE(ivh_pv_evict_promo_hist)))
+		return;
+	ni = (struct qnode *)pn - this_cpu_ptr(&qnodes[0]);
+	if ((unsigned long)ni >= IVH_EVICT_MAX_NODES)
+		return;
+	st = READ_ONCE(*this_cpu_ptr(&ivh_evict_promo_stamp[ni]));
+	if (!st) {
+		this_cpu_inc(ivh_evict_promo_unknown);
+		return;
+	}
+	d = (s64)(rdtsc() - st);
+	b = (d > 0) ? ilog2((u64)d) : 0;
+	if (b >= IVH_BEAT_AGE_HIST_BUCKETS)
+		b = IVH_BEAT_AGE_HIST_BUCKETS - 1;
+	this_cpu_inc(ivh_evict_promo_hist[b]);
+	WRITE_ONCE(*this_cpu_ptr(&ivh_evict_promo_stamp[ni]), 0);
+}
+
 static __always_inline void pv_handoff_ack(struct qspinlock *lock,
 					   struct mcs_spinlock *node)
 {
 	ivh_rot_ack(lock, node);
+	ivh_evict_promo_ack(node);
 }
 
 /*

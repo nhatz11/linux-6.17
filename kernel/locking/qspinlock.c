@@ -154,6 +154,8 @@ static __always_inline int  __pv_wait_node(struct mcs_spinlock *node,
 					   { return PV_WAIT_OK; }
 static __always_inline void __pv_requeue_node(struct mcs_spinlock *node) { }
 static __always_inline void __pv_requeue_steal(struct mcs_spinlock *node) { }
+static __always_inline bool __pv_requeue_nosteal(struct mcs_spinlock *node)
+						   { return false; }
 static __always_inline void __pv_kick_node(struct qspinlock *lock,
 					   struct mcs_spinlock *node) { }
 static __always_inline u32  __pv_wait_head_or_lock(struct qspinlock *lock,
@@ -176,6 +178,7 @@ static __always_inline void __pv_handoff_ack(struct qspinlock *lock,
 #define pv_wait_node		__pv_wait_node
 #define pv_requeue_node		__pv_requeue_node
 #define pv_requeue_steal	__pv_requeue_steal
+#define pv_requeue_nosteal	__pv_requeue_nosteal
 #define pv_kick_node		__pv_kick_node
 #define pv_wait_head_or_lock	__pv_wait_head_or_lock
 #define pv_handoff_rotate	__pv_handoff_rotate
@@ -382,7 +385,23 @@ requeue:
 	 * qnodes[] slot was never released -- so this must NOT re-run
 	 * node->count++ above. One push, one pop, per acquisition.
 	 */
-	if (queued_spin_trylock(lock)) {
+	/*
+	 * G-LOCK-38 DIAGNOSTIC (ivh_pv_requeue_nosteal, default 0): send a
+	 * REQUEUED node straight to xchg_tail() instead of letting it enter
+	 * pv_hybrid_queued_unfair_trylock()'s camp loop.
+	 *
+	 * Measured motivation: each eviction costs ~110 us and forces the queue
+	 * head to re-arm 4-13 extra times (ivh_head_spin_enter 2.1x at
+	 * hop_cap=1, 14.2x at hop_cap=4) while head HALTS stay flat. The camp
+	 * loop only exits on a win, an empty tail, or pending set -- and the
+	 * head cannot set pending until it reaches pv_wait_head_or_lock().
+	 * This gate removes ONLY the camping; detection, marking, the requeue
+	 * and xchg_tail are all untouched, so it isolates that one variable.
+	 *
+	 * Skipping a trylock is always safe: the node simply queues normally.
+	 * Fresh slowpath entries are unaffected (->requeues is 0 for them).
+	 */
+	if (!pv_requeue_nosteal(node) && queued_spin_trylock(lock)) {
 		pv_requeue_steal(node);
 		goto release;
 	}
@@ -402,6 +421,13 @@ requeue:
 	 * p,*,* -> n,*,*
 	 */
 	old = xchg_tail(lock, tail);
+	/*
+	 * G-LOCK-38 item 1: ungated, two adds on the ONLY xchg_tail site in the
+	 * tree. This is the denominator every previous round had to guess at.
+	 */
+	this_cpu_inc(ivh_xchg_tail_calls);
+	if (old & _Q_TAIL_MASK)
+		this_cpu_inc(ivh_xchg_tail_nonempty);
 	next = NULL;
 	/*
 	 * prev must be re-cleared too. It is assigned only inside the
@@ -438,6 +464,34 @@ requeue:
 			pv_requeue_node(node);
 			node->locked = 0;
 			node->next = NULL;
+			/*
+			 * G-LOCK-38 item 4 (ivh_pv_requeue_none, default 0):
+			 * do NOT rejoin the queue -- try to acquire as an
+			 * unfair waiter instead. With item 3's nosteal this
+			 * brackets the whole cost of re-entry: nosteal removes
+			 * the steal and keeps the requeue, this removes the
+			 * requeue and keeps the steal.
+			 *
+			 * BOUNDED on purpose. An unbounded spin here is exactly
+			 * the shape that hung this VM twice during G-LOCK-33
+			 * bring-up, and queued_spin_trylock() is itself a camp
+			 * loop that gives up when pending is set -- so on
+			 * failure we must fall back to the ordinary requeue
+			 * rather than spin again. Never a correctness risk:
+			 * falling through to `goto requeue` is the normal path.
+			 */
+			if (unlikely(READ_ONCE(ivh_pv_requeue_none))) {
+				int spins = 64;
+
+				while (spins--) {
+					if (queued_spin_trylock(lock)) {
+						this_cpu_inc(ivh_requeue_none_won);
+						goto release;
+					}
+					cpu_relax();
+				}
+				this_cpu_inc(ivh_requeue_none_fellback);
+			}
 			goto requeue;
 		}
 		arch_mcs_spin_lock_contended(&node->locked);
@@ -616,6 +670,7 @@ EXPORT_SYMBOL(queued_spin_lock_slowpath);
 #undef pv_wait_node
 #undef pv_requeue_node
 #undef pv_requeue_steal
+#undef pv_requeue_nosteal
 #undef pv_kick_node
 #undef pv_wait_head_or_lock
 #undef pv_defer_promote

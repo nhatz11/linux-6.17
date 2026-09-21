@@ -1664,6 +1664,58 @@ DEFINE_PER_CPU(u64, ivh_evict_age_true_hist[IVH_BEAT_AGE_HIST_BUCKETS]);
 DEFINE_PER_CPU(u64, ivh_evict_cpubeat_hist[IVH_BEAT_AGE_HIST_BUCKETS]);
 DEFINE_PER_CPU(u64, ivh_evict_age_negative);
 DEFINE_PER_CPU(u64, ivh_evict_requeue_hist[IVH_EVICT_REQ_HIST_BUCKETS]);
+unsigned long ivh_pv_evict_gap_hist = 0UL;
+unsigned long ivh_head_bypass_probe = 0UL;
+unsigned long ivh_head_bypass_enable = 0UL;
+unsigned long ivh_head_bypass_runs = 3UL;
+unsigned long ivh_head_bypass_hold = 220000UL;
+unsigned long ivh_head_bypass_max = 4UL;
+unsigned long ivh_head_bypass_onexit = 1UL;
+DEFINE_PER_CPU(u64, ivh_head_bypass_fired);
+DEFINE_PER_CPU(u64, ivh_head_bypass_fired_exit);
+DEFINE_PER_CPU(u64, ivh_head_bypass_raced_locked);
+DEFINE_PER_CPU(u64, ivh_head_bypass_raced_clear);
+DEFINE_PER_CPU(u64, ivh_head_bypass_capped);
+DEFINE_PER_CPU(u64, ivh_head_bypass_open_cycles);
+DEFINE_PER_CPU(u64, ivh_head_bypass_open_events);
+DEFINE_PER_CPU(u64, ivh_head_bypass_open_trunc);
+unsigned long ivh_pv_trylock_relaxed = 0UL;
+/* G-LOCK-38 diagnostic: see ivh_pv_requeue_nosteal in <asm/ivh_tsc_beat.h>. */
+unsigned long ivh_pv_requeue_nosteal __read_mostly = 0UL;
+/* G-LOCK-38 item 4: see ivh_pv_requeue_none in <asm/qspinlock.h>. */
+unsigned long ivh_pv_requeue_none __read_mostly = 0UL;
+/* G-LOCK-38 item 5: look-ahead eviction -- commit only if a LIVE replacement exists. */
+unsigned long ivh_pv_evict_lookahead __read_mostly = 0UL;
+/* G-LOCK-38 item 2: histogram promotion -> promoted node's acquisition. */
+unsigned long ivh_pv_evict_promo_hist __read_mostly = 0UL;
+/* G-LOCK-38 item 6: camp-loop probe. */
+unsigned long ivh_pv_camp_probe __read_mostly = 0UL;
+DEFINE_PER_CPU(u64, ivh_xchg_tail_calls);
+DEFINE_PER_CPU(u64, ivh_xchg_tail_nonempty);
+DEFINE_PER_CPU(u64, ivh_requeue_none_won);
+DEFINE_PER_CPU(u64, ivh_requeue_none_fellback);
+DEFINE_PER_CPU(u64, ivh_camp_trips);
+DEFINE_PER_CPU(u64, ivh_camp_entries);
+DEFINE_PER_CPU(u64, ivh_camp_exit_win);
+DEFINE_PER_CPU(u64, ivh_camp_exit_empty);
+DEFINE_PER_CPU(u64, ivh_camp_exit_pending);
+DEFINE_PER_CPU(u64, ivh_evict_promo_stamp[IVH_EVICT_MAX_NODES]);
+DEFINE_PER_CPU(u64, ivh_evict_promo_hist[IVH_BEAT_AGE_HIST_BUCKETS]);
+DEFINE_PER_CPU(u64, ivh_evict_promo_unknown);
+DEFINE_PER_CPU(u64, ivh_evict_lookahead_refused);
+DEFINE_PER_CPU(u64, ivh_head_obs_samples);
+DEFINE_PER_CPU(u64, ivh_head_obs_stale);
+DEFINE_PER_CPU(u64, ivh_head_obs_held);
+DEFINE_PER_CPU(u64, ivh_head_obs_free_open);
+DEFINE_PER_CPU(u64, ivh_head_obs_actionable);
+DEFINE_PER_CPU(u64, ivh_head_blocked_cycles);
+DEFINE_PER_CPU(u64, ivh_head_blocked_hist[IVH_BEAT_AGE_HIST_BUCKETS]);
+DEFINE_PER_CPU(u64, ivh_head_blocked_events);
+DEFINE_PER_CPU(u64, ivh_head_blocked_trunc_cycles);
+DEFINE_PER_CPU(u64, ivh_head_blocked_trunc_events);
+DEFINE_PER_CPU(u64, ivh_evict_stamp[IVH_EVICT_MAX_NODES]);
+DEFINE_PER_CPU(u64, ivh_evict_gap_negative);
+DEFINE_PER_CPU(u64, ivh_evict_gap_hist[IVH_BEAT_AGE_HIST_BUCKETS]);
 DEFINE_PER_CPU(u64, ivh_cs_abstain_rot);
 DEFINE_PER_CPU(u64, ivh_cs_abstain_tag);
 DEFINE_PER_CPU(u64, ivh_cs_abstain_skew);
@@ -2572,6 +2624,117 @@ static const struct ctl_table ivh_pv_sysctls[] = {
 	{
 		.procname	= "ivh_pv_evict_age_hist",
 		.data		= &ivh_pv_evict_age_hist,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		/*
+		 * Head-bypass Stage 1: observation only. Gates a sampled read
+		 * of the predecessor's head_ctl plus the lock word in
+		 * pv_wait_node(); at 0 it costs one READ_ONCE of this
+		 * read-mostly global and a predicted-not-taken branch.
+		 *
+		 * Deliberately INDEPENDENT of ivh_pv_tier2_enable. The
+		 * pre-existing "Stage 0" observe block is welded behind
+		 * pv_wait_early() returning non-zero, and with tier 2 off the
+		 * only such return is tier 1's, which requires
+		 * prev->state != VCPU_RUNNING -- mutually exclusive with the
+		 * HEAD_SPINNING && VCPU_RUNNING case it exists to observe. It
+		 * has therefore been dead in every arm this project ships.
+		 */
+		.procname	= "ivh_pv_trylock_relaxed",
+		.data		= &ivh_pv_trylock_relaxed,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_pv_requeue_nosteal",
+		.data		= &ivh_pv_requeue_nosteal,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_pv_requeue_none",
+		.data		= &ivh_pv_requeue_none,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_pv_evict_lookahead",
+		.data		= &ivh_pv_evict_lookahead,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_pv_evict_promo_hist",
+		.data		= &ivh_pv_evict_promo_hist,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_pv_camp_probe",
+		.data		= &ivh_pv_camp_probe,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_head_bypass_enable",
+		.data		= &ivh_head_bypass_enable,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_head_bypass_runs",
+		.data		= &ivh_head_bypass_runs,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_head_bypass_hold",
+		.data		= &ivh_head_bypass_hold,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_head_bypass_max",
+		.data		= &ivh_head_bypass_max,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_head_bypass_onexit",
+		.data		= &ivh_head_bypass_onexit,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_head_bypass_probe",
+		.data		= &ivh_head_bypass_probe,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		/*
+		 * Forward half of the eviction question: how long the evicted
+		 * vCPU was actually away. See ivh_evict_gap_hist in
+		 * <asm/ivh_tsc_beat.h>. Costs one rdtsc per REQUEUE (not per
+		 * handoff), so it is off by default but cheap when on.
+		 */
+		.procname	= "ivh_pv_evict_gap_hist",
+		.data		= &ivh_pv_evict_gap_hist,
 		.maxlen		= sizeof(unsigned long),
 		.mode		= 0644,
 		.proc_handler	= proc_doulongvec_minmax,
