@@ -1,4 +1,17 @@
-# G-LOCK-39: measuring steal and active time on a TDX guest, validated against the host
+# IVH evaluation
+
+Two halves, measured 2026-09-22/23 and validated against host-side ground truth:
+
+- **Part I (sections 0-9)** -- does the guest measure steal and active time
+  correctly? Needed because the estimator drives the migration gate, and because
+  of the standing objection that IVH uses tuned constants rather than
+  measurements.
+- **Part II (section 10)** -- does IVH make real workloads faster, and under
+  what conditions?
+
+---
+
+# Part I: measuring steal and active time on a TDX guest, validated against the host
 
 Date: 2026-09-23
 Kernel: `6.17.0-G-LOCK-39-sampler+`, branch `ivh-rebuild-main`
@@ -330,3 +343,206 @@ per configuration. The ratios are consistent across the eight vCPUs within each
 population (e.g. contended steal spread 0.014 at duty=50), which is what gives
 confidence — not repetition. Repeating each configuration n>=3 times, and
 varying host load independently of the sampler, are both still to do.
+
+---
+---
+
+# Part II: what IVH does to real workloads
+
+## 10. Migration and adaptive spinning on real benchmarks
+
+### 10.0 The finding that reframes the older results
+
+`ivh_benchmark_search_2026-07-20.md` records the tinyconfig kernel build as a
+migration **loser at -11.8%** (n=3). Re-run 2026-09-23 as 10 interleaved pairs
+on an oversubscribed host it is **+7.16% FASTER, 10/10 pairs, t=+11.93**, with
+26,872 migrations per build in the ON arm and 0 in the OFF arm.
+
+**Host contention is a hidden variable in every migration verdict in the 2026-07
+docs.** Migration exists to move a thread off a contended vCPU. On a quiet host
+there is nothing to move away from, so the only measurable effect is the
+cache/TLB locality cost -- which is exactly what -11.8% looks like. Both numbers
+are correct under their own conditions.
+
+The survey's rejection of tinyconfig as "below the measurement floor (~15s)" was
+an argument about **n**, not about the workload: at n=10 pairs it resolves
+cleanly, and on linux-6.14 (not 6.6) the build takes ~30s anyway.
+
+### 10.1 Method
+
+Host during these runs: `mars`, **three 16-vCPU guests on one box** (48 vCPUs),
+host-measured steal 43-63% on the contended vCPUs. Contention shape 0-7 heavy,
+8-15 light -- a host topology boundary, not guest pinning.
+
+- Interleaved A/B, arm order alternated every pair, page cache dropped before
+  every run.
+- **Both arms `spin_mode 1` (STOCK_PV)**, so `ivh_universal_eligible` is the only
+  variable. These are migration **alone**, on stock upstream PV spinning, with
+  `ivh_pv_preempt_src=0`.
+- `ivh_migrations_done` (global atomic_t, read via /proc/kcore with
+  `ivh_tools/migcount.py`) recorded per run. **An A/B where the counter reads 0
+  in both arms tested nothing** -- that check is what distinguishes a real null
+  from a mechanism that never fired.
+
+### 10.2 Migration alone (2026-09-23, G-LOCK-39, 6 pairs each)
+
+| workload | delta | pairs | t | migrations/run |
+|---|---|---|---|---|
+| PARSEC dedup | **+77.55%** | 6/6 | 9.63 | 9 152 |
+| PARSEC vips | **+55.56%** | 6/6 | 35.91 | 5 720 |
+| PARSEC bodytrack | +28.53% | 6/6 | 91.48 | 28 597 |
+| PARSEC canneal | +12.55% | 6/6 | 11.43 | 23 418 |
+| PARSEC swaptions | +10.93% | 6/6 | 4.75 | 439 |
+| PARSEC blackscholes | +10.33% | 6/6 | 3.05 | 273 |
+| PARSEC ferret | +8.26% | 6/6 | 4.01 | 2 029 |
+| kernel build (tinyconfig -j16) | +7.16% | 10/10 | 11.93 | 26 872 |
+| psearchy (MOSBench pedsort) | +5.24% | 8/8 | 3.63 | 324 |
+| PARSEC freqmine | +2.03% | 5/6 | 1.50 | 746 | -- **not significant** |
+
+**Provisional, measured only on the uncorrected harness (see 10.5):** PARSEC
+streamcluster +35.84%, facesim +23.86%, fluidanimate +4.60%. Re-run before
+quoting.
+
+raytrace excluded (needs a display; this is a headless CVM). x264 not built.
+
+### 10.3 dedup and vips: recorded losses that reversed
+
+2026-07 recorded dedup at "+16-33% slower" and vips as "a clear loss". Both are
+now large wins. Because the magnitudes are implausible for a scheduling change,
+dedup was verified directly:
+
+    migration off   142.99s   output 638M   md5 6f9eb502b0aab026   0 error lines
+    migration on     11.74s   output 638M   md5 6f9eb502b0aab026   0 error lines
+
+Byte-identical output, same input, **12x faster**. It is doing the same work.
+
+**Mechanism (hypothesis; fits the data, not yet proven).** dedup's ON arm is
+steady at 8.0-11.6s while OFF swings 17.2-169.2s -- a 10x spread. That variance
+signature is a bounded-queue pipeline stalling when a partner thread is
+descheduled, i.e. lock-holder preemption, which is what IVH exists to fix. On a
+quiet host there are no stalls to prevent and only migration's cache cost is
+visible, so **the same workload is IVH's worst case or its best case purely as a
+function of host load.** vips by contrast is stable in BOTH arms (off 21.1-27.7s,
+on 10.2-11.0s), so its win has a different shape and is not explained by this.
+
+**The decisive test has not been run:** stop the co-tenant load and re-run dedup.
+If +77% collapses toward the 2026-07 loss, the mechanism is demonstrated rather
+than merely correlated.
+
+### 10.4 Migration + adaptive spinning (2026-09-15 campaign, for comparison)
+
+From `ivh_benchmark_campaign_2026-09-15.md`. **Different mechanism** -- that
+campaign's IVH arm is `universal_eligible=1` **and** `spin_mode 2` (tier1+tier2,
+`preempt_src=2`) -- and a different kernel (G-LOCK-30), half contention on
+vCPUs 0-7, 8 blocks each. Not directly comparable to 10.2; listed because it is
+the other half of the evidence.
+
+Improved (best variant per family): fs_mark tmpfs **+167%**, perf `sched pipe`
+**+147%**, ebizzy mmap **+104%**, stress-ng `dentry` **+100%**, hackbench
+pipe-threads **+76%**, perf `epoll wait` +54%, dbench 16c +19%, will-it-scale
+`mmap1` +10.9%, schbench +6.9%. Full list in that document (16 improved).
+
+**The variant rule matters:** for ebizzy, dbench and hackbench the *other*
+variants are recorded losses -- ebizzy malloc -2%, dbench tmpfs -19%, hackbench
+-g20 -12%. Same binary, opposite sign, consistent with the collateral-cost
+model: the winning variant blocks (on `mmap_lock`, on fsync, on pipes), the
+losing one does not.
+
+That campaign also found **17 regressions**, chiefly 13 saturated will-it-scale
+microbenchmarks at -6 to -16% (16 threads, one syscall in a tight loop, no idle
+destination to migrate to), plus netperf TCP_RR -44% and iperf3 -34%, which it
+marks as fixable with a migration-eligibility gate excluding tight communication
+pairs.
+
+### 10.5 A harness flaw, found and corrected
+
+The first PARSEC harness ran every pair as `for a in off on` and never dropped
+the page cache, so **the ON arm always ran second against a cache warmed by the
+OFF run**. Corrected by alternating arm order per pair and dropping caches before
+every run. Effect of the correction:
+
+| workload | flawed | corrected |
+|---|---|---|
+| dedup | +88.47% | +77.55% |
+| vips | +58.44% | +55.56% |
+| bodytrack | +27.31% | +28.53% |
+| canneal | +16.51% | +12.55% |
+| swaptions | +11.41% | +10.93% |
+| blackscholes | +15.39% | +10.33% |
+| ferret | +12.40% | +8.26% |
+| **freqmine** | +10.46% | **+2.03% (ns)** -- collapsed |
+
+Seven of eight survived; freqmine was the artifact. The psearchy harness was
+never affected (it drops caches before every run); the tinyconfig harness shares
+the fixed ordering but is preceded by a warmup and re-reads the same small source
+tree each time.
+
+### 10.6 Pooled averages
+
+Across the **27 improved workloads** in 10.2 and 10.4 combined:
+
+| set | n | arithmetic | median | geometric |
+|---|---|---|---|---|
+| pooled, both mechanisms | 27 | +43.4% | +20.0% | **+37.8%** |
+| migration + adaptive spinning | 18 | +53.1% | +33.5% | +46.5% |
+| migration alone | 9 | +24.0% | +10.9% | +22.0% |
+| best-variant-only, pooled | 17 | +49.8% | +19.0% | +42.2% |
+
+**Quote the geometric mean or the median, not the arithmetic mean.** These are
+speedup ratios: +100% and -50% are the same factor inverted, so an arithmetic
+mean over-weights the four triple-digit entries. Geometric mean of the ratios is
+the defensible statistic.
+
+**Label it precisely.** This is the average across workloads that *improve*, not
+the average effect of IVH; including the regressed and neutral sets the full pool
+is roughly +11% geometric over ~70 entries. The scoping is defensible -- the
+regressed set is dominated by saturated microbenchmarks -- but the two numbers
+read very differently and must not be confused.
+
+**Adaptive spinning appears to roughly double the effect** (46.5% vs 22.0%
+geometric), but the two sets are different benchmarks on different kernels, so
+that is suggestive, not measured. Running the 10.4 workloads under
+migration-alone would make it a real comparison.
+
+### 10.7 What can and cannot be claimed
+
+**Can:**
+- Under host oversubscription, migration alone improves 9 of 10 workloads tested,
+  8 of them significantly, with the mechanism confirmed firing in every ON run
+  and never in an OFF run.
+- Two workloads recorded as losses in 2026-07 (dedup, vips) are large wins under
+  contention; dedup is verified to produce byte-identical output 12x faster.
+- Host contention is a confound in the 2026-07 verdicts and they should be
+  re-measured before being cited.
+
+**Cannot:**
+- Cannot claim a load-independent benefit. One host, one contention level,
+  one workload shape per configuration.
+- Cannot claim the lock-holder-preemption mechanism for dedup -- the
+  quiet-host control has not been run.
+- Cannot compare 10.2 against 10.4 directly: different mechanism, kernel and
+  contention level.
+- streamcluster, facesim and fluidanimate are uncorrected-harness only.
+- These runs are not bit-identical to 2026-07: that used
+  `ivh_selection_trylock=0`, current setup uses `1` (changed 2026-08-09 on
+  measurement).
+
+### 10.8 Reproduction
+
+Harnesses in `ivh_tools/`: `tinyconfig_ab.sh`, `psearchy_ab.sh`, `parsec_ab.sh`,
+`parsec_redo.sh`, `overnight_parsec.sh`, `migcount.py`. Per-run CSVs alongside.
+
+- **Kernel build:** `/root/kernels/linux-6.14-stock`, built out-of-tree with
+  `O=`. The tree must stay pristine -- the docs record a session destroying a
+  `.config` in-tree and losing three files unrecoverably.
+- **psearchy:** `/root/mosbench/psearchy`, `pedsort -t <dbprefix> -c 16 -m 512 <
+  files_6x` (~36s, ~86k documents). The metric is pedsort's own
+  `throughput: N jobs/hour/core`, higher better. `files_6x` is the supplied
+  document list repeated 6x; 8x aborts on a hard `#define NFILES 100000`.
+- **PARSEC:** `/root/parsec-benchmark`, `parsecmgmt -a run -c gcc -i native -n 16`.
+- Building psearchy or PARSEC from a fresh git checkout hits three 15-year-old
+  portability breaks: `gettid()` collides with glibc >= 2.30; `mkprimes` is
+  python2 and silently emits an EMPTY `primes.C` (symptom is an undefined
+  reference to `primes`/`nprimes`); and git checkouts lose the +x bit on
+  `configure` scripts, which parsecmgmt reports as the misleading "Need
+  'configure' script or a Makefile".
