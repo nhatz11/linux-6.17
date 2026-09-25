@@ -312,9 +312,31 @@ Identify this guest's QEMU process (its vCPU threads are named `CPU N/...`):
     $(ps -o args= -p $p | grep -o '\-name[= ][^ ]*' | head -1)"
     done
 
-Then `ivh_tools/host_truth.sh <seconds> <pid>`, which samples
-`/proc/<tid>/schedstat` per vCPU thread and prints `run_ns`/`wait_ns` deltas as
-active/steal/idle percentages of wall.
+**The command that actually produced the numbers in this document** was run
+inline on the host, not from a script. Recorded verbatim because it is the
+provenance of every host-side figure in section 4-5:
+
+    PID=1430099; SECS=60
+    TIDS=$(ps -L -o tid=,comm= -p $PID | awk '$2 ~ /^CPU/ {print $1}')
+    declare -A R W; T0=$(date +%s%N)
+    for t in $TIDS; do read r w _ < /proc/$t/schedstat; R[$t]=$r; W[$t]=$w; done
+    date -u +"START %H:%M:%S"; sleep $SECS
+    T1=$(date +%s%N); WALL=$((T1-T0)); date -u +"END   %H:%M:%S"
+    i=0; for t in $TIDS; do read r w _ < /proc/$t/schedstat; \
+      awk -v i=$i -v dr=$((r-${R[$t]})) -v dw=$((w-${W[$t]})) -v wall=$WALL 'BEGIN{
+        printf "vcpu%-3d active=%6.2f%%  steal=%6.2f%%  idle=%6.2f%%\n",
+        i, dr*100/wall, dw*100/wall, 100-(dr+dw)*100/wall}'; \
+      i=$((i+1)); done
+
+`/proc/<tid>/schedstat` is `<run_ns> <wait_ns> <timeslices>`. For a vCPU thread
+`run_ns` is time on a physical CPU (the guest's ACTIVE time) and `wait_ns` is
+time runnable but not scheduled (the guest's STEAL time); the remainder of wall
+is the thread halted, i.e. guest idle. Accuracy is then simply
+guest-estimate / host-truth over the same window.
+
+`ivh_tools/host_truth.sh <seconds> <pid>` is a tidied reimplementation of the
+above (it also discovers the pid and guards missing threads), written after the
+fact. Either works; the inline form is what the recorded results came from.
 
 **Guest half.** `ivh_tools/guest_window.sh <seconds>` over the SAME window —
 started within a couple of seconds of the host script, which at 60 s is ~3%
