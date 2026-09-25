@@ -8,6 +8,12 @@ Two halves, measured 2026-09-22/23 and validated against host-side ground truth:
   measurements.
 - **Part II (section 10)** -- does IVH make real workloads faster, and under
   what conditions?
+- **Part III (section 11)** -- the 15-point evaluation plan for the paper, with
+  a feasibility triage and current status per point.
+
+**2026-09-25: Part II section 10.2 was re-measured and REPLACED.** The original
+numbers were taken with the G-LOCK-39 hrtimer sampler live, which costs the arm
+that cannot mitigate lock-holder preemption up to 48%. See 10.9.
 
 ---
 
@@ -384,24 +390,34 @@ host-measured steal 43-63% on the contended vCPUs. Contention shape 0-7 heavy,
   in both arms tested nothing** -- that check is what distinguishes a real null
   from a mechanism that never fired.
 
-### 10.2 Migration alone (2026-09-23, G-LOCK-39, 6 pairs each)
+### 10.2 Migration alone (RE-MEASURED 2026-09-25, sampler off)
 
-| workload | delta | pairs | t | migrations/run |
-|---|---|---|---|---|
-| PARSEC dedup | **+77.55%** | 6/6 | 9.63 | 9 152 |
-| PARSEC vips | **+55.56%** | 6/6 | 35.91 | 5 720 |
-| PARSEC bodytrack | +28.53% | 6/6 | 91.48 | 28 597 |
-| PARSEC canneal | +12.55% | 6/6 | 11.43 | 23 418 |
-| PARSEC swaptions | +10.93% | 6/6 | 4.75 | 439 |
-| PARSEC blackscholes | +10.33% | 6/6 | 3.05 | 273 |
-| PARSEC ferret | +8.26% | 6/6 | 4.01 | 2 029 |
-| kernel build (tinyconfig -j16) | +7.16% | 10/10 | 11.93 | 26 872 |
-| psearchy (MOSBench pedsort) | +5.24% | 8/8 | 3.63 | 324 |
-| PARSEC freqmine | +2.03% | 5/6 | 1.50 | 746 | -- **not significant** |
+Both arms `spin_mode 1`, `ivh_universal_eligible` the only variable, page cache
+dropped before every run, arm order alternated per pair, `ivh_tks_sampler_ns=0`
+(see 10.9 for why that last one matters more than everything else here).
 
-**Provisional, measured only on the uncorrected harness (see 10.5):** PARSEC
-streamcluster +35.84%, facesim +23.86%, fluidanimate +4.60%. Re-run before
-quoting.
+| workload | delta | pairs | t | sig | migrations/run |
+|---|---|---|---|---|---|
+| PARSEC dedup | **+86.86%** | 6/6 | 27.04 | yes | 12 140 |
+| PARSEC vips | **+57.39%** | 6/6 | 17.87 | yes | 5 237 |
+| PARSEC ferret | **+15.21%** | 6/6 | 22.63 | yes | 2 294 |
+| PARSEC bodytrack | **+14.39%** | 6/6 | 6.47 | yes | 33 027 |
+| PARSEC swaptions | **+10.43%** | 6/6 | 14.18 | yes | 510 |
+| PARSEC freqmine | **+4.96%** | 5/6 | 2.86 | yes | 725 |
+| kernel build (tinyconfig -j16) | +0.99% | 9/10 | 2.99 | yes | 28 041 |
+| PARSEC blackscholes | +1.07% | 4/6 | 0.76 | **no** | 430 |
+| psearchy (MOSBench pedsort) | +0.82% | 6/8 | 1.82 | **no** | 280 |
+| PARSEC canneal | +0.14% | 2/6 | 0.18 | **no** | 23 340 |
+
+Significance: n=6 pairs needs |t|>2.571, n=8 needs 2.365, n=10 needs 2.262.
+**7 of 10 significant.** Geometric mean of the 7: **+24.1%**, median +14.4%.
+
+**Superseded values** (2026-09-23, sampler on): dedup +77.55, vips +55.56,
+bodytrack +28.53, canneal +12.55, swaptions +10.93, blackscholes +10.33,
+ferret +8.26, freqmine +2.03, tinyconfig +7.16, psearchy +5.24.
+
+**Provisional, uncorrected harness AND sampler-on, do not quote:** PARSEC
+streamcluster +35.84%, facesim +23.86%, fluidanimate +4.60%.
 
 raytrace excluded (needs a display; this is a headless CVM). x264 not built.
 
@@ -477,32 +493,37 @@ never affected (it drops caches before every run); the tinyconfig harness shares
 the fixed ordering but is preceded by a warmup and re-reads the same small source
 tree each time.
 
-### 10.6 Pooled averages
+### 10.6 Pooled averages (revised 2026-09-25)
 
-Across the **27 improved workloads** in 10.2 and 10.4 combined:
+**Corrected migration-alone set (10.2), 7 significant of 10 tested:**
 
-| set | n | arithmetic | median | geometric |
-|---|---|---|---|---|
-| pooled, both mechanisms | 27 | +43.4% | +20.0% | **+37.8%** |
-| migration + adaptive spinning | 18 | +53.1% | +33.5% | +46.5% |
-| migration alone | 9 | +24.0% | +10.9% | +22.0% |
-| best-variant-only, pooled | 17 | +49.8% | +19.0% | +42.2% |
+| statistic | value |
+|---|---|
+| geometric mean of the 7 significant | **+24.1%** |
+| median of the 7 | +14.4% |
+| geometric mean over all 10 incl. the 3 nulls | +16.6% |
 
-**Quote the geometric mean or the median, not the arithmetic mean.** These are
-speedup ratios: +100% and -50% are the same factor inverted, so an arithmetic
-mean over-weights the four triple-digit entries. Geometric mean of the ratios is
-the defensible statistic.
+**Quote the geometric mean or the median, never the arithmetic mean.** These are
+speedup ratios; +100% and -50% are the same factor inverted, so an arithmetic
+mean over-weights the triple-digit entries.
 
-**Label it precisely.** This is the average across workloads that *improve*, not
-the average effect of IVH; including the regressed and neutral sets the full pool
-is roughly +11% geometric over ~70 entries. The scoping is defensible -- the
-regressed set is dominated by saturated microbenchmarks -- but the two numbers
-read very differently and must not be confused.
+**Label the scope precisely.** This is the average across workloads that
+*improve*, not the average effect of IVH. Including regressed and neutral
+workloads the full pool is far lower. The two numbers read very differently.
 
-**Adaptive spinning appears to roughly double the effect** (46.5% vs 22.0%
-geometric), but the two sets are different benchmarks on different kernels, so
-that is suggestive, not measured. Running the 10.4 workloads under
-migration-alone would make it a real comparison.
+**The 10.4 campaign (+46.5% geometric over 18) is NOT poolable with this set.**
+Different mechanism (migration + AS vs migration alone), different kernel
+(G-LOCK-30 vs G-LOCK-39), different benchmarks. It was measured before the
+sampler existed, so it is not affected by 10.9 -- independently confirmed by
+re-measuring ebizzy_mmap with the sampler off: **+103.2%** against its recorded
+**+104.3%**.
+
+**Adaptive spinning's separate contribution is still not measured.** 10.4 is
+migration+AS, 10.2 is migration alone, and they share no workloads. Direct AS
+tests on the two 10.2 nulls (2026-09-25) were **not significant**: kernel build
++1.71% mean but -0.49% median, 3/10 pairs, t=0.84; psearchy +1.54%, 7/10,
+t=1.67. A 4-arm decomposition (PV / migration / AS / both) on the same workloads
+is the missing experiment.
 
 ### 10.7 What can and cannot be claimed
 
@@ -546,3 +567,199 @@ Harnesses in `ivh_tools/`: `tinyconfig_ab.sh`, `psearchy_ab.sh`, `parsec_ab.sh`,
   reference to `primes`/`nprimes`); and git checkouts lose the +x bit on
   `configure` scripts, which parsecmgmt reports as the misleading "Need
   'configure' script or a Makefile".
+
+### 10.9 The measurement instrument was corrupting the measurement
+
+**2026-09-25.** Every number in 10.2 as originally recorded was taken with
+`ivh_tks_sampler_ns=200000` -- the G-LOCK-39 hrtimer steal sampler. It fires
+every 200 us on every vCPU, and on this TDX guest each hrtimer re-arm is a LAPIC
+MSR write, i.e. a `#VE` exit costing 11-15 us. Those exits land inside critical
+sections. The IVH arm mitigates exactly that class of stall; the PV arm cannot.
+**The instrument manufactured the effect under test.**
+
+Measured on the PV arm with nothing else varying, 8 runs each:
+
+| workload | sampler ON | sampler OFF | OFF vs ON | 09-15 PV reference |
+|---|---|---|---|---|
+| ebizzy_mmap | 540.5 +- 22.5 | 1041.8 +- 317.6 | **+92.7%** | 974.3 (+6.9%) |
+| perf sched pipe | 16068 +- 1190 | 19410 +- 461 | **+20.8%** | 18893 (+2.7%) |
+
+With the sampler off the PV arm returns to within 3-7% of its G-LOCK-30 value.
+
+**Exposure window, from timestamps:** `sampler_ns=200000` entered
+`goto_mode.sh` at 2026-09-23 06:45:43; the tinyconfig run started 06:52,
+psearchy 07:22, PARSEC from 08:02. All inside the window.
+
+**The distortion is bidirectional**, which is why the re-run moved results both
+ways. The sampler does not cost both arms equally; the gap decides the sign:
+
+| workload | cost to OFF arm | to ON arm | gap | recorded -> corrected |
+|---|---|---|---|---|
+| bodytrack | 17.2% | 1.0% | +16.2pp | 28.5 -> 14.4 |
+| canneal | 21.9% | 10.8% | +11.1pp | 12.6 -> 0.1 |
+| blackscholes | 17.1% | 8.3% | +8.8pp | 10.3 -> 1.1 |
+| tinyconfig | 16.3% | 10.7% | +5.6pp | 7.2 -> 1.0 |
+| psearchy | 16.3% | 11.5% | +4.8pp | 5.2 -> 0.8 |
+| swaptions | 9.2% | 8.7% | +0.5pp | 11.0 -> 10.4 |
+| vips | 3.6% | 9.8% | -6.2pp | 55.6 -> 57.4 |
+| ferret | 8.3% | 15.3% | -7.0pp | 8.3 -> 15.2 |
+
+swaptions is the control: near-zero gap, result unmoved. Where the sampler hurt
+the unmitigated arm more we over-reported; where it hurt the migration arm more
+we *under*-reported and were hiding real wins (ferret nearly doubled).
+
+**Rule: `ivh_tks_sampler_ns=200000` is for VALIDATING the estimator (Part I).
+Set it to 0 for every performance measurement, in BOTH arms.** `goto_mode.sh`
+sets 200000, so anything calling it must override afterwards. Capacity still
+gates correctly at 0 (reads ~621 on the contended half against a 1010 threshold)
+and migration still fires (6 963 in a 10 s hackbench). Enforced by
+`ivh_tools/bench_guard.sh`, sourced by all three harnesses.
+
+**A second flaw found at the same time:** `tinyconfig_ab.sh` and
+`psearchy_ab.sh` both ran `for a in off on` with no alternation, so the ON arm
+always ran second -- the identical flaw corrected in the PARSEC harness in 10.5.
+Both now alternate per pair.
+
+### 10.10 Why the kernel build and psearchy cannot be rescued
+
+Five levers were tried against the two nulls. All failed, and the reason is
+structural rather than a tuning problem.
+
+Lock traffic measured with the ftrace function profiler (no PMU needed on this
+guest), `ivh_tools/lockrate.sh`:
+
+| workload | total locks/s | contended (qspinlock slowpath) /s | contended % | win |
+|---|---|---|---|---|
+| psearchy | 942 627 | 7 443 | **0.79%** | +0.82% null |
+| dedup | 273 969 | 1 505 | 0.55% | **+86.9%** |
+| canneal | 70 558 | 263 | 0.37% | +0.14% null |
+| kernel build (defconfig) | 884 590 | 2 366 | 0.27% | -- |
+| kernel build (tinyconfig) | 834 619 | 1 887 | 0.23% | +0.99% |
+
+**Contended-lock rate does not predict the win.** psearchy has the highest rate
+of the five and is null; dedup has a third of psearchy's and wins 87%.
+
+What separates them is **blocking dependency structure**. dedup is a
+bounded-queue pipeline: its OFF arm swings 42-189 s while ON sits at 8.5-11 s,
+because one descheduled stage stalls every stage behind it. A kernel build is
+thousands of independent gcc processes; psearchy is 16 independent workers with
+per-core hash tables and per-core output directories. Preempt one and nothing
+waits, so there is no lock-holder preemption to prevent.
+
+Levers tried:
+
+| lever | kernel build | psearchy |
+|---|---|---|
+| migration alone | +0.99% (sig) | +0.82% (ns) |
+| adaptive spinning (`spin_mode 2`) | +1.71% mean, **-0.49% median**, 3/10, t=0.84 | +1.54%, 7/10, t=1.67 |
+| bigger config (defconfig, 4.6x) | contended 0.23% -> 0.27% | n/a |
+| smaller `-m` (512/128/32) | n/a | contended 0.72/0.55/0.72% -- **no increase** |
+| rwlock coverage | 1.3% of traffic | 16% of traffic, but see below |
+
+**Ceiling from first principles.** Slowpath events are system-wide across 16
+cores. At a generous 100 us saved per contended acquisition: kernel build
+1 887/s x 100 us = 0.19 s/s against 16 s/s of CPU, a **~1.2% ceiling**; psearchy
+7 443/s gives **~4.6%**. Both measured results landed under their ceiling.
+
+**The rwlock gap is narrower than it appears.** `ivh_pre_lock` is absent from
+`_raw_read_lock*`/`_raw_write_lock*` (and from `_raw_spin_lock_bh` and the
+`_nested` variants), so migration cannot fire at those sites. But Linux
+`qrwlock` takes an internal `wait_lock` on its slow path, and that *is* a queued
+spinlock -- so contended rwlock time already appears in the slowpath counts
+above, and adaptive spinning already reaches it. Only migration opportunities
+are lost, and migration alone on psearchy is +0.82%.
+
+**Disposition: report both as negative controls.** They are the workloads where
+the mechanism should not help, they do not help, and the measured reason
+(independent workers, no blocking dependency) is the same property that predicts
+where it *does* help.
+
+
+---
+
+# Part III: the 15-point evaluation plan
+
+The evaluation the paper needs, as 15 points, with a feasibility triage done
+2026-09-24 against the live kernel and a status line per point.
+
+**Guest capability summary.** 68 `ivh_*` sysctls are live and runtime-writable,
+so most parameter sweeps need no rebuild. `CONFIG_SCHEDSTATS=y` (flip
+`sched_schedstats` at runtime); `CONFIG_LOCK_STAT` is **off**; there is **no PMU**
+(`model 207, no PMU driver`), so nothing can measure cache misses in hardware;
+`/sys/devices/system/cpu/present` is `0-15`, so vCPU count cannot be raised from
+inside the guest. Global counters are readable from userspace without a rebuild
+via `/proc/kcore` + kallsyms (`ivh_tools/migcount.py` is the pattern).
+
+## 11.1 Feasibility triage
+
+**Tier A -- guest, no rebuild, no reboot**
+
+| # | point | knob / method | status |
+|---|---|---|---|
+| 2 | kill PV | `ivh_pv_tas`, `ivh_pv_allow`, `ivh_pv_tier{1,2}_enable`, `ivh_universal_eligible` | PV vs mig+AS done (10.4); **TAS arm not run** |
+| 7 | time-left 4 ms | `ivh_time_left_threshold_ns` | not started |
+| 8 | budget 8 | `ivh_max_concurrent` | not started |
+| 10 | AS is good | tier1/tier2/bypass sysctls; wait from `ivh_slowpath_wait_ns/_events` | not started |
+| 11 | publish / stale interval | `ivh_pv_beat_publish_mask`, `ivh_pv_beat_threshold` | not started |
+| 14 | weaknesses | non-lock workloads; `taskset`-pinned lock workloads | partial -- see 10.10 |
+| 15 | workload reliability | `ivh_tools/lockrate.sh` (ftrace profiler, no PMU needed) | **5 workloads done, 10.10** |
+
+**Point 11 correction:** the plan says "publish every 128 iterations" and "0.5 ms
+stale". The live kernel is `publish_mask=4095` (every **4096** iterations) and
+`beat_threshold=220000` cycles = **100 us** at 2.2 GHz, confirmed by the comment
+at `qspinlock_paravirt.h:718`. Sweep around where the code actually is.
+
+**Tier B -- guest, needs a kernel build + reboot.** Batch as ONE instrumentation
+kernel: exact point 4 (per-task eligibility counter), exact point 9 (in-kernel
+migration cost), point 15 total-acquisition counts (`CONFIG_LOCK_STAT`), the
+`ivh_idle_ns()` fix Part I section 6 needs, and rebuilding the `ivh_exec`
+artifact point 6 asks for.
+
+**Tier C -- needs the host.** Point 1 (PLE exit counts are host-side; the legacy
+comparison arm is a second VM); point 6 (contending exactly 4/8/16 vCPUs means
+pinning the co-tenant to chosen pCPUs); point 12 at 32 and 64 vCPU (VM resize --
+`present` is `0-15`, no hotplug); point 13 (co-running VMs).
+
+**Tier D -- neither.** Point 3, the cloud pv-spinlock survey: needs accounts and
+CLI credentials. The per-instance detector is a guest-side one-liner; the fleet
+launching is not this machine.
+
+**Point 12's 16-vCPU row is already satisfiable as specified** -- the plan calls
+for sysbench at 1/2 nproc, and 8-of-16 is exactly the standing host setup.
+
+**Point 5 is largely done** -- Part I. Contended steal 0.907 (-4.0pp) and active
+0.912 (-3.0pp), both inside the 10% bar. Two gaps against the plan's own
+criteria: light-vCPU steal reads 0.101, so "within 50 us on average for idle" is
+**not met** and is not reachable by tuning (the sampler costs 11-15 us/fire, so
+the achievable period floors near 120 us while the quanta to resolve are ~120 us);
+and active time is validated only jointly with steal, because guest idle
+accounting roughly doubles idle.
+
+## 11.2 Priorities
+
+Ordered by what most strengthens the paper, not by cost.
+
+1. **4-arm decomposition (PV / migration-only / AS-only / both)** on 3-4 strong
+   workloads. Points 2 and 10. This is the largest hole: 10.4 is migration+AS,
+   10.2 is migration alone, they share no workloads, and contribution #3
+   (adaptive spinning) therefore has no isolated number beyond +2.05% vs PV.
+   Tier A, one session.
+2. **Scaling, points 12 and 13.** Everything so far is 16 vCPUs, one VM, one
+   contention level. For a parallel-and-distributed venue this is close to
+   mandatory. Needs the host.
+3. **Points 7, 8, 11** -- the three parameter-sensitivity sweeps. Pure Tier A,
+   and they answer the "why these constants" objection that motivates Part I.
+4. **Point 1 (PLE)**, which is the cleanest statement of why CVMs need this work
+   at all: PLE is off in Intel TDX, so the standard hardware mitigation is simply
+   unavailable. Host-side.
+
+## 11.3 Standing risks
+
+- **Host contention is a hidden variable in every result.** Record the capacity
+  split with every run; the 2026-07 verdicts were inverted by it (10.0), and on a
+  quiet host migration *loses*. State the operating envelope rather than letting a
+  reviewer find it.
+- **Two self-inflicted measurement artifacts have been found in two days** (10.9,
+  10.5). Publish the controls, not just the results: 0 migrations in the PV arm,
+  alternating arm order, the sampler guard, arm read-back before every run.
+- **Do not pool across mechanisms or kernels.** 10.2 and 10.4 are not comparable.
