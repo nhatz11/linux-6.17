@@ -25,6 +25,7 @@
 #include <linux/debug_locks.h>
 #include <linux/export.h>
 #include <linux/sched.h>
+#include <linux/rcupdate.h>
 #include <linux/bpf_sched.h>
 
 /*
@@ -114,6 +115,34 @@ static __always_inline void ivh_pre_lock(raw_spinlock_t *lock)
 	if (!READ_ONCE(ivh_universal_eligible) || current->ivh_exclude)
 		return;
 	if (!in_task() || !preemptible() || current->lock_depth > 0)
+		return;
+	/*
+	 * G-LOCK-40: refuse to migrate from inside an RCU read-side critical
+	 * section.
+	 *
+	 * With CONFIG_PREEMPT_RCU=y, rcu_read_lock() does NOT raise
+	 * preempt_count, so preemptible() above is TRUE inside an RCU reader
+	 * -- and an enormous share of spin_lock() callers (dcache, lockref,
+	 * net, slab) hold one. bpf_sched_pre_lock_migrate() then does two
+	 * things that are illegal there:
+	 *
+	 *   1. alloc_cpumask_var(&saved_mask, GFP_KERNEL) (fair.c) -- a
+	 *      sleeping, reclaim-capable allocation;
+	 *   2. set_cpus_allowed_ptr() -> affine_move_task() ->
+	 *      wait_for_completion() -- a VOLUNTARY context switch. Preemption
+	 *      inside a preemptible-RCU reader is legal; blocking is not, and
+	 *      it extends the grace period by the whole migration latency.
+	 *
+	 * This build cannot warn about it: CONFIG_DEBUG_ATOMIC_SLEEP and
+	 * CONFIG_PROVE_LOCKING are both off, so might_sleep() degrades to
+	 * might_resched() and rcu_sleep_check() is a no-op. The symptom would
+	 * be RCU stalls under memory pressure, not a splat.
+	 *
+	 * rcu_preempt_depth() is 0 under !PREEMPT_RCU, so this costs nothing
+	 * on those configs. Skipping is always safe: IVH is best-effort and
+	 * retries on the task's next acquisition outside the reader.
+	 */
+	if (rcu_preempt_depth())
 		return;
 	/*
 	 * Only migrate a genuinely runnable task. A caller may already have
