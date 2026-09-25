@@ -227,6 +227,64 @@ unsigned long ivh_tks_carry_ticks = 8UL;
 unsigned long ivh_tks_idle_sub = 1UL;
 
 /*
+ * G-LOCK-39: a sampler clock for the tick-gap estimator.
+ *
+ * ivh_tick_steal_accumulate() infers steal from the gap between consecutive
+ * samples, and driven from the CONFIG_HZ=1000 tick it is a 1 kHz sampler.
+ * Measured host preemption on this box arrives at 457/s (cpu3) and 956/s
+ * (cpu15) -- at or past Nyquist for that sampler. Replaying ONE fixed 10 s
+ * recording while varying only the sampler's phase moves reported/true steal
+ * by 2.16x on cpu3 and 10.67x on cpu15 (0.34 - 3.67) with the underlying
+ * timeline byte-identical: the estimator aliases, and no (phase_pct,
+ * deadband) pair fixes an aliased signal. Tooling that established this,
+ * entirely in-guest and with no kernel change: ivh_tools/vcpu_trace.c records
+ * the gap timeline from a SCHED_FIFO busy-spin prober, ivh_tools/replay_tks.py
+ * reproduces this function's arithmetic over it (agrees with the live counter
+ * to within 8-10%).
+ *
+ * ivh_tks_sampler_ns -- 0 (default) = tick-driven, bit-identical to
+ *   G-LOCK-38. Non-zero = a per-CPU hrtimer at this period drives the
+ *   estimator and account_process_tick() stops calling it. Offline replay
+ *   against wall-clock truth at ivh_tks_phase_pct=0:
+ *       50us @ 5% duty   cpu3 1.069  cpu15 0.853   1000 irq/s/cpu
+ *       20us @ 5% duty   cpu3 1.103  cpu15 1.017   2500 irq/s/cpu
+ *   with the phase swing collapsing from 10.67x to <=1.05x.
+ * ivh_tks_duty_pct -- 100 (default) = sample continuously. Below 100, sample
+ *   for ivh_tks_on_ns and then idle for the complementary interval, scaling
+ *   booked steal by 100/duty. Steal is a rate and the on-windows are not
+ *   correlated with the host's preemption phase, so a duty-cycled sample is
+ *   unbiased; the price is variance, not bias.
+ * ivh_tks_on_ns -- length of one "on" burst while duty cycling. 0 disables
+ *   duty cycling regardless of ivh_tks_duty_pct.
+ *
+ * RUN THE SAMPLER WITH ivh_tks_phase_pct=0. The one-period bonus exists only
+ * to compensate for undersampling: it credits a whole period per DETECTED
+ * event, which is unbiased only while events are far rarer than samples. Once
+ * the sampler resolves the gap directly the bonus is pure inflation --
+ * measured 1.49 at phase_pct=100 against 0.94 at phase_pct=0, both at 20 kHz.
+ */
+unsigned long ivh_tks_sampler_ns = 0UL;
+unsigned long ivh_tks_duty_pct = 100UL;
+unsigned long ivh_tks_on_ns = 10000000UL;	/* 10 ms */
+
+/*
+ * G-LOCK-39 sampler state. Declared here rather than beside its callback
+ * because ivh_tick_steal_accumulate() reads the measured on/off split to
+ * scale its bookings.
+ */
+struct ivh_tks_sampler {
+	struct hrtimer	timer;
+	u64		on_start_c;	/* TSC at the start of this on-window */
+	u64		gap_start_c;	/* TSC at the start of this gap */
+	u64		on_c;		/* cumulative cycles actually sampled */
+	u64		off_c;		/* cumulative cycles skipped */
+	int		cpu;		/* home CPU: a migrated timer must not run */
+	bool		armed;
+	bool		sampling;	/* false = inside a duty-cycle gap */
+};
+static DEFINE_PER_CPU(struct ivh_tks_sampler, ivh_tks_sampler);
+
+/*
  * ivh_idle_ns - idle+iowait time for @cpu, NOHZ-aware with a kcpustat
  * fallback. Shared by ivh_tick_steal_accumulate() and ivh_uc_tick() below.
  */
@@ -258,7 +316,7 @@ void ivh_tick_steal_accumulate(void)
 {
 	struct rq *rq = this_rq();
 	int cpu = smp_processor_id();
-	u64 now, idle_ns, d_idle_c, avail_c, tick_c;
+	u64 now, idle_ns, d_idle_c, avail_c, tick_c, period_ns;
 	s64 excess_c, carry, floor_c;
 
 	if (unlikely(!tsc_khz)) {
@@ -267,7 +325,14 @@ void ivh_tick_steal_accumulate(void)
 	}
 
 	now = ivh_raw_tsc();
-	idle_ns = ivh_idle_ns(cpu);
+	/* G-LOCK-39: ivh_idle_ns() is a seqlock-protected NOHZ/kcpustat walk.
+	 * At the tick's 1 kHz it is free; at the sampler's 50 kHz it is not,
+	 * and at ivh_tks_idle_sub=0 -- the operating value, and the only one
+	 * the sampler is calibrated for -- its result is discarded below
+	 * anyway. Skip the read rather than pay for it. prev_idle_ns then
+	 * holds 0, so a later flip to idle_sub=1 sees one oversized d_idle_c,
+	 * which avail_c's own underflow guard absorbs in a single sample. */
+	idle_ns = READ_ONCE(ivh_tks_idle_sub) ? ivh_idle_ns(cpu) : 0;
 
 	if (unlikely(!rq->ivh_tks_prev_tsc)) {
 		rq->ivh_tks_skipped++;
@@ -277,7 +342,12 @@ void ivh_tick_steal_accumulate(void)
 	/* Sanity floor: a tick period under 1000 cycles implies a sub-1 MHz
 	 * TSC, which does not exist -- guards against a miscompiled
 	 * ns<->cycles conversion silently inverting the signal. */
-	tick_c = ivh_tsc_ns_to_cycles(TICK_NSEC);
+	/* The expected inter-sample distance: the sampler's period when it is
+	 * driving, the tick period otherwise. The excess, the phase bonus and
+	 * the carry floor are all relative to this, so it has to track
+	 * whichever clock is actually calling. */
+	period_ns = READ_ONCE(ivh_tks_sampler_ns);
+	tick_c = ivh_tsc_ns_to_cycles(period_ns ? period_ns : TICK_NSEC);
 	if (unlikely(tick_c < 1000)) {
 		rq->ivh_tks_skipped++;
 		goto seed;
@@ -301,7 +371,35 @@ void ivh_tick_steal_accumulate(void)
 
 	carry = rq->ivh_tks_carry_c + excess_c;
 	if (carry > 0) {
-		rq->ivh_tks_steal_ns += ivh_tsc_cycles_to_ns((u64)carry);
+		u64 booked = ivh_tsc_cycles_to_ns((u64)carry);
+
+		/* Duty cycling observes only part of wall time, so scale the
+		 * observation back up. Scale by the MEASURED on/off split, NOT
+		 * by the nominal ivh_tks_duty_pct -- the nominal figure lies in
+		 * two reachable ways. ivh_tks_on_ns=0 disables gapping entirely
+		 * while duty_pct stays set (off_c stays 0, the ratio is 1, and
+		 * nothing is scaled, which is what the knob documents). And an
+		 * on-window stretched by hrtimer overrun covers MORE wall time
+		 * than configured, so scaling by the nominal duty would inflate
+		 * the report in proportion to the very steal being measured --
+		 * the worst possible direction for this estimator.
+		 *
+		 * Q16 with a clamp rather than a plain multiply: on_c+off_c is
+		 * a cycle count that grows without bound, and booked*(on+off)
+		 * would overflow u64 within a day of uptime. */
+		if (period_ns) {
+			struct ivh_tks_sampler *s = this_cpu_ptr(&ivh_tks_sampler);
+			u64 on = s->on_c, off = s->off_c, ratio_q16;
+
+			if (on && off) {
+				ratio_q16 = ((on + off) << 16) / on;
+				if (ratio_q16 > (100ULL << 16))
+					ratio_q16 = 100ULL << 16;
+				booked = (booked * ratio_q16) >> 16;
+			}
+		}
+
+		rq->ivh_tks_steal_ns += booked;
 		carry = 0;
 	} else {
 		/* clamp_val() before the multiply, not after: a plain sysctl
@@ -319,6 +417,157 @@ seed:
 	rq->ivh_tks_prev_tsc     = now;
 	rq->ivh_tks_prev_idle_ns = idle_ns;
 }
+
+/*
+ * G-LOCK-39 sampler: drives ivh_tick_steal_accumulate() from a per-CPU
+ * hrtimer instead of the scheduler tick, so the estimator can sample above
+ * the host's preemption rate. Default-off -- see ivh_tks_sampler_ns above for
+ * the aliasing measurement that motivates it.
+ */
+static enum hrtimer_restart ivh_tks_sampler_fn(struct hrtimer *timer)
+{
+	struct ivh_tks_sampler *s = container_of(timer, struct ivh_tks_sampler,
+						 timer);
+	u64 period_ns = READ_ONCE(ivh_tks_sampler_ns);
+	unsigned long duty = READ_ONCE(ivh_tks_duty_pct);
+	u64 on_ns = READ_ONCE(ivh_tks_on_ns);
+	u64 now_c;
+
+	/* hrtimers_cpu_dying() -> migrate_hrtimer_list() moves every enqueued
+	 * timer to a surviving CPU, PINNED ones included -- there is no
+	 * exemption. A migrated copy would drive the wrong CPU's rq state
+	 * (two samplers stamping one prev_tsc cancels real steal to zero) and
+	 * would re-arm itself there forever. container_of() above gets the
+	 * OWNER's state rather than this_cpu's, so the mismatch is detectable;
+	 * refuse to run away from home and let the online hook re-arm us. */
+	if (unlikely(s->cpu != smp_processor_id()))
+		return HRTIMER_NORESTART;
+
+	if (unlikely(!period_ns || !s->armed))
+		return HRTIMER_NORESTART;
+
+	now_c = ivh_raw_tsc();
+
+	if (s->sampling) {
+		ivh_tick_steal_accumulate();
+
+		/* Measured elapsed, not a count of nominal periods:
+		 * hrtimer_forward_now() skips missed deadlines, so under heavy
+		 * preemption one callback can cover several periods and a
+		 * nominal count would understate how much wall time this
+		 * window actually spans.
+		 *
+		 * duty >= 1 is enforced by ivh_proc_tks_duty(), but the divide
+		 * below is unconditional and a zero would be fatal, so the
+		 * guard is repeated rather than assumed. */
+		if (duty >= 1 && duty < 100 && on_ns &&
+		    now_c - s->on_start_c >= ivh_tsc_ns_to_cycles(on_ns)) {
+			u64 off_ns = div64_u64(on_ns * (100 - duty), duty);
+
+			s->on_c += now_c - s->on_start_c;
+			s->gap_start_c = now_c;
+			s->sampling = false;
+			/* prev_tsc must go: the gap is our own absence, not the
+			 * host's, and carrying the stamp across it would book
+			 * the whole off-interval as steal on the far side.
+			 * carry must NOT go: it is signed debt whose job is to
+			 * cancel over-booked jitter, so zeroing it at every
+			 * window edge is a one-way upward bias -- and at a 20us
+			 * period the debt ceiling is already 50x smaller than
+			 * it was at tick rate. */
+			this_rq()->ivh_tks_prev_tsc = 0;
+			if (off_ns < period_ns)		/* never gap shorter than one period */
+				off_ns = period_ns;
+			hrtimer_forward_now(timer, ns_to_ktime(off_ns));
+			return HRTIMER_RESTART;
+		}
+	} else {
+		/* Leaving the gap: this pass only re-seeds, it books nothing. */
+		s->off_c += now_c - s->gap_start_c;
+		s->on_start_c = now_c;
+		s->sampling = true;
+		this_rq()->ivh_tks_prev_tsc = 0;
+		/* Keep the span counters bounded so the Q16 ratio above cannot
+		 * overflow. Halving both preserves the ratio exactly and makes
+		 * it recency-weighted, which is what we want if duty is
+		 * retuned at runtime. 2^40 cycles is ~500 s of sampled time. */
+		if (s->on_c > (1ULL << 40)) {
+			s->on_c >>= 1;
+			s->off_c >>= 1;
+		}
+	}
+
+	hrtimer_forward_now(timer, ns_to_ktime(period_ns));
+	return HRTIMER_RESTART;
+}
+
+static void ivh_tks_sampler_apply_cpu(void *unused)
+{
+	struct ivh_tks_sampler *s = this_cpu_ptr(&ivh_tks_sampler);
+	u64 period_ns = READ_ONCE(ivh_tks_sampler_ns);
+
+	/* Always quiesce first: a period change is a stop followed by a start,
+	 * and s->armed is what stops an in-flight callback from re-arming
+	 * itself underneath us. */
+	s->armed = false;
+	hrtimer_try_to_cancel(&s->timer);
+
+	/* Whoever drives next must re-seed rather than measure the handover
+	 * as a gap. */
+	this_rq()->ivh_tks_prev_tsc = 0;
+	this_rq()->ivh_tks_carry_c = 0;
+
+	if (!period_ns)
+		return;
+
+	s->cpu = smp_processor_id();
+	s->armed = true;
+	s->sampling = true;
+	s->on_start_c = ivh_raw_tsc();
+	s->on_c = 0;
+	s->off_c = 0;
+	hrtimer_start(&s->timer, ns_to_ktime(period_ns),
+		      HRTIMER_MODE_REL_PINNED_HARD);
+}
+
+/*
+ * A CPU that comes online after the sysctl write would otherwise never sample:
+ * account_process_tick() is gated off globally, and nothing would arm this
+ * CPU's timer -- its ivh_tks_samples would simply stop advancing, silently.
+ * Runs on the incoming CPU, which is what apply_cpu() requires.
+ */
+static int ivh_tks_sampler_online(unsigned int cpu)
+{
+	if (READ_ONCE(ivh_tks_sampler_ns))
+		ivh_tks_sampler_apply_cpu(NULL);
+	return 0;
+}
+
+/*
+ * Called from ivh_proc_tks_sampler() (kernel/sched/bpf_sched.c) once the new
+ * period is visible. on_each_cpu() rather than a bare loop because each timer
+ * is PINNED: it can only be started or cancelled from its own CPU.
+ */
+void ivh_tks_sampler_reconfigure(void)
+{
+	on_each_cpu(ivh_tks_sampler_apply_cpu, NULL, 1);
+}
+
+static int __init ivh_tks_sampler_init(void)
+{
+	int cpu;
+
+	for_each_possible_cpu(cpu) {
+		per_cpu(ivh_tks_sampler, cpu).cpu = cpu;
+		hrtimer_setup(&per_cpu(ivh_tks_sampler, cpu).timer,
+			      ivh_tks_sampler_fn, CLOCK_MONOTONIC,
+			      HRTIMER_MODE_REL_PINNED_HARD);
+	}
+	cpuhp_setup_state_nocalls(CPUHP_AP_ONLINE_DYN, "sched/ivh_tks:online",
+				  ivh_tks_sampler_online, NULL);
+	return 0;
+}
+late_initcall(ivh_tks_sampler_init);
 
 /*
  * ivh_uc_steal_ns - the steal number ivh_uc_tick() folds into "used"

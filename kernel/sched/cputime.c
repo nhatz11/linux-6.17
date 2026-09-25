@@ -545,7 +545,12 @@ void account_process_tick(struct task_struct *p, int user_tick)
 	 */
 	this_rq()->clock_preempt = sched_clock();
 	ivh_tsc_beat_publish();
-	ivh_tick_steal_accumulate();
+	/* G-LOCK-39: when the hrtimer sampler is driving, it calls this at
+	 * its own period and the tick must NOT also call it -- the two
+	 * callers share one prev_tsc/carry state, so each would read the
+	 * other's interval as a gap. */
+	if (!READ_ONCE(ivh_tks_sampler_ns))
+		ivh_tick_steal_accumulate();
 	/*
 	 * G-LOCK-23: same placement discipline as its neighbours -- every
 	 * tick, every CPU, before the early return below, because a skipped

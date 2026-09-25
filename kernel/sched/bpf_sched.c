@@ -74,6 +74,108 @@ unsigned long ivh_migrate_mechanism = 0UL;
  */
 unsigned long ivh_cap_source = 0UL;
 
+/*
+ * G-LOCK-39 sampler knobs. ivh_tks_sampler_ns needs a validating handler for
+ * two reasons: the period sets a per-CPU hrtimer rate, so an accidental
+ * sub-microsecond value would be a self-inflicted interrupt storm; and the
+ * per-CPU timers have to be re-armed when it changes, which a plain
+ * proc_doulongvec_minmax() would never do.
+ */
+static int ivh_proc_tks_sampler(const struct ctl_table *table, int write,
+				void *buffer, size_t *lenp, loff_t *ppos)
+{
+	unsigned long val = READ_ONCE(ivh_tks_sampler_ns);
+	struct ctl_table tmp = *table;
+	int ret;
+
+	tmp.data = &val;
+	ret = proc_doulongvec_minmax(&tmp, write, buffer, lenp, ppos);
+	if (ret || !write)
+		return ret;
+
+	if (val && (val < 20000 || val > 10000000)) {
+		pr_err("IVH: refusing ivh_tks_sampler_ns=%lu: accepts 0 "
+		       "(tick-driven, the default) or 20000..10000000 ns. "
+		       "Below 20us the per-CPU hrtimer rate stops being "
+		       "affordable. Validated operating point: 20000 with "
+		       "ivh_tks_duty_pct=5 and ivh_tks_phase_pct=0\n", val);
+		return -EINVAL;
+	}
+
+	/* The one-period bonus (ivh_tks_phase_pct) is an UNDERSAMPLING
+	 * correction: it credits a whole period per detected event, which is
+	 * unbiased only while events are far rarer than samples. With the
+	 * sampler driving it is pure inflation -- 1.49 against 0.94 at 20 kHz
+	 * -- and worse than that ratio suggests, because at a 20 us period
+	 * ordinary interrupt-entry jitter clears the 1 us deadband routinely
+	 * and each spurious hit books a whole period. goto_mode.sh sets
+	 * phase_pct=100 after every reboot, so without this check the machine's
+	 * default state is exactly the inflating one. Refuse rather than
+	 * silently rewrite the operator's other knob. */
+	if (val && READ_ONCE(ivh_tks_phase_pct)) {
+		pr_err("IVH: refusing ivh_tks_sampler_ns=%lu while "
+		       "ivh_tks_phase_pct=%lu: the phase bonus corrects for "
+		       "undersampling and inflates a properly-sampled signal. "
+		       "Write ivh_tks_phase_pct=0 first\n",
+		       val, READ_ONCE(ivh_tks_phase_pct));
+		return -EINVAL;
+	}
+
+	WRITE_ONCE(ivh_tks_sampler_ns, val);
+	ivh_tks_sampler_reconfigure();
+	return 0;
+}
+
+/*
+ * F7: ivh_tks_on_ns feeds both a multiply and a timer interval. Unbounded,
+ * on_ns * (100 - duty) overflows u64 above ~1.9e17 and wraps to an off_ns of
+ * years -- the sampler would stop on that CPU while account_process_tick()
+ * stays gated off, freezing steal accounting silently.
+ */
+static int ivh_proc_tks_on_ns(const struct ctl_table *table, int write,
+			      void *buffer, size_t *lenp, loff_t *ppos)
+{
+	unsigned long val = READ_ONCE(ivh_tks_on_ns);
+	struct ctl_table tmp = *table;
+	int ret;
+
+	tmp.data = &val;
+	ret = proc_doulongvec_minmax(&tmp, write, buffer, lenp, ppos);
+	if (ret || !write)
+		return ret;
+
+	if (val && (val < 100000 || val > 1000000000)) {
+		pr_err("IVH: refusing ivh_tks_on_ns=%lu: 0 (no duty cycling) "
+		       "or 100000..1000000000 ns\n", val);
+		return -EINVAL;
+	}
+
+	WRITE_ONCE(ivh_tks_on_ns, val);
+	return 0;
+}
+
+static int ivh_proc_tks_duty(const struct ctl_table *table, int write,
+			     void *buffer, size_t *lenp, loff_t *ppos)
+{
+	unsigned long val = READ_ONCE(ivh_tks_duty_pct);
+	struct ctl_table tmp = *table;
+	int ret;
+
+	tmp.data = &val;
+	ret = proc_doulongvec_minmax(&tmp, write, buffer, lenp, ppos);
+	if (ret || !write)
+		return ret;
+
+	/* 0 would divide by zero when computing the off-interval. */
+	if (val < 1 || val > 100) {
+		pr_err("IVH: refusing ivh_tks_duty_pct=%lu: 1..100\n", val);
+		return -EINVAL;
+	}
+
+	WRITE_ONCE(ivh_tks_duty_pct, val);
+	return 0;
+}
+
 static int ivh_proc_cap_source(const struct ctl_table *table, int write,
 			       void *buffer, size_t *lenp, loff_t *ppos)
 {
@@ -357,6 +459,27 @@ static const struct ctl_table ivh_sysctls[] = {
 		.maxlen		= sizeof(unsigned long),
 		.mode		= 0644,
 		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_tks_sampler_ns",
+		.data		= &ivh_tks_sampler_ns,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= ivh_proc_tks_sampler,
+	},
+	{
+		.procname	= "ivh_tks_duty_pct",
+		.data		= &ivh_tks_duty_pct,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= ivh_proc_tks_duty,
+	},
+	{
+		.procname	= "ivh_tks_on_ns",
+		.data		= &ivh_tks_on_ns,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= ivh_proc_tks_on_ns,
 	},
 	{
 		.procname	= "ivh_tks_idle_sub",

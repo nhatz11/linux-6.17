@@ -148,6 +148,10 @@ extern unsigned long ivh_tks_deadband_ns;	/* kernel/sched/core.c */
 extern unsigned long ivh_tks_phase_pct;	/* kernel/sched/core.c */
 extern unsigned long ivh_tks_carry_ticks;	/* kernel/sched/core.c */
 extern unsigned long ivh_tks_idle_sub;		/* kernel/sched/core.c */
+extern unsigned long ivh_tks_sampler_ns;	/* kernel/sched/core.c */
+extern unsigned long ivh_tks_duty_pct;		/* kernel/sched/core.c */
+extern unsigned long ivh_tks_on_ns;		/* kernel/sched/core.c */
+extern void ivh_tks_sampler_reconfigure(void);	/* kernel/sched/core.c */
 extern void ivh_tick_steal_accumulate(void);	/* kernel/sched/core.c */
 extern int  is_cpu_preempted(int cpunum);	/* kernel/sched/cputime.c */
 
