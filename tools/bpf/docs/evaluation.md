@@ -10,6 +10,9 @@ Two halves, measured 2026-09-22/23 and validated against host-side ground truth:
   what conditions?
 - **Part III (section 11)** -- the 15-point evaluation plan for the paper, with
   a feasibility triage and current status per point.
+- **Part IV (section 12)** -- preemption DETECTION validated per-event against
+  host `perf sched`. Part I validates steal/active TIME; Part IV validates the
+  EVENT claim. They are different quantities and must not be conflated.
 
 **2026-09-25: Part II section 10.2 was re-measured and REPLACED.** The original
 numbers were taken with the G-LOCK-39 hrtimer sampler live, which costs the arm
@@ -398,6 +401,25 @@ cleanly, and on linux-6.14 (not 6.6) the build takes ~30s anyway.
 
 ### 10.1 Method
 
+> **PROVENANCE (2026-09-25): every result in Part II was measured with Gate 2
+> structurally dead.** IVH's migration decision has two gates: Gate 1 capacity
+> and Gate 2 "time left before preemption". Gate 2 reads `rq->last_active_time`,
+> which is written only inside `if (static_key_false(&paravirt_steal_enabled))`
+> in `kernel/sched/cputime.c`. This TDX host has **no `KVM_FEATURE_STEAL_TIME`**,
+> so that static key is false, the field stays 0, and the gate's
+> `return last_active != 0 && ...` is always false -- it never rejects. Measured
+> directly: `ivh_steal_imminent_time_left_reject` = **0/s** against
+> `ivh_steal_imminent_capacity_reject` = 44 414/s under hackbench.
+>
+> The working alternative is `ivh_preempt_event_source=2`, which selects a TSC
+> jump-detection path (`ivh_vact_tick()`, `kernel/sched/core.c`) needing no
+> paravirt support. **No harness in this project ever set it** -- not
+> `goto_mode.sh`, not `run_campaign.sh`, not any script in `ivh_tools/`.
+>
+> So every migration in every result below was decided by **capacity alone**,
+> and `ivh_time_left_threshold_ns=4000000` had no effect on anything measured.
+> Do not describe these results as validating a two-gate design.
+
 Host during these runs: `mars`, **three 16-vCPU guests on one box** (48 vCPUs),
 host-measured steal 43-63% on the contended vCPUs. Contention shape 0-7 heavy,
 8-15 light -- a host topology boundary, not guest pinning.
@@ -785,3 +807,138 @@ Ordered by what most strengthens the paper, not by cost.
   10.5). Publish the controls, not just the results: 0 migrations in the PV arm,
   alternating arm order, the sampler guard, arm read-back before every run.
 - **Do not pool across mechanisms or kernels.** 10.2 and 10.4 are not comparable.
+
+---
+
+# Part IV: preemption DETECTION, validated per-event against the host
+
+Part I validated steal and active **time** (totals). This validates the
+**event** claim: when the guest says a vCPU was preempted, was it?
+
+## 12. Test 1 -- per-vCPU TSC jump detection
+
+**Result, one sentence:** on an Intel TDX guest with neither PLE nor
+paravirtual steal time available, vCPU preemption is detected from TSC
+discontinuities at **106% recall above 1.5 ms, 101% above 500 us, 97% above
+50 us, and 74% across all host deschedules**, with **0.028 false detections/s**
+on busy-but-unpreempted vCPUs.
+
+### 12.1 What is being tested
+
+`ivh_vact_tick()` (`kernel/sched/core.c`) records a preemption when the gap
+between two consecutive calls exceeds `ivh_vact_jump_ns` (1.5 ms default),
+counting into per-rq `ivh_vact_jumps`; gaps attributable to the vCPU having
+idled go to `ivh_vact_idle_explained` instead, discriminated via
+`rq->ivh_vact_idle_exit_tsc` (written in `account_idle_time()`,
+`kernel/sched/cputime.c:247`).
+
+This is a DIFFERENT quantity from Part I's steal time and must not be conflated
+with it:
+
+| path | produces | consumed by |
+|---|---|---|
+| `ivh_tick_steal_accumulate()` | `ivh_tks_steal_ns` -- **time** | capacity EMA -> Gate 1 -> migration |
+| `ivh_vact_tick()` | `ivh_vact_jumps` -- **events** | `last_active` -> Gate 2 |
+
+`ivh_uc_steal_ns()` (`core.c:578-587`) reads `ivh_tks_steal_ns`, never the
+jump counter. **The migration engine never consumes an event count.**
+
+### 12.2 Method -- three independent witnesses, one window
+
+The measurement is only clean because of one trick: **pin a SCHED_FIFO
+busy-spinner to the vCPU under test.** That drives guest idle to exactly zero,
+so every off-CPU interval MUST be a host deschedule. There is no
+"was it idle or preempted?" ambiguity left to argue about, and the host
+confirms it (`idle = -0.00%`).
+
+1. **Host truth, per event.** `perf sched record` on the host, then
+   `perf sched timehist` filtered to the vCPU thread. The `wait time` column
+   is that event's off-CPU duration. This gives the full DISTRIBUTION, which
+   `/proc/<tid>/schedstat` cannot -- schedstat gives only a count and a total.
+2. **In-guest oracle.** `ivh_tools/vcpu_trace.c`: SCHED_FIFO, `rdtscp` in a
+   tight loop, records every gap at ~20 ns resolution.
+3. **The detector under test.** `rq->ivh_vact_jumps` and
+   `ivh_vact_idle_explained`, read from `/proc/kcore` via
+   `ivh_tools/read_vact_rq.py` (per-CPU offsets 3984 and 3992).
+
+### 12.3 Reproduction
+
+**Host, get the vCPU thread id** (`comm` is `CPU <n>/KVM`; the first is vcpu0):
+
+    PID=<qemu-pid>
+    ps -L -o tid=,comm= -p $PID | awk '$2 ~ /^CPU/ {print $1, $2}' | head -4
+
+**Guest, start the spinner + counter capture** (`ivh_tools/disc2.sh`):
+
+    echo 2 > /proc/sys/kernel/ivh_preempt_event_source   # TSC path; the
+        # paravirt path is DEAD here, see 10.1 -- no KVM_FEATURE_STEAL_TIME
+    ./disc2.sh          # reads ivh_vact_jumps/idle_explained around a
+                        # 90 s vcpu_trace run pinned to cpu0
+
+**Host, capture per-event durations inside that window:**
+
+    sudo perf sched record -o /tmp/v0.data -- sleep 45
+    sudo perf sched timehist -i /tmp/v0.data | grep "<tid>/<pid>" > /tmp/v0.txt
+    awk '{print $(NF-2)}' /tmp/v0.txt      # wait time, msec, one per event
+
+~400 MB for 45 s on a 72-core host; delete `v0.data` afterwards.
+
+**Score:** detector rate against the host count above each duration cutoff.
+
+### 12.4 Measured, 2026-09-26, cpu0, G-LOCK-40, sampler off
+
+Host, `perf sched`, 45 s, tid 1807162: **104.4 events/s**, median **2997 us**,
+mean 2655 us, off-CPU **27.74%** of wall, guest idle **-0.00%**.
+Detector, same window: **77.4 jumps/s**, `idle_explained` **0**.
+
+| host population | rate | detector recall |
+|---|---|---|
+| deschedules > 1.5 ms | 73.2/s | **105.7%** |
+| deschedules > 1 ms | 73.4/s | 105.4% |
+| deschedules > 500 us | 76.8/s | **100.8%** |
+| deschedules > 50 us | 79.9/s | **96.9%** |
+| ALL deschedules | 104.4/s | **74.1%** |
+
+**Specificity.** On vCPUs 8-15 -- **70.9% active** (busy, not idle) with
+**0.131%** host steal -- the detector produced **0.028 jumps/s**. A busy CPU
+that is not being preempted yields essentially no false detections. This is a
+real negative control: it is not idle, so it is not excluded by the
+idle-discriminator path.
+
+**What it misses.** 24.5 deschedules/s below 50 us -- 23% of events, but at
+~11 us each under **0.1% of wall time**. That is why steal-time accuracy is
+0.907 (Part I) while event recall is 74%.
+
+### 12.5 The in-guest oracle is validated, which matters for future work
+
+`vcpu_trace` was scored against the host's own distribution:
+
+| population | vcpu_trace | host perf sched | agreement |
+|---|---|---|---|
+| > 50 us | 79.7/s | 79.9/s | **99.7%** |
+| > 1.5 ms | 71.9/s | 73.2/s | **98.2%** |
+| < 50 us | 24.2/s (by difference) | 24.5/s | 98.8% |
+
+So **preemption can be characterised from inside the guest to within ~2% on
+event counts**, with no host access. Caveat: `vcpu_trace` over-measures
+DURATION (its > 1.5 ms events mean 4353 us against the host's ~3500 us) and
+its total gap time reads 33.03% against the host's 27.74%, because the
+busy-spin loop also catches guest-side interrupts and TDX `#VE` exits. Use it
+for counts, not for absolute steal.
+
+### 12.6 Retractions from this test
+
+- **"The detector only achieves 8% recall" is WRONG** and was a denominator
+  error: it scored 96.5 jumps/s against 1272 host deschedules/s in a *dbench*
+  window, where mean off-CPU was 290 us -- i.e. against a population dominated
+  by events an order of magnitude below the detector's threshold. Scored
+  against the population the detector targets, recall is 97-106%.
+- **A proposed "G-LOCK-41" patch driving `ivh_vact_tick()` from the 200 us
+  sampler was written, reviewed, and REVERTED unbuilt.** Review established it
+  is a strict regression: at a 200 us period with the threshold still at
+  1.5 ms, `P(detect) = clamp((P + D - T)/P, 0, 1)` goes to **zero** for the
+  500-1300 us band that the 1 kHz clock detects at 40-80%. The fix is also
+  unreachable from userspace -- `ivh_vact_jump_ns_min = TICK_NSEC`
+  (`kernel/sched/bpf_sched.c:266`) rejects anything below 1 ms, verified live.
+  Had the measurement been done correctly first, the patch would never have
+  been written.
