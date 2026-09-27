@@ -976,6 +976,8 @@ static __always_inline int ivh_cs_bucket(u64 v)
 static __always_inline void ivh_cs_ep_close(u64 *ep_acq, u64 ep_start, u64 now,
 					    int why)
 {
+	/* G-LOCK-46: ivh_lock_holder.c duplicates _Q_SLOW_VAL; catch drift. */
+	BUILD_BUG_ON(IVH_Q_SLOW_VAL != _Q_SLOW_VAL);
 	u64 d;
 
 	if (!*ep_acq)

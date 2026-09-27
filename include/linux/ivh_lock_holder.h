@@ -190,6 +190,16 @@ extern unsigned long ivh_cs_owner_enable;
 extern unsigned long ivh_cs_owner_clear;
 
 void __ivh_cs_owner_stamp(struct qspinlock *lock);
+/*
+ * G-LOCK-46: _Q_SLOW_VAL, duplicated because kernel/locking/qspinlock_paravirt.h
+ * is not includable from arch/x86/kernel/ivh_lock_holder.c. The head sets it
+ * (pv_hash() then xchg(&lock->locked, _Q_SLOW_VAL)) immediately before it
+ * halts, so at the release hook -- which runs STRICTLY BEFORE the releasing
+ * store, see ivh_cs_owner_release() below -- it means "my head is halted".
+ * qspinlock_paravirt.h carries a BUILD_BUG_ON against this value.
+ */
+#define IVH_Q_SLOW_VAL	3U
+
 void __ivh_cs_owner_clear(struct qspinlock *lock);
 
 static __always_inline void ivh_cs_owner_stamp(struct qspinlock *lock)

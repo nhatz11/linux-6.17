@@ -1788,6 +1788,29 @@ DEFINE_PER_CPU(u64, ivh_cs_prev_hold_hist[IVH_BEAT_AGE_HIST_BUCKETS]);
  * has a very different fix from one that is uniformly leaky.
  */
 DEFINE_PER_CPU(u64, ivh_cs_hold_by_flag[2][IVH_BEAT_AGE_HIST_BUCKETS]);
+/*
+ * G-LOCK-46: the self-check the mechanism is actually claiming.
+ *
+ *   [1][b] = holds of duration-bucket b released while the HEAD WAS HALTED
+ *   [0][b] = holds of bucket b released with the head still spinning
+ *
+ * so for the long buckets (>= ~0.5 ms, which the dose-response test showed
+ * are host preemptions, 75.8 ppm loaded vs 0.3 ppm idle):
+ *
+ *   "the holder ran long, and by the time it released, its head had stopped
+ *    burning CPU on it"  =  [1][b] / ([0][b] + [1][b])
+ *
+ * Both rows are read at ONE site, on the holder's own CPU, from the lock word
+ * it already owns -- no cross-CPU deposit and therefore none of the
+ * attribution loss that made ivh_cs_hold_by_flag credit only 33 of 104 fires.
+ *
+ * CAVEAT: _Q_SLOW_VAL says the head is halted, not WHY. A head that simply
+ * exhausted ivh_pv_spin_threshold sets it too. Split the credit using the
+ * global ivh_head_halt_events[IVH_CS_HALT_CS] vs [IVH_CS_HALT_EXHAUST]; do
+ * not attribute an exhaustion halt to the detector.
+ */
+DEFINE_PER_CPU(u64, ivh_cs_react[2][IVH_BEAT_AGE_HIST_BUCKETS]);
+unsigned long ivh_cs_react_hist __read_mostly = 0UL;
 /* 0 = off, and then the block costs one read-mostly load. */
 unsigned long ivh_cs_recall_hist __read_mostly = 0UL;
 DEFINE_PER_CPU(u64, ivh_cs_abstain_tenure);
@@ -2542,6 +2565,13 @@ static const struct ctl_table ivh_pv_sysctls[] = {
 		.maxlen		= sizeof(unsigned long),
 		.mode		= 0644,
 		.proc_handler	= ivh_pv_proc_tier1_confirm,
+	},
+	{
+		.procname	= "ivh_cs_react_hist",
+		.data		= &ivh_cs_react_hist,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
 	},
 	{
 		.procname	= "ivh_cs_recall_hist",

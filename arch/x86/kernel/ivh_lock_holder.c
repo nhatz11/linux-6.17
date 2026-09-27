@@ -252,6 +252,25 @@ void __ivh_cs_owner_clear(struct qspinlock *lock)
 
 			this_cpu_inc(ivh_cs_hold_by_flag[fdep == tsc][hb]);
 		}
+
+		/*
+		 * G-LOCK-46: did our head stop spinning on us?
+		 *
+		 * This hook runs STRICTLY BEFORE the releasing store (see
+		 * ivh_cs_owner_release()), so lock->locked still carries the
+		 * value the head left: _Q_SLOW_VAL means it ran pv_hash() and
+		 * halted. One read of a line this CPU already owns, no remote
+		 * access, and no deposit to lose.
+		 *
+		 * Says halted, not why -- an exhaustion halt sets it too. Use
+		 * ivh_head_halt_events[IVH_CS_HALT_CS] vs [_EXHAUST] to split
+		 * the credit.
+		 */
+		if (unlikely(READ_ONCE(ivh_cs_react_hist))) {
+			int halted = READ_ONCE(lock->locked) == IVH_Q_SLOW_VAL;
+
+			this_cpu_inc(ivh_cs_react[halted][hb]);
+		}
 		/* G-LOCK-31: written after the NULL store, so a reader that sees
 		 * the tag still naming a lock never pairs it with this value. */
 		this_cpu_write(ivh_cs_owner.last_cs, (u64)held);
