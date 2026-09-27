@@ -52,6 +52,20 @@ set_ivh_sysctl ivh_capacity_threshold 1010
 set_ivh_sysctl ivh_time_left_threshold_ns 4000000
 set_ivh_sysctl ivh_max_concurrent 8
 set_ivh_sysctl ivh_time_left_source 1
+
+# 2026-09-27: MISSING FROM THIS SCRIPT UNTIL NOW, and it silently kills
+# migration on TDX. Gate 2 (ivh_gate_time_left_reject, fair.c:13815) picks its
+# timing signal with  tsc_pe = (ivh_preempt_event_source == 2):
+#     tsc_pe -> rq->ivh_vact_last_active_c      (TSC, written by ivh_vact_tick)
+#     else   -> rq->last_active_time            (paravirt)
+# last_active_time is only ever written inside
+# cputime.c's  if (static_key_false(&paravirt_steal_enabled))  block, and TDX
+# has no KVM_FEATURE_STEAL_TIME, so that key is never enabled and the field
+# stays 0. At source=0 Gate 2 therefore reads zero forever ->
+# ivh_steal_imminent_time_left_reject = 0/s and NO MIGRATIONS EVER FIRE.
+# Arming it took that counter 0 -> 2857 in one hackbench run.
+# IVH_start.sh has always set this; goto_mode.sh did not.
+set_ivh_sysctl ivh_preempt_event_source 2
 set_ivh_sysctl ivh_selection_trylock 1
 set_ivh_sysctl ivh_migrate_mechanism 0
 set_ivh_sysctl ivh_steal_source 2
