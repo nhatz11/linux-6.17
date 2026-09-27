@@ -2480,8 +2480,16 @@ static __always_inline bool pv_evict_can_skip(struct mcs_spinlock *succ)
 	 * successor's OWN pv_node line instead of its CPU's per-cpu heartbeat
 	 * line. Same threshold, same meaning, no cross-CPU cacheline read.
 	 */
+	/*
+	 * G-LOCK-47: split BY SIGNAL, not by feature. These two arms read
+	 * different clocks with floors 30-60x apart -- the per-node stamp
+	 * (~47-110us, refreshed every publish_mask+1 spin iterations) and the
+	 * per-cpu heartbeat (~3ms p99, tick-bound). Feeding the node arm's
+	 * threshold to the beat arm is precisely the 100us misfire this series
+	 * exists to fix, so each arm keeps its own knob.
+	 */
 	if (READ_ONCE(ivh_pv_evict_node_stamp)) {
-		if (ivh_node_stale(pn, now, READ_ONCE(ivh_pv_beat_threshold)))
+		if (ivh_node_stale(pn, now, READ_ONCE(ivh_pv_evict_threshold)))
 			return false;		/* candidate: do the real walk */
 	} else if ((s64)(now - READ_ONCE(per_cpu(ivh_tsc_beat, pn->cpu).stamp)) >
 		   (s64)READ_ONCE(ivh_pv_beat_threshold)) {
@@ -2592,9 +2600,18 @@ static __always_inline int ivh_evict_classify(struct mcs_spinlock *n,
 
 		if (READ_ONCE(cpn->state) != VCPU_RUNNING)
 			return IVH_ROT_HALTED;
-		return ivh_node_stale(cpn, now, thr) ? IVH_ROT_PREEMPTED
-						     : IVH_ROT_LIVE;
+		/*
+		 * G-LOCK-47: the node-stamp arm uses eviction's own knob. The
+		 * caller's @thr is the per-cpu-beat threshold and is NOT
+		 * interchangeable -- the two clocks' noise floors differ by
+		 * 30-60x. Selected here rather than threaded in, so a future
+		 * caller cannot pass the wrong one.
+		 */
+		return ivh_node_stale(cpn, now,
+				      READ_ONCE(ivh_pv_evict_threshold))
+			? IVH_ROT_PREEMPTED : IVH_ROT_LIVE;
 	}
+	/* per-cpu beat path: @thr (ivh_pv_beat_threshold) is correct here. */
 	return ivh_rot_class(n, src, thr, now);
 }
 

@@ -1489,11 +1489,42 @@ u64 ivh_beat_preempt_stamp ____cacheline_aligned = 0;
  * late_initcall so the knob survives a different host.
  */
 unsigned long ivh_pv_beat_threshold __read_mostly = 3300000UL;
+/*
+ * G-LOCK-47. Applies ONLY where eviction reads the per-NODE stamp. The
+ * per-cpu-beat arms of the same walk keep ivh_pv_beat_threshold -- the split
+ * is by SIGNAL, not by feature, because pv_evict_can_skip() forks on
+ * ivh_pv_evict_node_stamp and feeding this value to the beat arm would
+ * reproduce exactly the 100us misfire this whole series was fixing.
+ */
+unsigned long ivh_pv_evict_threshold __read_mostly = 1100000UL;	/* 500us @2.2GHz */
+/* thr >> 8 in ivh_node_stale(): anything under 256 truncates to 0 = fire
+ * always. Floor it far above that; ceiling is one tick. */
+static unsigned long ivh_evict_thr_min = 22000UL;	/* 10 us */
+static unsigned long ivh_evict_thr_max = 22000000UL;	/* 10 ms */
 /* G-LOCK-44: was 1500. A LIVE vCPU's beat has a ~3 ms noise floor here
  * (its only guaranteed publisher is account_process_tick() at HZ=1000), so
  * 1500 sat inside the all-false zone: 178576 tier-2 fires per 13 s run with a
  * mean consequent halt of 14.2 us against ~250 us real preemptions. */
 #define IVH_BEAT_THRESHOLD_US	5000ULL
+
+/*
+ * G-LOCK-47: eviction's OWN staleness threshold.
+ *
+ * ivh_pv_beat_threshold governs the PER-CPU heartbeat, whose only guaranteed
+ * publisher is account_process_tick() at HZ=1000. Measured on this host
+ * (400 samples, idle, all 16 vCPUs): max staleness p50=251us, p99=3243us.
+ * 5000us sits just above that ceiling, which is why B needs it HIGH.
+ *
+ * Eviction reads a different signal: the PER-NODE stamp in head_ctl,
+ * refreshed by ivh_node_publish_in_spin() every ivh_pv_beat_publish_mask+1
+ * spin iterations (4096 today, ~47-110us of real loop body). Its floor is
+ * 30-60x lower, so it needs the threshold LOW or it never fires at all --
+ * measured 1001 evictions/run at 500us and exactly 0 at 5ms.
+ *
+ * One knob cannot satisfy both. 500us gives eviction 5-8x margin over its
+ * own floor; for comparison the beat has only 5000/3243 = 1.5x over its.
+ */
+#define IVH_EVICT_THRESHOLD_US	500ULL
 unsigned long ivh_pv_beat_publish_mask = 0xfffUL;
 
 /*
@@ -1907,6 +1938,18 @@ static void ivh_irqoff_attr_record(unsigned long ret_ip)
 DEFINE_PER_CPU_ALIGNED(struct ivh_lock_halt, ivh_lock_halt);
 EXPORT_PER_CPU_SYMBOL_GPL(ivh_lock_halt);
 
+static int __init ivh_pv_evict_calibrate(void)
+{
+	if (tsc_khz)
+		ivh_pv_evict_threshold = (unsigned long)((u64)tsc_khz *
+					IVH_EVICT_THRESHOLD_US / 1000ULL);
+
+	pr_info("IVH: evict staleness threshold = %lu cycles (%llu us at tsc_khz=%u)\n",
+		ivh_pv_evict_threshold, IVH_EVICT_THRESHOLD_US, tsc_khz);
+	return 0;
+}
+late_initcall(ivh_pv_evict_calibrate);
+
 static int __init ivh_pv_beat_calibrate(void)
 {
 	if (tsc_khz)
@@ -2166,6 +2209,35 @@ static int ivh_pv_proc_preempt_src(const struct ctl_table *table, int write,
  * (ivh_adaptive_mode != ADAPTIVE never reaches pv_wait_early()'s tier-1
  * block's confirm check at all).
  */
+/*
+ * G-LOCK-47 interlock. ivh_node_publish_in_spin() is gated on
+ * ivh_pv_preempt_src != 0 (qspinlock_paravirt.h), so arming the node stamp
+ * while src == 0 freezes every node stamp in place: already-stamped nodes
+ * then age forever, read stale at any threshold, and the walk evicts en
+ * masse. Fresh nodes are safe (st == 0 reads as unknown, never stale), which
+ * is exactly what makes the failure creep in rather than announce itself.
+ */
+static int ivh_pv_proc_evict_node_stamp(const struct ctl_table *table, int write,
+					void *buffer, size_t *lenp, loff_t *ppos)
+{
+	unsigned long val = READ_ONCE(ivh_pv_evict_node_stamp);
+	struct ctl_table tmp = *table;
+	int ret;
+
+	tmp.data = &val;
+	ret = proc_doulongvec_minmax(&tmp, write, buffer, lenp, ppos);
+	if (ret || !write)
+		return ret;
+
+	if (val && !READ_ONCE(ivh_pv_preempt_src)) {
+		pr_err("IVH: refusing ivh_pv_evict_node_stamp=1 at ivh_pv_preempt_src=0 -- ivh_node_publish_in_spin() is gated on src, so no node stamp would ever be refreshed and every already-stamped node would age into a false eviction.\n");
+		return -EINVAL;
+	}
+
+	WRITE_ONCE(ivh_pv_evict_node_stamp, val);
+	return 0;
+}
+
 static int ivh_pv_proc_tier1_confirm(const struct ctl_table *table, int write,
 				     void *buffer, size_t *lenp, loff_t *ppos)
 {
@@ -2612,6 +2684,15 @@ static const struct ctl_table ivh_pv_sysctls[] = {
 		.proc_handler	= proc_doulongvec_minmax,
 	},
 	{
+		.procname	= "ivh_pv_evict_threshold",
+		.data		= &ivh_pv_evict_threshold,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+		.extra1		= &ivh_evict_thr_min,
+		.extra2		= &ivh_evict_thr_max,
+	},
+	{
 		.procname	= "ivh_pv_beat_threshold",
 		.data		= &ivh_pv_beat_threshold,
 		.maxlen		= sizeof(unsigned long),
@@ -2871,7 +2952,7 @@ static const struct ctl_table ivh_pv_sysctls[] = {
 		.data		= &ivh_pv_evict_node_stamp,
 		.maxlen		= sizeof(unsigned long),
 		.mode		= 0644,
-		.proc_handler	= proc_doulongvec_minmax,
+		.proc_handler	= ivh_pv_proc_evict_node_stamp,
 	},
 	{
 		.procname	= "ivh_pv_evict_quiet",

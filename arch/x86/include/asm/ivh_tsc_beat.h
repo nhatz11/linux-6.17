@@ -119,7 +119,8 @@ extern unsigned long ivh_pv_beat_publish_mask;
  * own "bail later" experiment, which measured ~9% SLOWER.
  */
 extern unsigned long ivh_pv_tier1_confirm;
-extern unsigned long ivh_pv_tier1_halt_min;	/* G-LOCK-44, cycles; 0 = off */
+extern unsigned long ivh_pv_tier1_halt_min;
+extern unsigned long ivh_pv_evict_threshold;	/* G-LOCK-47, node-stamp arm only */	/* G-LOCK-44, cycles; 0 = off */
 
 /*
  * Shadow-comparator validation counters and the threshold-tuning histograms,
@@ -1011,7 +1012,8 @@ extern unsigned long ivh_pv_evict_node_stamp;
  * SIZING. Must be comfortably larger than ivh_pv_beat_threshold (a vCPU that
  * is preempted right now was, by definition, observed preempted no earlier
  * than one threshold ago) and larger than the interval at which node waiters
- * run their tier-2 checks. Start at ~10x ivh_pv_beat_threshold.
+ * run their tier-2 checks. Start at ~10x ivh_pv_evict_threshold (G-LOCK-47:
+ * evict_quiet gates EVICTION, so it must track eviction's knob, not the beat's).
  */
 extern unsigned long ivh_pv_evict_quiet;
 
