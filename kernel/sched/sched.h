@@ -1500,6 +1500,15 @@ struct rq {
 	u64			ivh_vact_idle_exit_tsc;
 	u64			ivh_vact_burst_start_tsc;
 	u64			ivh_vact_last_preempt_tsc;
+	/*
+	 * G-LOCK-41: the tick BEFORE the gap -- a lower bound on the instant
+	 * the vCPU was descheduled. ivh_vact_last_preempt_tsc is the DETECTING
+	 * tick, which is at or after the RESUME, so a consumer asking "was I
+	 * preempted since T?" cannot otherwise distinguish "the gap spanned my
+	 * critical section" from "the gap ended just before I started". With
+	 * both ends a consumer can answer yes / no / ambiguous.
+	 */
+	u64			ivh_vact_last_preempt_start_tsc;
 	u64			ivh_vact_last_active_c;
 	u64			ivh_vact_jumps;		/* instrumentation */
 	u64			ivh_vact_idle_explained;	/* instrumentation */

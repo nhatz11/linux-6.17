@@ -1347,6 +1347,56 @@ DECLARE_PER_CPU(u64, ivh_cs_abstain_nohz);
 DECLARE_PER_CPU(u64, ivh_cs_long_hold);
 DECLARE_PER_CPU(u64, ivh_cs_healthy_long);
 DECLARE_PER_CPU(u64, ivh_cs_fired);
+
+/*
+ * G-LOCK-41 -- detector VERDICT AUDIT, gated by ivh_cs_verdict (default 0).
+ *
+ * The question: when we mark a lock holder or a lock waiter preempted, was it?
+ * The verdict comes from a heartbeat stamp the victim published. The check
+ * comes from ivh_vact_preempt_since() -- the tick-driven raw-TSC gap detector,
+ * a different mechanism, validated per-event against host `perf sched`
+ * (evaluation.md section 12). Chaining the two is what makes this a statement
+ * about HOST truth rather than about our own stamp.
+ *
+ * ivh_cs_flagged_acq: the head's verdict, deposited into the HOLDER's slot.
+ * The value is the holder's ACQUISITION TSC, not a flag, so a deposit left
+ * over from an earlier hold cannot match the current one -- no clearing
+ * protocol, no stale-flag race. It is deliberately NOT a field in struct
+ * ivh_cs_owner: that line is one-writer / many-remote-reader by design and a
+ * remote write would dirty it on every stamp and every clear. Same resolution
+ * as ivh_evict_stamp[] -- a dedicated array. ALIGNED because it is written
+ * remotely and read locally, the opposite direction from its neighbours.
+ */
+DECLARE_PER_CPU_ALIGNED(u64, ivh_cs_flagged_acq);
+extern unsigned long ivh_cs_verdict;
+
+/*
+ * The 2x2, indexed [irqs_disabled()][ivh_vact_preempt_since()].
+ *
+ *   [0][*]  IRQs ON at release  -- the detecting tick arrives at resume, so
+ *           this half is the TRUSTWORTHY 2x2.
+ *   [1][*]  IRQs OFF (spin_lock_irqsave) -- ivh_vact_tick() runs only from
+ *           account_process_tick(), so the tick that would record the gap is
+ *           deferred PAST the unlock. [1][0] is a blind spot, NOT a true
+ *           negative. Reporting the halves merged makes recall uninterpretable.
+ *   [*][0] not preempted   [*][1] preempted   [*][2] ambiguous window
+ *
+ * ACCOUNTING: sum(ivh_cs_v_flagged) <= ivh_cs_fired. The shortfall is re-fires
+ * on one hold (the deposit is idempotent, the count is not), verdicts landing
+ * after the holder released, and holds whose acq stamp a nested hold
+ * overwrote (ivh_cs_stamp_overwrote). Report the shortfall, do not hide it.
+ */
+#define IVH_CS_V_NR	3
+DECLARE_PER_CPU(u64, ivh_cs_v_flagged[2][IVH_CS_V_NR]);
+DECLARE_PER_CPU(u64, ivh_cs_v_unflagged[2][IVH_CS_V_NR]);
+
+/*
+ * G-LOCK-41 LW arm: of the waiters we evicted as "preempted", how many had
+ * their vCPU actually descheduled? Marked-row only -- pv_requeue_node() never
+ * sees an unmarked node -- so this is a PRECISION column, not a 2x2, and must
+ * not be reported as recall.
+ */
+DECLARE_PER_CPU(u64, ivh_evict_v[IVH_CS_V_NR]);
 DECLARE_PER_CPU(u64, ivh_cs_abstain_tenure);	/* waitcnt >= 1 without the clear */
 DECLARE_PER_CPU(u64, ivh_cs_abstain_hashed);	/* HASHED entry, _Q_SLOW_VAL witness failed */
 DECLARE_PER_CPU(u64, ivh_cs_abstain_late);	/* RUNNING entry, promptness gate failed */

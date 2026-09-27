@@ -849,6 +849,17 @@ static inline bool is_cs_preempted(struct qspinlock *lock, struct pv_node *prev,
 		}
 		*acq_out  = acq;
 		*held_out = (u64)held;
+		/*
+		 * G-LOCK-41: publish the verdict to the holder so it can score
+		 * it at release against its OWN vCPU's evidence. @cpu is
+		 * prev->cpu; @acq was just validated against a re-read tag, so
+		 * it names THIS hold and no other. Plain store, no barrier --
+		 * the consumer is a counter, not a control decision, and a
+		 * lost store costs one sample (and shows up as a shortfall
+		 * against ivh_cs_fired).
+		 */
+		if (unlikely(READ_ONCE(ivh_cs_verdict)))
+			WRITE_ONCE(per_cpu(ivh_cs_flagged_acq, cpu), acq);
 		this_cpu_inc(ivh_cs_fired);
 		return true;
 	}
@@ -930,6 +941,9 @@ static inline bool is_cs_preempted(struct qspinlock *lock, struct pv_node *prev,
 
 	*acq_out  = acq;
 	*held_out = (u64)held;
+	/* G-LOCK-41, criterion 0 -- see the criterion-1 site above. */
+	if (unlikely(READ_ONCE(ivh_cs_verdict)))
+		WRITE_ONCE(per_cpu(ivh_cs_flagged_acq, cpu), acq);
 	this_cpu_inc(ivh_cs_fired);
 	return true;
 }
@@ -1506,6 +1520,19 @@ static void pv_requeue_node(struct mcs_spinlock *node)
 				this_cpu_inc(ivh_evict_gap_hist[b]);
 				if (gap <= 0)
 					this_cpu_inc(ivh_evict_gap_negative);
+				/*
+				 * G-LOCK-41 LW arm: gap_hist above says HOW
+				 * LONG this waiter was absent, but a quiet-host
+				 * control showed 51% of evictions reporting
+				 * 1-2 ms "absence" with ZERO host preemption --
+				 * it measures notice-and-requeue latency, not
+				 * being descheduled. This says WHY: the
+				 * independent tick-driven TSC gap detector,
+				 * host-validated in evaluation.md section 12.
+				 * Marked-row only, so PRECISION, never recall.
+				 */
+				if (unlikely(READ_ONCE(ivh_cs_verdict)))
+					this_cpu_inc(ivh_evict_v[ivh_vact_preempt_since(st)]);
 				WRITE_ONCE(*slot, 0);	/* never reuse a stale stamp */
 			}
 		}

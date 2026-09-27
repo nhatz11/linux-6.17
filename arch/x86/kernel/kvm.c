@@ -1724,6 +1724,15 @@ DEFINE_PER_CPU(u64, ivh_cs_abstain_nohz);
 DEFINE_PER_CPU(u64, ivh_cs_long_hold);
 DEFINE_PER_CPU(u64, ivh_cs_healthy_long);
 DEFINE_PER_CPU(u64, ivh_cs_fired);
+/* G-LOCK-41 verdict audit. Default OFF: every hook is one READ_ONCE of this
+ * read-mostly global plus a predicted-not-taken branch when it is 0. */
+unsigned long ivh_cs_verdict = 0UL;
+EXPORT_SYMBOL_GPL(ivh_cs_verdict);
+DEFINE_PER_CPU_ALIGNED(u64, ivh_cs_flagged_acq);
+EXPORT_SYMBOL_GPL(ivh_cs_flagged_acq);
+DEFINE_PER_CPU(u64, ivh_cs_v_flagged[2][IVH_CS_V_NR]);
+DEFINE_PER_CPU(u64, ivh_cs_v_unflagged[2][IVH_CS_V_NR]);
+DEFINE_PER_CPU(u64, ivh_evict_v[IVH_CS_V_NR]);
 DEFINE_PER_CPU(u64, ivh_cs_ep_events);
 DEFINE_PER_CPU(u64, ivh_cs_ep_events_by_end[IVH_CS_EP_NR]);
 DEFINE_PER_CPU(u64, ivh_cs_ep_cycles[IVH_CS_EP_NR]);
@@ -2800,6 +2809,21 @@ static const struct ctl_table ivh_pv_sysctls[] = {
 		.proc_handler	= proc_doulongvec_minmax,
 		.extra1		= &ivh_g31_zero,
 		.extra2		= &ivh_g31_one,
+	},
+	{
+		/*
+		 * G-LOCK-41. Arms the head-side verdict deposit and both
+		 * victim-side audits. Needs ivh_cs_owner_clear=1 for the LH
+		 * arm (its read site is inside __ivh_cs_owner_clear) and
+		 * ivh_pv_evict_enable=1 for the LW arm. Deliberately NOT
+		 * interlocked with either, so the counters can be sanity
+		 * checked at the off settings and must read exactly zero.
+		 */
+		.procname	= "ivh_cs_verdict",
+		.data		= &ivh_cs_verdict,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
 	},
 	{
 		.procname	= "ivh_cs_noise_cycles",

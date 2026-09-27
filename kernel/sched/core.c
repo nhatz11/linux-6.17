@@ -763,11 +763,58 @@ void ivh_vact_tick(void)
 		rq->ivh_vact_idle_explained++;
 	} else {
 		rq->ivh_vact_last_active_c    = old - rq->ivh_vact_burst_start_tsc;
+		rq->ivh_vact_last_preempt_start_tsc = old;	/* G-LOCK-41 */
 		rq->ivh_vact_last_preempt_tsc = now;
 		rq->ivh_vact_burst_start_tsc  = now;
 		rq->ivh_vact_jumps++;
 	}
 }
+
+/*
+ * ivh_vact_preempt_since - was THIS vCPU host-preempted after raw TSC @since?
+ *
+ * The only exported reader of rq->ivh_vact_last_preempt_tsc: struct rq is
+ * private to kernel/sched/, and both consumers (the qspinlock release path in
+ * arch/x86/kernel/ivh_lock_holder.c and the PV requeue path in
+ * kernel/locking/qspinlock_paravirt.h) live outside it.
+ *
+ * THREE-VALUED ON PURPOSE. ivh_vact_tick() stamps _last_preempt_tsc at the
+ * DETECTING tick, which is at or after the resume -- so "end > since" alone
+ * scores a critical section that began AFTER the resume as preempted. The
+ * window between resume and detecting tick is normally one interrupt-delivery
+ * latency (nohz=off here: the periodic APIC timer expired during the
+ * preemption and is latched), but it widens to the whole IRQ-off region when
+ * the resuming context has interrupts disabled -- i.e. exactly a
+ * spin_lock_irqsave critical section. Callers MUST account 2 separately;
+ * folding it into either cell manufactures the answer.
+ *
+ * WHY THIS IS NOT CIRCULAR as a validator of the lock-path detectors: those
+ * decide from a heartbeat stamp published by the waiter/holder itself. This
+ * reads a completely different mechanism -- the tick-driven raw-TSC gap
+ * detector -- which was validated per-event against host `perf sched`
+ * (tools/bpf/docs/evaluation.md section 12): 105.7% recall above 1.5 ms,
+ * 100.8% above 500 us, 0.028 false positives/s.
+ *
+ * cpu_rq(raw_smp_processor_id()), not this_rq(): both call sites run with
+ * preemption disabled, and raw_ keeps a CONFIG_DEBUG_PREEMPT build quiet if a
+ * third caller ever appears. No lock -- these fields are written only by this
+ * CPU's own tick, and an aligned u64 cannot tear on x86-64.
+ *
+ * Returns 0 = no, 1 = yes, 2 = ambiguous.
+ */
+int ivh_vact_preempt_since(u64 since)
+{
+	struct rq *rq = cpu_rq(raw_smp_processor_id());
+	u64 end   = READ_ONCE(rq->ivh_vact_last_preempt_tsc);
+	u64 start = READ_ONCE(rq->ivh_vact_last_preempt_start_tsc);
+
+	if (!end || (s64)(end - since) <= 0)
+		return 0;			/* no gap after @since */
+	if ((s64)(start - since) >= 0)
+		return 1;			/* the whole gap is after @since */
+	return 2;				/* @since fell inside the gap */
+}
+EXPORT_SYMBOL_GPL(ivh_vact_preempt_since);
 
 /*
  * ivh_uc_tick - one tick's worth of the "uc" (used-capacity) signal, the

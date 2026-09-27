@@ -8,6 +8,15 @@
 struct qspinlock;
 
 /*
+ * G-LOCK-41: was this vCPU host-preempted since raw TSC @since?
+ * 0 = no, 1 = yes, 2 = ambiguous (@since fell inside the detected gap).
+ * Defined unconditionally in kernel/sched/core.c, so declared OUTSIDE the
+ * CONFIG_X86 && KVM_GUEST && PARAVIRT_SPINLOCKS guard below. Call with
+ * preemption disabled. See that function for why it is three-valued.
+ */
+int ivh_vact_preempt_since(u64 since);
+
+/*
  * ---------------------------------------------------------------------------
  * IVH lock-holder identity (Build 1, tools/bpf/docs/
  * ivh_tsc_full_redesign_build_plan_2026-07-29.md sec 3.3)

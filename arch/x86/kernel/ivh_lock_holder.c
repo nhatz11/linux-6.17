@@ -25,6 +25,7 @@
 #include <linux/init.h>
 #include <linux/ivh_lock_holder.h>
 #include <linux/log2.h>
+#include <linux/irqflags.h>	/* irqs_disabled(), G-LOCK-41 */
 /*
  * <asm/ivh_tsc_beat.h> is not self-contained: its ivh_tsc_cycles_to_ns()/
  * ivh_tsc_ns_to_cycles() helpers use USEC_PER_SEC without including it (every
@@ -228,6 +229,37 @@ void __ivh_cs_owner_clear(struct qspinlock *lock)
 		/* G-LOCK-31: written after the NULL store, so a reader that sees
 		 * the tag still naming a lock never pairs it with this value. */
 		this_cpu_write(ivh_cs_owner.last_cs, (u64)held);
+	}
+
+	/*
+	 * G-LOCK-41 -- the LH detector's 2x2, scored HERE because this is the
+	 * one site every stamped hold passes through, so both the flagged and
+	 * the unflagged row exist. (At the fire site only the flagged row does,
+	 * which is why a hook there could never give more than precision.)
+	 *
+	 *   (a) the queue head's remote inference, from a heartbeat stamp;
+	 *   (b) this vCPU's OWN tick-driven raw-TSC evidence.
+	 * Different mechanisms, so agreement is information. (b) was validated
+	 * per-event against host `perf sched` -- evaluation.md section 12.
+	 *
+	 * Placed after the last_cs write so nothing above is perturbed, and
+	 * after the NULL store so no remote reader can pair a live tag with it.
+	 *
+	 * The irqoff split is NOT optional: ivh_vact_tick() runs only from
+	 * account_process_tick(), so with interrupts disabled the tick that
+	 * would have recorded the gap has not run yet and (b) reads 0 for a
+	 * hold that WAS preempted. [1][0] is a blind spot, not a true negative.
+	 */
+	if (unlikely(READ_ONCE(ivh_cs_verdict))) {
+		int irqoff = !!irqs_disabled();
+		int v = ivh_vact_preempt_since(tsc);
+
+		if (this_cpu_read(ivh_cs_flagged_acq) == tsc) {
+			this_cpu_inc(ivh_cs_v_flagged[irqoff][v]);
+			this_cpu_write(ivh_cs_flagged_acq, 0);
+		} else {
+			this_cpu_inc(ivh_cs_v_unflagged[irqoff][v]);
+		}
 	}
 }
 EXPORT_SYMBOL_GPL(__ivh_cs_owner_clear);
