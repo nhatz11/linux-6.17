@@ -252,9 +252,31 @@ void __ivh_cs_owner_clear(struct qspinlock *lock)
 	 */
 	if (unlikely(READ_ONCE(ivh_cs_verdict))) {
 		int irqoff = !!irqs_disabled();
-		int v = ivh_vact_preempt_since(tsc);
+		u64 rel = rdtsc();
+		u64 dep = this_cpu_read(ivh_cs_flagged_acq);
+		int v;
 
-		if (this_cpu_read(ivh_cs_flagged_acq) == tsc) {
+		/*
+		 * A hold shorter than the detection lag cannot be judged: a
+		 * preemption starting inside it is not detected until after it
+		 * closed. Scoring those "not preempted" buried 17.8M
+		 * unjudgeable holds in the denominator on the first run.
+		 */
+		if (!ivh_vact_judgeable(rel - tsc))
+			v = IVH_CS_V_UNKNOWABLE;
+		else
+			v = ivh_vact_preempt_since(tsc);
+
+		/*
+		 * WINDOW match, not equality. 47% of stamps overwrite a
+		 * previous one (ivh_cs_stamp_overwrote) because nested
+		 * acquires re-stamp ivh_cs_owner.tsc, so the head's deposit
+		 * may name an inner hold rather than this one. Exact equality
+		 * matched 63 of 11796 fires. Any deposit landing inside
+		 * [tsc, rel] was made while this CPU held this lock, which is
+		 * what the audit is asking.
+		 */
+		if (dep && (s64)(dep - tsc) >= 0 && (s64)(rel - dep) >= 0) {
 			this_cpu_inc(ivh_cs_v_flagged[irqoff][v]);
 			this_cpu_write(ivh_cs_flagged_acq, 0);
 		} else {

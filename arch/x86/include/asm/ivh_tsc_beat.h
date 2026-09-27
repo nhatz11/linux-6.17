@@ -1386,7 +1386,18 @@ extern unsigned long ivh_cs_verdict;
  * after the holder released, and holds whose acq stamp a nested hold
  * overwrote (ivh_cs_stamp_overwrote). Report the shortfall, do not hide it.
  */
-#define IVH_CS_V_NR	3
+/*
+ * G-LOCK-41 verdict states. 3 was WRONG and produced a meaningless
+ * "not preempted" column: ivh_vact_preempt_since() answers "has a preemption
+ * been DETECTED since T", and detection lags by up to one tick plus
+ * ivh_vact_jump_ns. Any window shorter than that lag CANNOT be judged -- a
+ * preemption starting inside it is not detected until after it closes. Scoring
+ * those as "not preempted" buried 17.8M unjudgeable holds in the denominator.
+ *   0 = not preempted   1 = preempted   2 = ambiguous window
+ *   3 = UNKNOWABLE: window shorter than the detection lag
+ */
+#define IVH_CS_V_NR	4
+#define IVH_CS_V_UNKNOWABLE	3
 DECLARE_PER_CPU(u64, ivh_cs_v_flagged[2][IVH_CS_V_NR]);
 DECLARE_PER_CPU(u64, ivh_cs_v_unflagged[2][IVH_CS_V_NR]);
 

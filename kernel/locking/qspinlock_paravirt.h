@@ -1531,8 +1531,14 @@ static void pv_requeue_node(struct mcs_spinlock *node)
 				 * host-validated in evaluation.md section 12.
 				 * Marked-row only, so PRECISION, never recall.
 				 */
-				if (unlikely(READ_ONCE(ivh_cs_verdict)))
-					this_cpu_inc(ivh_evict_v[ivh_vact_preempt_since(st)]);
+				if (unlikely(READ_ONCE(ivh_cs_verdict))) {
+					u64 now2 = rdtsc();
+					int v = ivh_vact_judgeable(now2 - st)
+						? ivh_vact_preempt_since(st)
+						: IVH_CS_V_UNKNOWABLE;
+
+					this_cpu_inc(ivh_evict_v[v]);
+				}
 				WRITE_ONCE(*slot, 0);	/* never reuse a stale stamp */
 			}
 		}

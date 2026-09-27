@@ -802,6 +802,23 @@ void ivh_vact_tick(void)
  *
  * Returns 0 = no, 1 = yes, 2 = ambiguous.
  */
+/*
+ * ivh_vact_judgeable - is a window of @span_c cycles long enough that a
+ * preemption inside it would have been DETECTED before the window closed?
+ *
+ * ivh_vact_tick() fires when the gap between consecutive ticks exceeds
+ * ivh_vact_jump_ns, and the gap is only observed at the tick AFTER it. So the
+ * worst-case lag from "preempted" to "detected" is the threshold plus one
+ * tick. A window shorter than that is unjudgeable, not negative.
+ */
+bool ivh_vact_judgeable(u64 span_c)
+{
+	u64 lag_ns = READ_ONCE(ivh_vact_jump_ns) + TICK_NSEC;
+
+	return span_c >= ivh_tsc_ns_to_cycles(lag_ns);
+}
+EXPORT_SYMBOL_GPL(ivh_vact_judgeable);
+
 int ivh_vact_preempt_since(u64 since)
 {
 	struct rq *rq = cpu_rq(raw_smp_processor_id());

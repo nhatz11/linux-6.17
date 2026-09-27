@@ -15,6 +15,8 @@ struct qspinlock;
  * preemption disabled. See that function for why it is three-valued.
  */
 int ivh_vact_preempt_since(u64 since);
+/* G-LOCK-41: false when @span_c is shorter than the detection lag. */
+bool ivh_vact_judgeable(u64 span_c);
 
 /*
  * ---------------------------------------------------------------------------
