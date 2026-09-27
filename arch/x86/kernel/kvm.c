@@ -1393,6 +1393,28 @@ unsigned long ivh_pv_preempt_src __read_mostly = 0UL;	/* 0 = KVM bit (default) *
 unsigned long ivh_pv_tier1_confirm = 0UL;		/* 0 = upstream tier-1, bit-identical */
 
 /*
+ * G-LOCK-44: minimum HALT DURATION, in TSC cycles, before tier 1 will bail.
+ *
+ * Tier 1's test ("prev->state != VCPU_RUNNING") is a fact, but it carries no
+ * information about how long prev has been down, and measured on 2026-09-27
+ * 72.56%% of tier-1 fires landed on a predecessor that had been halted for
+ * only 3.7-7.4 us -- a waiter about to be handed the lock, not a preempted
+ * one. Precision was 2.9%% at the old 100 us beat threshold and 17.5-24.2%%
+ * once the threshold was made sound.
+ *
+ * ivh_pv_tier1_confirm cannot fix this: it reuses ivh_pv_beat_threshold,
+ * whose resolution floor is the 1 ms tick, so at any threshold high enough
+ * to be sound it also rejects the genuine 444 us preemptions (measured:
+ * 16500 true positives -> 13).
+ *
+ * This knob instead reads a stamp the HALTING CPU writes into its own node
+ * immediately before the RUNNING->HALTED cmpxchg, so "how long has prev been
+ * halted" is an exact local measurement with no publish cadence and no tick
+ * floor in it. 0 = off, bit-identical to G-LOCK-43.
+ */
+unsigned long ivh_pv_tier1_halt_min = 0UL;
+
+/*
  * Handoff-time rotation probe (lock skipping), PHASE 0 -- DETECT ONLY.
  * 0 = off, costs one predicted branch. 1 = count handoffs, whether the target
  * looked preempted, and how deep the first live waiter was. NOTHING is ever
@@ -1467,7 +1489,11 @@ u64 ivh_beat_preempt_stamp ____cacheline_aligned = 0;
  * late_initcall so the knob survives a different host.
  */
 unsigned long ivh_pv_beat_threshold __read_mostly = 3300000UL;
-#define IVH_BEAT_THRESHOLD_US	1500ULL
+/* G-LOCK-44: was 1500. A LIVE vCPU's beat has a ~3 ms noise floor here
+ * (its only guaranteed publisher is account_process_tick() at HZ=1000), so
+ * 1500 sat inside the all-false zone: 178576 tier-2 fires per 13 s run with a
+ * mean consequent halt of 14.2 us against ~250 us real preemptions. */
+#define IVH_BEAT_THRESHOLD_US	5000ULL
 unsigned long ivh_pv_beat_publish_mask = 0xfffUL;
 
 /*
@@ -1590,6 +1616,8 @@ DEFINE_PER_CPU(u64, ivh_tier1_confirm_checked);
 DEFINE_PER_CPU(u64, ivh_tier1_confirm_agreed);
 DEFINE_PER_CPU(u64, ivh_tier1_confirm_disagreed);
 DEFINE_PER_CPU(u64, ivh_tier1_suppressed);
+/* G-LOCK-44: tier-1 trips refused because prev had only just halted. */
+DEFINE_PER_CPU(u64, ivh_tier1_halt_fresh);
 
 /* Handoff-time rotation probe (Phase 0, detect-only) -- see ivh_tsc_beat.h */
 DEFINE_PER_CPU(u64, ivh_rot_handoffs);
@@ -2495,6 +2523,13 @@ static const struct ctl_table ivh_pv_sysctls[] = {
 		.maxlen		= sizeof(unsigned long),
 		.mode		= 0644,
 		.proc_handler	= ivh_pv_proc_tier1_confirm,
+	},
+	{
+		.procname	= "ivh_pv_tier1_halt_min",
+		.data		= &ivh_pv_tier1_halt_min,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
 	},
 	{
 		.procname	= "ivh_pv_beat_threshold",

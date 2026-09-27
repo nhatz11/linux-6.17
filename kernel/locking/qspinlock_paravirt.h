@@ -1219,6 +1219,25 @@ static __always_inline bool ivh_node_stale(struct pv_node *pn, u64 now, u64 thr)
 	return (s32)(IVH_NODE_STAMP(now) - st) > (s32)(thr >> 8);
 }
 
+/*
+ * G-LOCK-44: is @pn KNOWN to have halted within the last @thr cycles?
+ *
+ * Deliberately NOT expressed as !ivh_node_stale(): that returns false for an
+ * unstamped node (st == 0), which negated would read as "freshly halted" and
+ * suppress the tier-1 bail on exactly the nodes we know nothing about. An
+ * unknown stamp must fall through to upstream behaviour, so it returns false
+ * here and the caller bails as before.
+ */
+static __always_inline bool ivh_node_halt_fresh(struct pv_node *pn, u64 now,
+						u64 thr)
+{
+	u32 st = (u32)(READ_ONCE(pn->head_ctl) >> 32);
+
+	if (!st)
+		return false;		/* unknown -> do not suppress */
+	return (s32)(IVH_NODE_STAMP(now) - st) <= (s32)(thr >> 8);
+}
+
 static __always_inline void ivh_beat_publish_in_spin(unsigned long loop)
 {
 	if (likely(!READ_ONCE(ivh_pv_preempt_src)))
@@ -1321,6 +1340,39 @@ pv_wait_early(struct pv_node *prev, unsigned long loop)
 	if (READ_ONCE(ivh_pv_tier1_enable) &&
 	    READ_ONCE(prev->state) != VCPU_RUNNING) {
 		unsigned long confirm = READ_ONCE(ivh_pv_tier1_confirm);
+		unsigned long hmin = READ_ONCE(ivh_pv_tier1_halt_min);
+
+		/*
+		 * G-LOCK-44: HOW LONG has prev been halted?
+		 *
+		 * prev->state != VCPU_RUNNING is a fact but says nothing about
+		 * duration, and measured 2026-09-27 under host contention
+		 * 72.56% of tier-1 fires landed on a predecessor halted for
+		 * only 3.7-7.4 us -- one about to hand us the lock, not a
+		 * preempted one. Halting behind it costs a real TDX HLT exit
+		 * and buys nothing.
+		 *
+		 * The stamp read here is written by prev's OWN cpu immediately
+		 * before its RUNNING->HALTED cmpxchg (see pv_wait_node()), so
+		 * this is an exact halt duration: no publish cadence, no 1 ms
+		 * tick floor, no cross-cpu staleness ambiguity. That is why it
+		 * succeeds where ivh_pv_tier1_confirm cannot -- confirm reuses
+		 * ivh_pv_beat_threshold, which has all three of those problems.
+		 *
+		 * Ordering: prev's stamp store is a plain store ahead of its
+		 * locked cmpxchg, so on x86-TSO anyone who observes VCPU_HALTED
+		 * also observes the stamp. Same argument pv_evict_walk() makes
+		 * for ivh_evict_stamp.
+		 *
+		 * A zero stamp is UNKNOWN and must not suppress -- see
+		 * ivh_node_halt_fresh(). Nodes that halted before the knob was
+		 * switched on, and the queue head before it reaches its own
+		 * stamp site, therefore keep upstream behaviour.
+		 */
+		if (hmin && ivh_node_halt_fresh(prev, rdtsc(), hmin)) {
+			this_cpu_inc(ivh_tier1_halt_fresh);
+			return PV_BAIL_NONE;
+		}
 
 		/*
 		 * G-LOCK-25: prev->state == VCPU_HALTED is a FACT about prev,
@@ -2127,6 +2179,22 @@ static int pv_wait_node(struct mcs_spinlock *node, struct mcs_spinlock *prev,
 		 */
 		{
 			u8 hold = VCPU_RUNNING;
+
+			/*
+			 * G-LOCK-44: record WHEN we halted, for our successor's
+			 * tier-1 halt-duration gate (see pv_wait_early()). Our
+			 * own cpu is the sole writer of this node's head_ctl,
+			 * and the plain store lands before the locked cmpxchg
+			 * below, so anyone who observes VCPU_HALTED observes
+			 * this too on x86-TSO.
+			 *
+			 * Gated on the knob so that at ivh_pv_tier1_halt_min==0
+			 * this is bit-identical to G-LOCK-43 -- in particular
+			 * the evictor's ivh_node_stale() pre-filter keeps
+			 * reading a spin-loop stamp, not a halt stamp.
+			 */
+			if (unlikely(READ_ONCE(ivh_pv_tier1_halt_min)))
+				ivh_node_stamp_set(pn, rdtsc());
 
 			if (!try_cmpxchg(&pn->state, &hold, VCPU_HALTED)) {
 				if (hold == VCPU_SKIPPED) {
@@ -3639,6 +3707,17 @@ pv_wait_head_or_lock(struct qspinlock *lock, struct mcs_spinlock *node,
 				goto gotlock;
 			}
 		}
+		/*
+		 * G-LOCK-44: the head halts here, not in pv_wait_node(), so
+		 * stamp its node too -- otherwise a waiter queued directly
+		 * behind the head reads an unstamped node, tier 1 falls
+		 * through to upstream behaviour, and the single longest-lived
+		 * halt in the queue is the one the duration gate cannot see.
+		 * Written before the HASHED store for the same TSO ordering
+		 * reason as the pv_wait_node() site.
+		 */
+		if (unlikely(READ_ONCE(ivh_pv_tier1_halt_min)))
+			ivh_node_stamp_set(pn, rdtsc());
 		WRITE_ONCE(pn->state, VCPU_HASHED);
 		lockevent_inc(pv_wait_head);
 		lockevent_cond_inc(pv_wait_again, waitcnt);

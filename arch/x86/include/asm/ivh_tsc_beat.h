@@ -119,6 +119,7 @@ extern unsigned long ivh_pv_beat_publish_mask;
  * own "bail later" experiment, which measured ~9% SLOWER.
  */
 extern unsigned long ivh_pv_tier1_confirm;
+extern unsigned long ivh_pv_tier1_halt_min;	/* G-LOCK-44, cycles; 0 = off */
 
 /*
  * Shadow-comparator validation counters and the threshold-tuning histograms,
@@ -401,6 +402,7 @@ DECLARE_PER_CPU(u64, ivh_tier1_confirm_checked);
 DECLARE_PER_CPU(u64, ivh_tier1_confirm_agreed);
 DECLARE_PER_CPU(u64, ivh_tier1_confirm_disagreed);
 DECLARE_PER_CPU(u64, ivh_tier1_suppressed);
+DECLARE_PER_CPU(u64, ivh_tier1_halt_fresh);	/* G-LOCK-44 */
 
 /*
  * ============================================================================
