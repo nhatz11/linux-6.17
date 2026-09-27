@@ -64,6 +64,40 @@ set_ivh_sysctl ivh_uc_duty_ns 0
 set_ivh_sysctl ivh_uc_ema_alpha_q16 868
 set_ivh_sysctl ivh_uc_min_avail_pct 10
 set_ivh_sysctl ivh_tks_deadband_ns 1000
+
+# 2026-09-27: the TSC heartbeat staleness threshold. MUST stay above the
+# noise floor of a LIVE vCPU's beat, measured at ~3 ms on this host (p99 of
+# max-staleness across 16 vCPUs, 400 samples, idle box).
+#
+# CORRECTED REASON: the first version of this comment said the floor is ~3 ms
+# because account_process_tick() at HZ=1000 is the only guaranteed publisher.
+# That is wrong -- a 1 ms publisher bounds staleness at ~1 ms. The measured
+# distribution is quantised at ~251us + k*1ms, i.e. MISSED TICKS: the host
+# delaying timer delivery to this vCPU. So the floor is set by host
+# preemption itself, which means this threshold is being calibrated above the
+# very phenomenon tier 2 exists to detect. There is no fixed point, and that
+# is why the value kept drifting (100us -> 1500 -> 3300 -> 11e6). Treat tier 2
+# as OFF at this setting (it fires 0-21 times per run), not as accurate.
+# NO_HZ is NOT the explanation: /proc/cmdline has nohz=off and every vCPU
+# ticks ~1000/s. If nohz=off is ever dropped, idle vCPUs stop publishing
+# entirely and this floor becomes unbounded.
+# At the old 220000 cyc
+# (100 us) tier 2 fired 398,588 times per 13 s hackbench run with a mean
+# consequent halt of 12.0 us; real preemptions here are ~250 us, so ~all of
+# those were false, and they poisoned tier 1 (mean target 21.7 us).
+# At 11000000 cyc (5 ms) tier 2's targets average 293.4 us and tier 1's
+# average 209.1 us -- both matching real preemptions. See
+# tools/bpf/docs/evaluation.md Part V.
+set_ivh_sysctl ivh_pv_beat_threshold 11000000
+
+# 2026-09-27: is_cs_preempted() criterion 1 fires when a hold exceeds that
+# cpu's last completed hold + this margin. It is the HOLDER predicate and is
+# independent of ivh_pv_beat_threshold. The compiled default is 22000 (10us,
+# kvm.c) with NO late_initcall recalibration, so without this line the 250us
+# operating point silently reverts to 10us on every reboot -- a 25x change
+# with no log line. 250us was chosen from the floor sweep: best recall with
+# ZERO fires on short holds (100us and below start leaking false fires).
+set_ivh_sysctl ivh_cs_noise_cycles 550000
 set_ivh_sysctl ivh_tks_idle_sub 0
 # G-LOCK-39: the hrtimer sampler drives the estimator, so the one-period
 # phase bonus must be OFF -- it corrects for undersampling and inflates a
@@ -74,7 +108,22 @@ set_ivh_sysctl ivh_tks_idle_sub 0
 set_ivh_sysctl ivh_tks_phase_pct 0
 set_ivh_sysctl ivh_tks_carry_ticks 8
 set_ivh_sysctl ivh_tks_duty_pct 100
-set_ivh_sysctl ivh_tks_sampler_ns 200000
+# 2026-09-25: DEFAULT IS NOW 0, i.e. the tick estimator, NOT the 200us hrtimer
+# sampler. The sampler fires every 200us on every vCPU and each re-arm is a
+# LAPIC MSR write = a TDX #VE exit of 11-15us, which lands inside critical
+# sections. The IVH arm mitigates that class of stall and the stock PV arm
+# cannot, so leaving it on makes the instrument manufacture the effect under
+# test: measured on the PV arm alone, ebizzy_mmap ran 92.7% faster and perf
+# sched pipe 20.8% faster with it OFF, and turning it off returns both to
+# within 3-7% of their 2026-09-15 G-LOCK-30 reference. It silently inflated
+# every number in evaluation.md 10.2 as first recorded.
+#
+# Set 200000 by hand ONLY to validate the steal estimator itself (Part I).
+# Never for a throughput measurement. Capacity still gates correctly at 0
+# (reads ~620 on the contended half against ivh_capacity_threshold=1010) and
+# migration still fires (6963 in a 10 s hackbench).
+# See tools/bpf/docs/evaluation.md 10.9 and ivh_tools/bench_guard.sh.
+set_ivh_sysctl ivh_tks_sampler_ns 0
 
 # --- infra: daemons, idempotent -- only touched if not already correctly up ---
 NEED_DAEMONS=0
@@ -216,7 +265,7 @@ check_cal() {   # $1 knob  $2 expected
 check_cal ivh_tks_idle_sub      0
 check_cal ivh_tks_phase_pct     0
 check_cal ivh_tks_duty_pct      100
-check_cal ivh_tks_sampler_ns    200000
+check_cal ivh_tks_sampler_ns    0
 check_cal ivh_tks_deadband_ns   1000
 check_cal ivh_tks_carry_ticks   8
 check_cal ivh_steal_source      2
