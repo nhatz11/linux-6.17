@@ -1809,7 +1809,31 @@ DEFINE_PER_CPU(u64, ivh_cs_hold_by_flag[2][IVH_BEAT_AGE_HIST_BUCKETS]);
  * global ivh_head_halt_events[IVH_CS_HALT_CS] vs [IVH_CS_HALT_EXHAUST]; do
  * not attribute an exhaustion halt to the detector.
  */
-DEFINE_PER_CPU(u64, ivh_cs_react[2][IVH_BEAT_AGE_HIST_BUCKETS]);
+/*
+ * G-LOCK-46b: did THIS cpu latch _Q_SLOW_VAL during its own hold?
+ *
+ * pv_kick_node() (qspinlock_paravirt.h:2292) and pv_defer_promote() both run
+ * on the HOLDER's cpu, a few lines after ivh_cs_owner_stamp(), and write
+ * _Q_SLOW_VAL for a successor that was halted AT HANDOFF. Nothing clears it
+ * until the releasing store. Worse, pv_kick_node()'s HALTED->HASHED cmpxchg
+ * wakes that successor, which then spins in pv_wait_head_or_lock() with
+ * lp != NULL and never touches lock->locked again.
+ *
+ * So without this flag "lock->locked == _Q_SLOW_VAL at release" reads TRUE
+ * for a head that is awake and burning CPU on us -- the exact inverse of the
+ * claim, biased in the flattering direction.
+ */
+DEFINE_PER_CPU(u8, ivh_cs_self_slow);
+
+/*
+ * [had_tail][state][bucket], state: 0 = head not halted,
+ * 1 = head halted on its own account, 2 = we latched SLOW_VAL ourselves.
+ * Only [1][1][b] is evidence. had_tail=0 means no queue existed at release,
+ * so there was no head to react at all (an A4 acquirer is never anyone's
+ * prev -- see kernel/locking/qspinlock.c:576) and the hold must not sit in
+ * the denominator.
+ */
+DEFINE_PER_CPU(u64, ivh_cs_react[2][3][IVH_BEAT_AGE_HIST_BUCKETS]);
 unsigned long ivh_cs_react_hist __read_mostly = 0UL;
 /* 0 = off, and then the block costs one read-mostly load. */
 unsigned long ivh_cs_recall_hist __read_mostly = 0UL;

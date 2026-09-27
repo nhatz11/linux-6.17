@@ -976,9 +976,10 @@ static __always_inline int ivh_cs_bucket(u64 v)
 static __always_inline void ivh_cs_ep_close(u64 *ep_acq, u64 ep_start, u64 now,
 					    int why)
 {
+	u64 d;
+
 	/* G-LOCK-46: ivh_lock_holder.c duplicates _Q_SLOW_VAL; catch drift. */
 	BUILD_BUG_ON(IVH_Q_SLOW_VAL != _Q_SLOW_VAL);
-	u64 d;
 
 	if (!*ep_acq)
 		return;
@@ -2290,6 +2291,9 @@ static void pv_kick_node(struct qspinlock *lock, struct mcs_spinlock *node)
 	 * needed.
 	 */
 	WRITE_ONCE(lock->locked, _Q_SLOW_VAL);
+	/* G-LOCK-46b: WE set it, inside our own hold -- not evidence that our
+	 * head halted during the CS. See ivh_cs_self_slow. */
+	this_cpu_write(ivh_cs_self_slow, 1);
 	this_cpu_inc(ivh_hash_ins_kick);
 	(void)pv_hash(lock, pn, 0);	/* site 0 = pv_kick_node */
 
@@ -3889,6 +3893,8 @@ static bool pv_defer_promote(struct qspinlock *lock, struct mcs_spinlock *node,
 	 */
 	(void)pv_hash(lock, pn, 2);
 	WRITE_ONCE(lock->locked, _Q_SLOW_VAL);
+	/* G-LOCK-46b: same self-set hazard as pv_kick_node(). */
+	this_cpu_write(ivh_cs_self_slow, 1);
 	set_pending(lock);
 
 	/*

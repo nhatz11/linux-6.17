@@ -1520,7 +1520,8 @@ DECLARE_PER_CPU(u64, ivh_cs_tenure_cycles[2]);
 DECLARE_PER_CPU(u64, ivh_cs_tenure_hist[2][IVH_BEAT_AGE_HIST_BUCKETS]);
 DECLARE_PER_CPU(u64, ivh_cs_prev_hold_hist[IVH_BEAT_AGE_HIST_BUCKETS]);
 DECLARE_PER_CPU(u64, ivh_cs_hold_by_flag[2][IVH_BEAT_AGE_HIST_BUCKETS]);	/* G-LOCK-45 */
-DECLARE_PER_CPU(u64, ivh_cs_react[2][IVH_BEAT_AGE_HIST_BUCKETS]);	/* G-LOCK-46 */
+DECLARE_PER_CPU(u64, ivh_cs_react[2][3][IVH_BEAT_AGE_HIST_BUCKETS]);	/* G-LOCK-46b */
+DECLARE_PER_CPU(u8, ivh_cs_self_slow);
 extern unsigned long ivh_cs_react_hist;
 extern unsigned long ivh_cs_recall_hist;
 

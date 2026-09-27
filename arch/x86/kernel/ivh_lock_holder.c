@@ -179,6 +179,10 @@ void __ivh_cs_owner_stamp(struct qspinlock *lock)
 		this_cpu_inc(ivh_cs_stamp_overwrote);
 
 	this_cpu_write(ivh_cs_owner.tsc, rdtsc());
+	/* G-LOCK-46b: a fresh hold starts with no self-set SLOW_VAL. Cleared
+	 * here, set by pv_kick_node()/pv_defer_promote() if THIS cpu latches
+	 * _Q_SLOW_VAL during the hold, read at the release hook. */
+	this_cpu_write(ivh_cs_self_slow, 0);
 	smp_wmb();
 	this_cpu_write(ivh_cs_owner.lock, lock);
 	this_cpu_inc(ivh_cs_stamps);
@@ -267,9 +271,20 @@ void __ivh_cs_owner_clear(struct qspinlock *lock)
 		 * the credit.
 		 */
 		if (unlikely(READ_ONCE(ivh_cs_react_hist))) {
-			int halted = READ_ONCE(lock->locked) == IVH_Q_SLOW_VAL;
+			int slow = READ_ONCE(lock->locked) == IVH_Q_SLOW_VAL;
+			int self = this_cpu_read(ivh_cs_self_slow);
+			/*
+			 * A queue must still exist for a head to have reacted
+			 * at all. An A4 acquirer (qspinlock.c:576) has no MCS
+			 * successor and is never anyone's prev, so without
+			 * this its holds pile into "head not halted" and bias
+			 * recall down by tens of percent.
+			 */
+			int had_tail = !!(atomic_read(&lock->val) &
+					  _Q_TAIL_MASK);
+			int st = !slow ? 0 : (self ? 2 : 1);
 
-			this_cpu_inc(ivh_cs_react[halted][hb]);
+			this_cpu_inc(ivh_cs_react[had_tail][st][hb]);
 		}
 		/* G-LOCK-31: written after the NULL store, so a reader that sees
 		 * the tag still naming a lock never pairs it with this value. */
