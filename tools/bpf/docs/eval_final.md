@@ -32,7 +32,7 @@ Status legend: **DONE** / **PARTIAL** / **NOT STARTED**
 | 12 | Full test on 1 VM | NOT STARTED |
 | 13 | Scalability | NOT STARTED |
 | 14 | Our weaknesses | NOT STARTED |
-| 15 | Workload reliability | NOT STARTED |
+| 15 | **Workload reliability** | **DONE (with 3 stated limits)** |
 
 ---
 
@@ -472,5 +472,135 @@ on pinned spinlock-intensive workloads where migration cannot run.
 
 # 15. Workload reliability
 
-NOT STARTED. Lock acquisitions/s per workload. Partial data exists from
-`lockrate.sh`.
+DONE, with three limits stated at the end. Measured 2026-09-27 on
+`6.17.0-G-LOCK-48-skipcheck+`.
+
+**Purpose.** Rank the candidate workloads by how hard they exercise kernel
+locks, so the parameter-sensitivity points (7, 8, 11) can be run on 5-6
+workloads spanning that range instead of ~20 through every arm. At 8 arms and
+2 reps the full set costs 2.58 h per sweep; a stratified subset costs a
+fraction of that and represents the range better than the top of it.
+
+**Config.** Single arm, stock PV (`/root/spin_mode 1`, `ivh_adaptive_mode==0`
+asserted), `ivh_universal_eligible=0`, `ivh_tks_sampler_ns=0`, CS stamping
+armed AFTER `spin_mode` (it clears `ivh_cs_owner_enable`), `drop_caches` before
+every run. There is no second arm because this characterises the WORKLOAD, not
+IVH -- there is nothing to compare against.
+
+**Instruments.** Two, independent, both safe:
+
+| instrument | what it counts |
+|---|---|
+| `perf stat -a -e lock:contention_begin` | kernel spinlock contention, exact |
+| `ivh_cs_prev_hold_hist` (sum) | acquisitions that formed a stamped MCS queue |
+
+They agree on the ranking, which is what makes the stratification trustworthy.
+`fentry` on `_raw_spin_lock*` was rejected: bpftrace flags it a "dangerous
+function" that risks kernel deadlock *and* drops events under its own
+mitigation, and a lossy counter cannot stratify.
+
+## 15.1 Kernel-lock workloads -- the axis is valid here
+
+Median over n reps. `recorded` is the workload's IVH-vs-PV figure from the
+campaign (section 6) or evaluation.md section 10.2.
+
+| workload | n | contended/s | holds/s | sec | recorded | note |
+|---|---|---|---|---|---|---|
+| stressng_dentry | 3 | 570,785 | 140,692 | 16.1 | +99.5% | settled |
+| hackbench_pipe_thr | 3 | 248,507 | 199,845 | 3.1 | +76.3% | settled |
+| sysbench_mutex | 8 | 14,887 | 8,892 | 0.6 | +24.4% | settled |
+| ebizzy_mmap | 3 | 13,387 | 10,086 | 15.3 | +104.3% | settled |
+| dbench_16 | 3 | 9,381 | 5,116 | 36.4 | +19.1% | settled |
+| psearchy | 3 | 5,536 | 2,146 | 35.3 | +0.82% ns | settled |
+| fsmark_tmpfs | 8 | 4,753 | 769 | 0.7 | +167.0% | 1 outlier |
+| wis_mmap2 | 3 | 3,623 | 1,164 | 16.4 | +11.2% | settled |
+| tinyconfig | 5 | 2,409 | 958 | 39.6 | +0.99% | settled |
+| perf_sched_pipe | 8 | 412 | 391 | 25.0 | +146.9% | **BIMODAL** 5 lo / 3 hi |
+| schbench | 3 | 299 | 221 | 15.3 | +7.4% | settled |
+
+**Range 299 -> 570,785/s, a 1,907x span with no gaps.**
+
+## 15.2 Userspace-sync workloads -- the axis is INVALID here
+
+| workload | n | contended/s | holds/s | sec | recorded | note |
+|---|---|---|---|---|---|---|
+| nhextend_full | 3 | 7,637 | 3,991 | 8.2 | +64.0% (AFL vs spin-only) | settled |
+| parsec_vips | 3 | 2,077 | 1,470 | 17.8 | +57.39% | settled |
+| parsec_bodytrack | 3 | 1,107 | 801 | 67.8 | +14.39% | settled |
+| parsec_dedup | 3 | 1,035 | 465 | 46.5 | +86.86% | settled |
+| parsec_freqmine | 3 | 325 | 104 | 49.8 | +4.96% | settled |
+| parsec_canneal | 3 | 249 | 146 | 85.0 | +2.01% ns | settled |
+| parsec_blackscholes | 8 | 128 | 104 | 26.1 | +8.01% | **BIMODAL** 5 lo / 3 hi |
+| parsec_swaptions | 8 | 67 | 52 | 42.0 | +10.43% | **BLIND**, at/below idle floor |
+| parsec_ferret | 8 | 58 | 28 | 77.9 | +15.21% | **BLIND**, at/below idle floor |
+
+Idle background on this box is ~64/s. `parsec_ferret` medians **58/s** and
+`parsec_swaptions` **67/s** -- at or BELOW that floor, measured against clean
+baselines -- while carrying +15.21% and +10.43% recorded migration wins. They
+synchronise via `pthread_mutex` -> futex, which `lock:contention_begin` never
+observes. **A low reading in this table means the instrument is blind, NOT that
+the workload has little contention.** These rows must not be ranked against
+section 15.1.
+
+`nhextend_full` is the exception among userspace workloads: its adaptive futex
+lock makes real futex syscalls that take the kernel's `hb->lock`, so it does
+register (7,637/s).
+
+## 15.3 Lock rate does not predict the benefit
+
+Demonstrated at both ends, which is stronger than the previous evidence for
+this claim:
+
+| workload | contended/s | recorded IVH win |
+|---|---|---|
+| parsec_dedup | 1,035 | **+86.86%** |
+| psearchy | 5,536 | **+0.82%, not significant** |
+
+5.3x the lock rate, and the benefit inverts. This supports the existing
+"blocking structure predicts the win, lock rate does not" finding with a direct
+measurement of the rate rather than an inference from it.
+
+## 15.4 Stratified subset for points 7, 8 and 11
+
+| stratum | workloads | contended/s |
+|---|---|---|
+| INTENSE | stressng_dentry, hackbench_pipe_thr | 570,785 / 248,507 |
+| MID | ebizzy_mmap, dbench_16 | 13,387 / 9,381 |
+| INFREQUENT | schbench, and tinyconfig or wis_mmap2 | 299 / 2,409 / 3,623 |
+
+`perf_sched_pipe` and `parsec_blackscholes` are **excluded despite being
+otherwise good candidates**: both are genuinely two-regime (401 vs 1,672/s;
+127 vs 1,447/s, each 5 reps low and 3 high). A per-arm median lands arbitrarily
+in one mode, which would read as a threshold effect that is not there.
+
+## 15.5 Limits of this measurement
+
+1. **PARSEC cannot be placed on this axis at all** (15.2). Stratifying PARSEC
+   requires a futex-rate instrument that does not exist yet.
+2. **Background subtraction was tried and FAILED.** Sampling `lock:contention_
+   begin` for 3 s immediately before each run, then subtracting, gave nonsense
+   negative rates: **14 of 35 samples (40%)** were contaminated by the
+   *previous* run's teardown, and the contamination clusters on the long PARSEC
+   runs. The `net` column was discarded. Raw medians over 5+ reps are what
+   worked.
+3. **A discarded warmup run is missing and is needed.** `psearchy_ab.sh` has
+   one; the point-15 harness did not. Its absence produced the two largest
+   artifacts seen -- `fsmark_tmpfs` 86,939/s and `parsec_swaptions` 685/s, both
+   first reps following a different workload. This must be added before points
+   7/8/11, where arm order rotates and a contaminated first rep per arm biases
+   whichever arm happens to run first.
+
+Also noted: `fsmark_tmpfs` (0.7 s) and `sysbench_mutex` (0.6 s) complete in
+under a second at their recorded invocations. Their *rates* are stable anyway
+(sysbench 8 reps within 10%), but their *throughput* figures at that duration
+are dominated by startup, which matters for points 7/8/11 and not for this one.
+
+## 15.6 Harnesses
+
+| file | role |
+|---|---|
+| `ivh_tools/point15_lockrate.sh` | main pass, 20 workloads x 3 reps |
+| `ivh_tools/point15_rerun_anomalies.sh` | +5 reps for UNSTABLE / NEAR-IDLE / SHORT |
+| `ivh_tools/point15_report.py` | report, splits the two groups |
+| `ivh_tools/ivh_benchmarks.sh` | workload registry with recorded deltas |
+| `ivh_tools/point15_0927-220345.csv` | raw data (`_rerun.csv` for the re-runs) |
