@@ -1771,6 +1771,25 @@ DEFINE_PER_CPU(u64, ivh_cs_ep_hist[IVH_CS_EP_NR][IVH_BEAT_AGE_HIST_BUCKETS]);
 DEFINE_PER_CPU(u64, ivh_cs_tenure_cycles[2]);
 DEFINE_PER_CPU(u64, ivh_cs_tenure_hist[2][IVH_BEAT_AGE_HIST_BUCKETS]);
 DEFINE_PER_CPU(u64, ivh_cs_prev_hold_hist[IVH_BEAT_AGE_HIST_BUCKETS]);
+/*
+ * G-LOCK-45: RECALL, bucketed by hold duration.
+ *
+ * [0][b] = holds of duration-bucket b that NO detector flagged
+ * [1][b] = holds of bucket b that were flagged
+ * so recall(b) = [1][b] / ([0][b] + [1][b]).
+ *
+ * Both rows come from the SAME site, the same run and the same population
+ * (only contended acquisitions are stamped, so every hold reaching here had
+ * a queue), which is the whole point: every earlier recall figure divided a
+ * numerator and a denominator that came from different configurations.
+ *
+ * Bucketing by duration is not decoration -- it localises WHERE detection
+ * fails. A detector that is blind to short holds and perfect on long ones
+ * has a very different fix from one that is uniformly leaky.
+ */
+DEFINE_PER_CPU(u64, ivh_cs_hold_by_flag[2][IVH_BEAT_AGE_HIST_BUCKETS]);
+/* 0 = off, and then the block costs one read-mostly load. */
+unsigned long ivh_cs_recall_hist __read_mostly = 0UL;
 DEFINE_PER_CPU(u64, ivh_cs_abstain_tenure);
 DEFINE_PER_CPU(u64, ivh_cs_abstain_hashed);
 DEFINE_PER_CPU(u64, ivh_cs_abstain_late);
@@ -2523,6 +2542,13 @@ static const struct ctl_table ivh_pv_sysctls[] = {
 		.maxlen		= sizeof(unsigned long),
 		.mode		= 0644,
 		.proc_handler	= ivh_pv_proc_tier1_confirm,
+	},
+	{
+		.procname	= "ivh_cs_recall_hist",
+		.data		= &ivh_cs_recall_hist,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
 	},
 	{
 		.procname	= "ivh_pv_tier1_halt_min",

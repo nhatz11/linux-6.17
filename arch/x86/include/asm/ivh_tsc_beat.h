@@ -1519,6 +1519,8 @@ DECLARE_PER_CPU(u64, ivh_cs_ep_hist[IVH_CS_EP_NR][IVH_BEAT_AGE_HIST_BUCKETS]);
 DECLARE_PER_CPU(u64, ivh_cs_tenure_cycles[2]);
 DECLARE_PER_CPU(u64, ivh_cs_tenure_hist[2][IVH_BEAT_AGE_HIST_BUCKETS]);
 DECLARE_PER_CPU(u64, ivh_cs_prev_hold_hist[IVH_BEAT_AGE_HIST_BUCKETS]);
+DECLARE_PER_CPU(u64, ivh_cs_hold_by_flag[2][IVH_BEAT_AGE_HIST_BUCKETS]);	/* G-LOCK-45 */
+extern unsigned long ivh_cs_recall_hist;
 
 /* Stage B only. Head halts split by cause, mirroring ivh_node_halt_record(). */
 #define IVH_CS_HALT_EXHAUST	0

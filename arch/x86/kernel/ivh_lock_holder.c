@@ -232,8 +232,26 @@ void __ivh_cs_owner_clear(struct qspinlock *lock)
 	 */
 	held = (s64)(rdtsc() - tsc);
 	if (held > 0) {
-		this_cpu_inc(ivh_cs_prev_hold_hist[held >= (1LL << 31) ?
-				IVH_BEAT_AGE_HIST_BUCKETS - 1 : ilog2((u64)held)]);
+		int hb = held >= (1LL << 31) ?
+				IVH_BEAT_AGE_HIST_BUCKETS - 1 : ilog2((u64)held);
+
+		this_cpu_inc(ivh_cs_prev_hold_hist[hb]);
+
+		/*
+		 * G-LOCK-45: recall, bucketed by hold duration. Same site,
+		 * same population, same run as the denominator above -- which
+		 * is exactly what every earlier recall estimate lacked.
+		 *
+		 * Reads the deposit but does NOT consume it: the verdict block
+		 * below owns the clear, and taking it here would starve that
+		 * block's flagged row. Uses the same `dep == tsc` equality the
+		 * verdict block uses, so the two rows stay reconcilable.
+		 */
+		if (unlikely(READ_ONCE(ivh_cs_recall_hist))) {
+			u64 fdep = this_cpu_read(ivh_cs_flagged_acq);
+
+			this_cpu_inc(ivh_cs_hold_by_flag[fdep == tsc][hb]);
+		}
 		/* G-LOCK-31: written after the NULL store, so a reader that sees
 		 * the tag still naming a lock never pairs it with this value. */
 		this_cpu_write(ivh_cs_owner.last_cs, (u64)held);
