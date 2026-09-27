@@ -1252,6 +1252,28 @@ static __always_inline void ivh_beat_publish_in_spin(unsigned long loop)
 	this_cpu_inc(ivh_beat_publishes);
 }
 
+/*
+ * G-LOCK-48: how long since THIS node last published, and was it marked?
+ * @now must already be an rdtsc. Reads only this cpu's own node stamp.
+ * st == 0 means never stamped -> unknown, not a gap, so it is dropped.
+ */
+static __always_inline void ivh_skipcheck_record(struct pv_node *pn, u64 now,
+						 int skipped)
+{
+	u32 st;
+	s64 gap;
+
+	if (likely(!READ_ONCE(ivh_skipcheck_hist)))
+		return;
+	st = (u32)(READ_ONCE(pn->head_ctl) >> 32);
+	if (!st)
+		return;
+	gap = (s64)(s32)(IVH_NODE_STAMP(now) - st) * 256;
+	if (gap <= 0)
+		return;
+	this_cpu_inc(ivh_skipcheck[!!skipped][ivh_cs_bucket((u64)gap)]);
+}
+
 /* As above, and also refresh this waiter's per-node stamp (design D). */
 static __always_inline void ivh_node_publish_in_spin(struct pv_node *pn,
 						     unsigned long loop)
@@ -1264,6 +1286,10 @@ static __always_inline void ivh_node_publish_in_spin(struct pv_node *pn,
 		return;
 
 	t = rdtsc();
+	/* G-LOCK-48: measure the gap BEFORE overwriting the stamp. Reaching
+	 * here means the loop's VCPU_SKIPPED test above did not fire, so we
+	 * are the not-marked row. */
+	ivh_skipcheck_record(pn, t, 0);
 	this_cpu_write(ivh_tsc_beat.stamp, t);
 	this_cpu_inc(ivh_beat_publishes);
 	if (READ_ONCE(ivh_pv_evict_node_stamp))
@@ -1966,6 +1992,13 @@ static int pv_wait_node(struct mcs_spinlock *node, struct mcs_spinlock *prev,
 			 * the outer for(;;) into this loop again.
 			 */
 			if (unlikely(READ_ONCE(pn->state) == VCPU_SKIPPED)) {
+				/* G-LOCK-48: the marked row. This site exists
+				 * because we break out here and never reach
+				 * the publish site below. rdtsc is affordable:
+				 * this path runs once per eviction, not per
+				 * spin iteration. */
+				if (unlikely(READ_ONCE(ivh_skipcheck_hist)))
+					ivh_skipcheck_record(pn, rdtsc(), 1);
 				ivh_head_blk_close(&hb, true);
 				return PV_WAIT_REQUEUE;
 			}

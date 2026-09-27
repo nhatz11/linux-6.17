@@ -119,8 +119,9 @@ extern unsigned long ivh_pv_beat_publish_mask;
  * own "bail later" experiment, which measured ~9% SLOWER.
  */
 extern unsigned long ivh_pv_tier1_confirm;
-extern unsigned long ivh_pv_tier1_halt_min;
-extern unsigned long ivh_pv_evict_threshold;	/* G-LOCK-47, node-stamp arm only */	/* G-LOCK-44, cycles; 0 = off */
+extern unsigned long ivh_pv_tier1_halt_min;	/* G-LOCK-44, cycles; 0 = off */
+extern unsigned long ivh_pv_evict_threshold;	/* G-LOCK-47, node-stamp arm only */
+extern unsigned long ivh_skipcheck_hist;	/* G-LOCK-48 */
 
 /*
  * Shadow-comparator validation counters and the threshold-tuning histograms,
@@ -1523,6 +1524,7 @@ DECLARE_PER_CPU(u64, ivh_cs_tenure_hist[2][IVH_BEAT_AGE_HIST_BUCKETS]);
 DECLARE_PER_CPU(u64, ivh_cs_prev_hold_hist[IVH_BEAT_AGE_HIST_BUCKETS]);
 DECLARE_PER_CPU(u64, ivh_cs_hold_by_flag[2][IVH_BEAT_AGE_HIST_BUCKETS]);	/* G-LOCK-45 */
 DECLARE_PER_CPU(u64, ivh_cs_react[2][3][IVH_BEAT_AGE_HIST_BUCKETS]);	/* G-LOCK-46b */
+DECLARE_PER_CPU(u64, ivh_skipcheck[2][IVH_BEAT_AGE_HIST_BUCKETS]);	/* G-LOCK-48 */
 DECLARE_PER_CPU(u8, ivh_cs_self_slow);
 extern unsigned long ivh_cs_react_hist;
 extern unsigned long ivh_cs_recall_hist;

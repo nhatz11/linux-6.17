@@ -1865,6 +1865,28 @@ DEFINE_PER_CPU(u8, ivh_cs_self_slow);
  * the denominator.
  */
 DEFINE_PER_CPU(u64, ivh_cs_react[2][3][IVH_BEAT_AGE_HIST_BUCKETS]);
+
+/*
+ * G-LOCK-48: the WAITER's own self-check, the exact question asked:
+ * "a waiter comes back from being preempted, sees its own stamp has not been
+ *  refreshed for a while, checks its state -- is it VCPU_SKIPPED?"
+ *
+ *   [1][b] = gap of bucket b since MY last publish, and I found myself SKIPPED
+ *   [0][b] = gap of bucket b, and nobody had marked me
+ * so recall(b) = [1][b] / ([0][b] + [1][b]).
+ *
+ * The gap is measured from this node's OWN head_ctl stamp, written by this
+ * cpu -- self-observation, no remote read, no cross-cpu deposit to lose.
+ *
+ * TWO record sites are required and that is not optional. pv_wait_node()'s
+ * loop tests VCPU_SKIPPED (~:1968) BEFORE it reaches
+ * ivh_node_publish_in_spin() (~:2076), so a waiter that returns and finds
+ * itself skipped breaks out and never publishes. Instrumenting only the
+ * publish site would make the numerator identically zero and read as "0%
+ * recall" -- a measurement artifact, not a result.
+ */
+DEFINE_PER_CPU(u64, ivh_skipcheck[2][IVH_BEAT_AGE_HIST_BUCKETS]);
+unsigned long ivh_skipcheck_hist __read_mostly = 0UL;
 unsigned long ivh_cs_react_hist __read_mostly = 0UL;
 /* 0 = off, and then the block costs one read-mostly load. */
 unsigned long ivh_cs_recall_hist __read_mostly = 0UL;
@@ -2679,6 +2701,13 @@ static const struct ctl_table ivh_pv_sysctls[] = {
 	{
 		.procname	= "ivh_pv_tier1_halt_min",
 		.data		= &ivh_pv_tier1_halt_min,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_skipcheck_hist",
+		.data		= &ivh_skipcheck_hist,
 		.maxlen		= sizeof(unsigned long),
 		.mode		= 0644,
 		.proc_handler	= proc_doulongvec_minmax,
