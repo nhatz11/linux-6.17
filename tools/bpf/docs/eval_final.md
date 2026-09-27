@@ -55,6 +55,35 @@ ground truth from `/proc/<vcpu-tid>/schedstat` and `perf sched`.
 
 ---
 
+## 5.0 Method
+
+How each sub-claim was obtained. Configuration is in 5.5, scripts in 5.6.
+
+| sub-claim | procedure | control / ground truth |
+|---|---|---|
+| 5.1 steal + active | read the guest's own TSC-derived accounting over a fixed window; compare against the same window measured on the host | host `/proc/<vcpu-tid>/schedstat`; the TD pid is re-resolved every boot |
+| 5.2 deschedule count | count TSC jumps exceeding the deschedule threshold; compare the count to the host's own context-switch count for that vCPU | host `schedstat` `nr_switches` |
+| 5.3 holder detection | arm the CS stamp, run a workload, bucket every hold by duration at release (`ivh_cs_prev_hold_hist`); a "detection" is a hold past `ivh_cs_noise_cycles` | **dose-response**: idle vs loaded host, two machines and two clocks with no shared instrument. Plus a stock-PV arm (`spin_mode 1`, `ivh_adaptive_mode==0` asserted) in every comparison |
+| 5.4 waiter marking | at the eviction decision point, record the predecessor's stamp age and whether the node was already `VCPU_SKIPPED`; precision = marked ∩ genuinely stale / marked | self-observation at the decision point; funnel accounting for refusals |
+
+**Two rules that every number here depends on.**
+
+1. **Stock PV is `spin_mode 1` AND `ivh_adaptive_mode==0`, asserted.** Setting
+   `ivh_universal_eligible=0` alone leaves adaptive spinning, head bypass and
+   eviction running -- that is a third configuration, not a baseline. Using it
+   as the denominator inflated one fs_mark measurement from +173.6% to +239%.
+2. **`/root/spin_mode` CLEARS `ivh_cs_owner_enable` and `ivh_cs_owner_clear`.**
+   CS stamping must be re-armed AFTER every `spin_mode` call, with a readback
+   assert. Arming once at startup silently disarms it on the first arm switch
+   and the hold histogram then reads a flat zero for the whole run.
+
+**Reporting convention.** Improvements in this file are stated as **% wall
+time saved** for time-reported benchmarks and **% throughput gained** for
+rate-reported ones; the two are not interchangeable (hackbench PV 59.57s ->
+IVH 15.55s is +73.9% time saved and +283% throughput). Each table says which.
+
+---
+
 ## 5.1 Steal and active time vs the hypervisor
 
 **Result: on contended vCPUs, steal reads 0.907 and active 0.912 of host
@@ -481,6 +510,8 @@ workloads spanning that range instead of ~20 through every arm. At 8 arms and
 2 reps the full set costs 2.58 h per sweep; a stratified subset costs a
 fraction of that and represents the range better than the top of it.
 
+## 15.0 Method
+
 **Config.** Single arm, stock PV (`/root/spin_mode 1`, `ivh_adaptive_mode==0`
 asserted), `ivh_universal_eligible=0`, `ivh_tks_sampler_ns=0`, CS stamping
 armed AFTER `spin_mode` (it clears `ivh_cs_owner_enable`), `drop_caches` before
@@ -498,6 +529,14 @@ They agree on the ranking, which is what makes the stratification trustworthy.
 `fentry` on `_raw_spin_lock*` was rejected: bpftrace flags it a "dangerous
 function" that risks kernel deadlock *and* drops events under its own
 mitigation, and a lossy counter cannot stratify.
+
+**Procedure.** Each workload runs 3x; any workload flagged UNSTABLE (>3x
+spread across reps), NEAR-IDLE (<2x background) or SHORT (<1 s) then gets +5
+reps. Medians over all reps are reported. `drop_caches` before every run.
+Anomaly re-runs additionally sampled a 3 s idle background before each run --
+see 15.5 limit 2 for why that correction was discarded.
+
+---
 
 ## 15.1 Kernel-lock workloads -- the axis is valid here
 
