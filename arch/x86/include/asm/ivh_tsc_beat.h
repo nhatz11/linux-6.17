@@ -1408,6 +1408,21 @@ DECLARE_PER_CPU(u64, ivh_cs_v_unflagged[2][IVH_CS_V_NR]);
  * not be reported as recall.
  */
 DECLARE_PER_CPU(u64, ivh_evict_v[IVH_CS_V_NR]);
+
+/*
+ * G-LOCK-43 accounting closure. The first audit run reported a 0.5% match rate
+ * by dividing ivh_cs_v_flagged by ivh_cs_fired -- but the head RE-PROBES
+ * throughout a stall (~88 fires each) while the deposit is idempotent, so one
+ * stall yields at most one match. The honest denominator is
+ * ivh_cs_ep_events_by_end[ACQUIRED], against which the match rate is 104/105.
+ * These three counters make the identity checkable rather than argued:
+ *
+ *   ep_events_by_end[ACQUIRED] = v_flagged + v_orphan + v_nested
+ *                                + dep_clobbered + in-flight
+ */
+DECLARE_PER_CPU(u64, ivh_cs_v_orphan);	  /* deposit unconsumed: slot retagged */
+DECLARE_PER_CPU(u64, ivh_cs_v_nested);	  /* deposit named an INNER hold */
+DECLARE_PER_CPU(u64, ivh_cs_dep_clobbered); /* overwrote a different acq */
 DECLARE_PER_CPU(u64, ivh_cs_abstain_tenure);	/* waitcnt >= 1 without the clear */
 DECLARE_PER_CPU(u64, ivh_cs_abstain_hashed);	/* HASHED entry, _Q_SLOW_VAL witness failed */
 DECLARE_PER_CPU(u64, ivh_cs_abstain_late);	/* RUNNING entry, promptness gate failed */

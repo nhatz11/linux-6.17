@@ -558,7 +558,11 @@ void account_process_tick(struct task_struct *p, int user_tick)
 	 * tell apart from real host preemption, which is the one thing this
 	 * signal exists to measure.
 	 */
-	ivh_vact_tick();
+	/* G-LOCK-43: exactly one clock drives the detector, mirroring
+	 * ivh_tick_steal_accumulate() above. Both firing would make each read
+	 * the other's interval as a gap. */
+	if (!READ_ONCE(ivh_tks_sampler_ns))
+		ivh_vact_tick();
 	ivh_uc_tick();
 
 	if (vtime_accounting_enabled_this_cpu())

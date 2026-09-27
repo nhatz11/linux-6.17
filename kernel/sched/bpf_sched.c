@@ -263,7 +263,17 @@ static int ivh_proc_preempt_event_source(const struct ctl_table *table, int writ
  */
 #define IVH_VACT_JUMP_NS	(TICK_NSEC + TICK_NSEC / 2)
 unsigned long ivh_vact_jump_ns = IVH_VACT_JUMP_NS;
-static unsigned long ivh_vact_jump_ns_min = TICK_NSEC;
+/* G-LOCK-43: shortest host deschedule we will believe in. See
+ * ivh_vact_certain_negative(). */
+unsigned long ivh_vact_min_preempt_ns = 2000UL;	/* 2 us */
+EXPORT_SYMBOL_GPL(ivh_vact_min_preempt_ns);
+/* G-LOCK-43: was TICK_NSEC, which made sense only while the tick was the
+ * detector's sole clock. ivh_tks_sampler_fn() can now drive it at 200 us, so
+ * the hard floor is one sampler period; anything above that is the operator's
+ * responsibility and ivh_vact_judgeable() adapts. Setting a threshold below
+ * the ACTUAL driver period will produce false jumps -- that is the operator's
+ * error to avoid, not something this bound can express. */
+static unsigned long ivh_vact_jump_ns_min = 100000;	/* 100 us */
 
 /*
  * IVH "uc" (used-capacity): in-kernel replica of vcap's used/(used+stolen)
@@ -374,6 +384,13 @@ static const struct ctl_table ivh_sysctls[] = {
 		.maxlen		= sizeof(unsigned long),
 		.mode		= 0644,
 		.proc_handler	= ivh_proc_preempt_event_source,
+	},
+	{
+		.procname	= "ivh_vact_min_preempt_ns",
+		.data		= &ivh_vact_min_preempt_ns,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
 	},
 	{
 		.procname	= "ivh_vact_jump_ns",

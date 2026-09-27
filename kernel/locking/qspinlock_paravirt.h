@@ -858,8 +858,16 @@ static inline bool is_cs_preempted(struct qspinlock *lock, struct pv_node *prev,
 		 * lost store costs one sample (and shows up as a shortfall
 		 * against ivh_cs_fired).
 		 */
-		if (unlikely(READ_ONCE(ivh_cs_verdict)))
+		if (unlikely(READ_ONCE(ivh_cs_verdict))) {
+			u64 prev_dep = READ_ONCE(per_cpu(ivh_cs_flagged_acq, cpu));
+
+			/* Re-fires on the same stall write the same acq and are
+			 * free; a DIFFERENT pending acq means a prior episode
+			 * the holder never scored. */
+			if (prev_dep && prev_dep != acq)
+				this_cpu_inc(ivh_cs_dep_clobbered);
 			WRITE_ONCE(per_cpu(ivh_cs_flagged_acq, cpu), acq);
+		}
 		this_cpu_inc(ivh_cs_fired);
 		return true;
 	}
@@ -942,8 +950,13 @@ static inline bool is_cs_preempted(struct qspinlock *lock, struct pv_node *prev,
 	*acq_out  = acq;
 	*held_out = (u64)held;
 	/* G-LOCK-41, criterion 0 -- see the criterion-1 site above. */
-	if (unlikely(READ_ONCE(ivh_cs_verdict)))
+	if (unlikely(READ_ONCE(ivh_cs_verdict))) {
+		u64 prev_dep = READ_ONCE(per_cpu(ivh_cs_flagged_acq, cpu));
+
+		if (prev_dep && prev_dep != acq)
+			this_cpu_inc(ivh_cs_dep_clobbered);
 		WRITE_ONCE(per_cpu(ivh_cs_flagged_acq, cpu), acq);
+	}
 	this_cpu_inc(ivh_cs_fired);
 	return true;
 }
@@ -1532,10 +1545,19 @@ static void pv_requeue_node(struct mcs_spinlock *node)
 				 * Marked-row only, so PRECISION, never recall.
 				 */
 				if (unlikely(READ_ONCE(ivh_cs_verdict))) {
-					u64 now2 = rdtsc();
-					int v = ivh_vact_judgeable(now2 - st)
-						? ivh_vact_preempt_since(st)
-						: IVH_CS_V_UNKNOWABLE;
+					u64 sp = rdtsc() - st;
+					int v;
+
+					/* Same ordering as the holder hook: a
+					 * span too short to hold a deschedule
+					 * is a certain negative. 34% of
+					 * eviction windows are under 1.86 us. */
+					if (ivh_vact_certain_negative(sp))
+						v = 0;
+					else if (!ivh_vact_judgeable(sp))
+						v = IVH_CS_V_UNKNOWABLE;
+					else
+						v = ivh_vact_preempt_since(st);
 
 					this_cpu_inc(ivh_evict_v[v]);
 				}

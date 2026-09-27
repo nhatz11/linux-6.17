@@ -450,6 +450,25 @@ static enum hrtimer_restart ivh_tks_sampler_fn(struct hrtimer *timer)
 
 	if (s->sampling) {
 		ivh_tick_steal_accumulate();
+		/*
+		 * G-LOCK-43: the sampler is the jump detector's clock too.
+		 *
+		 * SHIPPED DARK -- inert at the boot default ivh_tks_sampler_ns=0.
+		 * The G-LOCK-41 attempt was reverted because at a 200 us period
+		 * with ivh_vact_jump_ns still 1.5 ms, P(detect) goes to ZERO for
+		 * the 500-1300 us band the 1 kHz clock catches at 40-80%. That
+		 * is fixed here by two companion changes, and both are required:
+		 * ivh_vact_judgeable() now derives its lag from the DRIVER
+		 * period, and ivh_vact_jump_ns_min dropped from TICK_NSEC to
+		 * 100 us so the threshold can actually follow the period.
+		 * Arm with: sampler_ns=200000 AND jump_ns=400000.
+		 *
+		 * Cuts detection lag 2.5 ms -> 600 us, which takes the waiter
+		 * audit from 2% judgeable to ~64%. VALIDATION ONLY: the sampler
+		 * costs ~48% on ebizzy (evaluation.md 10.9) and bench_guard.sh
+		 * must keep refusing any throughput A/B with it armed.
+		 */
+		ivh_vact_tick();
 
 		/* Measured elapsed, not a count of nominal periods:
 		 * hrtimer_forward_now() skips missed deadlines, so under heavy
@@ -811,9 +830,39 @@ void ivh_vact_tick(void)
  * worst-case lag from "preempted" to "detected" is the threshold plus one
  * tick. A window shorter than that is unjudgeable, not negative.
  */
+/*
+ * ivh_vact_certain_negative - is @span_c too short to contain ANY deschedule?
+ *
+ * rdtsc() counts wall time straight through a host deschedule, so a window
+ * whose raw-TSC span is shorter than the shortest deschedule the host can
+ * perform cannot contain one. That is a CERTAIN NEGATIVE, independent of any
+ * detector lag -- no sampling rate is required to know it.
+ *
+ * This is what makes the audit tractable: 99.93% of contended lock holds are
+ * under 1.86 us (ivh_cs_prev_hold_hist), far below the host's shortest
+ * measured deschedules (~11 us, evaluation.md 12.4) and below one TDX #VE
+ * round trip (11-15 us). Without this they all fall into UNKNOWABLE and the
+ * negative row is empty; with it they are correctly classified as negatives.
+ *
+ * Default 2 us: ~5x below the host's shortest observed deschedule and below a
+ * single #VE exit. A sysctl rather than a constant so the floor is
+ * re-validated against host truth, never assumed.
+ */
+bool ivh_vact_certain_negative(u64 span_c)
+{
+	return span_c < ivh_tsc_ns_to_cycles(READ_ONCE(ivh_vact_min_preempt_ns));
+}
+EXPORT_SYMBOL_GPL(ivh_vact_certain_negative);
+
 bool ivh_vact_judgeable(u64 span_c)
 {
-	u64 lag_ns = READ_ONCE(ivh_vact_jump_ns) + TICK_NSEC;
+	u64 p = READ_ONCE(ivh_tks_sampler_ns);
+
+	/* G-LOCK-43: the lag is one threshold plus one DRIVER period. The
+	 * driver is the tick when the sampler is off and the sampler when it
+	 * is on -- keeping TICK_NSEC here would overstate the lag 5x at a
+	 * 200 us sampling period and throw away judgeable windows. */
+	u64 lag_ns = READ_ONCE(ivh_vact_jump_ns) + (p ? p : TICK_NSEC);
 
 	return span_c >= ivh_tsc_ns_to_cycles(lag_ns);
 }

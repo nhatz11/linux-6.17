@@ -176,6 +176,9 @@ extern void ivh_vact_tick(void);		/* kernel/sched/core.c */
  * comment for why reusing that knob was a real bug.
  */
 extern unsigned long ivh_vact_jump_ns;		/* kernel/sched/bpf_sched.c */
+/* G-LOCK-43: shortest host deschedule we will believe in; below this a window
+ * is a certain negative. See ivh_vact_certain_negative(). */
+extern unsigned long ivh_vact_min_preempt_ns;	/* kernel/sched/bpf_sched.c */
 
 /*
  * IVH per-CPU TSC heartbeat and raw-TSC<->ns helpers (Step 4/6). The real

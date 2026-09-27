@@ -200,8 +200,16 @@ void __ivh_cs_owner_clear(struct qspinlock *lock)
 
 	u64 tsc;
 
-	if (this_cpu_read(ivh_cs_owner.lock) != (void *)lock)
+	if (this_cpu_read(ivh_cs_owner.lock) != (void *)lock) {
+		/* G-LOCK-43: a pending deposit dies here -- the slot was
+		 * retagged before we could score it. The only structural way
+		 * a head verdict is lost on the holder side; count it so the
+		 * ACQUIRED identity closes. */
+		if (unlikely(READ_ONCE(ivh_cs_verdict)) &&
+		    this_cpu_read(ivh_cs_flagged_acq))
+			this_cpu_inc(ivh_cs_v_orphan);
 		return;
+	}
 	/*
 	 * G-LOCK-31: load the acquisition TSC BEFORE the NULL store, and re-check
 	 * the tag after loading it. An IRQ that stamps another lock between the
@@ -262,7 +270,18 @@ void __ivh_cs_owner_clear(struct qspinlock *lock)
 		 * closed. Scoring those "not preempted" buried 17.8M
 		 * unjudgeable holds in the denominator on the first run.
 		 */
-		if (!ivh_vact_judgeable(rel - tsc))
+		u64 span = rel - tsc;
+
+		/*
+		 * Order matters. A window too short to contain any deschedule
+		 * is a CERTAIN NEGATIVE, not an unknowable -- rdtsc counts
+		 * through a deschedule, so the span itself proves it. 99.93%
+		 * of holds land here; without this test the negative row is
+		 * empty and the audit cannot compute precision at all.
+		 */
+		if (ivh_vact_certain_negative(span))
+			v = 0;
+		else if (!ivh_vact_judgeable(span))
 			v = IVH_CS_V_UNKNOWABLE;
 		else
 			v = ivh_vact_preempt_since(tsc);
@@ -276,8 +295,22 @@ void __ivh_cs_owner_clear(struct qspinlock *lock)
 		 * [tsc, rel] was made while this CPU held this lock, which is
 		 * what the audit is asking.
 		 */
-		if (dep && (s64)(dep - tsc) >= 0 && (s64)(rel - dep) >= 0) {
+		/*
+		 * G-LOCK-43: EQUALITY, reverting G-LOCK-42's window match.
+		 * That was built on "47% of holds are nested", which was
+		 * ivh_cs_stamp_overwrote read across a boot with
+		 * ivh_cs_owner_clear=0 -- with the clear disarmed the slot is
+		 * never NULLed so EVERY stamp overwrites. Controlled
+		 * measurement with it armed: 0.57%. The window is also
+		 * strictly less precise, since an inner hold's deposit
+		 * satisfies an outer hold's window. Count the nested case
+		 * instead of absorbing it.
+		 */
+		if (dep == tsc) {
 			this_cpu_inc(ivh_cs_v_flagged[irqoff][v]);
+			this_cpu_write(ivh_cs_flagged_acq, 0);
+		} else if (dep && (s64)(dep - tsc) > 0 && (s64)(rel - dep) >= 0) {
+			this_cpu_inc(ivh_cs_v_nested);
 			this_cpu_write(ivh_cs_flagged_acq, 0);
 		} else {
 			this_cpu_inc(ivh_cs_v_unflagged[irqoff][v]);

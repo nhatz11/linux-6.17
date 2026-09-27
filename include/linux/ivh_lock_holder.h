@@ -17,6 +17,8 @@ struct qspinlock;
 int ivh_vact_preempt_since(u64 since);
 /* G-LOCK-41: false when @span_c is shorter than the detection lag. */
 bool ivh_vact_judgeable(u64 span_c);
+/* G-LOCK-43: true when @span_c is too short to contain any host deschedule. */
+bool ivh_vact_certain_negative(u64 span_c);
 
 /*
  * ---------------------------------------------------------------------------
