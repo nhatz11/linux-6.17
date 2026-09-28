@@ -107,6 +107,12 @@ alone manufactured a bogus +88%.
 Without the wipe, `make` finds nothing to do and returns in ~0.5 s having built
 nothing.
 
+## A.3 Registry
+
+`/root/ivh_tools/ivh_benchmarks.sh` carries both sets, Set A generated verbatim
+from `benchmarks.tsv`. Use it rather than re-deriving invocations.
+
+---
 ## A.4 Scaled variants (PV arm >= 5 s)
 
 Two confirmed wins run under a second at their campaign invocation, too short
@@ -130,12 +136,8 @@ t=24.96 and t=21.23 here, against sub-second runs that spanned +173.6% to
 
 ---
 
-## A.3 Registry
-
-`/root/ivh_tools/ivh_benchmarks.sh` carries both sets, Set A generated verbatim
-from `benchmarks.tsv`. Use it rather than re-deriving invocations.
-
 ---
+
 
 # 5. TSC accuracy
 
