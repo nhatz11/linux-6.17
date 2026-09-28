@@ -816,10 +816,142 @@ contradictory entries and needs re-taking now that tier 2 is going away.
 
 # 11. Iterations before deciding preempted
 
-PARTIAL. Publish cadence is `ivh_pv_beat_publish_mask+1` = 4096 spin
-iterations (~47 us bare `cpu_relax`, ~60-110 us with the real loop body); the
-node-stamp floor that follows from it is in 5.5. The 0.5 ms staleness cut is
-in use for eviction. Not yet swept for wait-time/throughput as the point asks.
+DONE, as a NULL. Measured 2026-09-28 on `6.17.0-G-LOCK-48-skipcheck+`.
+Raw data: `p11full_data.csv` (180 rows).
+
+**The knob does not matter, because the predicate barely fires.** Sweeping the
+eviction staleness cut over a 20x range produces no distinguishable change in
+either throughput or wait time. This is a firing-rate result, not a tuning
+result, and it corroborates the `evaluation.md` entry recording lock skipping as
+null on real workloads.
+
+Publish cadence is `ivh_pv_beat_publish_mask+1` = 4096 spin iterations (~47 us
+bare `cpu_relax`, ~60-110 us with the real loop body); the node-stamp floor that
+follows from it is in 5.5. The shipped cut is 1,100,000 cycles = 500 us.
+
+## 11.1 Method
+
+`ivh_pv_evict_threshold` at 220,000 / 550,000 / 1,100,000 (shipped) / 2,200,000
+/ 4,400,000 cycles = 100 us / 250 us / 500 us / 1 ms / 2 ms at 2200 MHz, plus a
+stock-PV arm. 6 arms x 5 reps x 6 workloads = 180 runs, arm order rotated each
+rep. Harness `point11_full.sh`, report `point11_report.py`.
+
+Two metrics, both in-kernel counters so the measurement costs nothing:
+throughput, and `ivh_slowpath_wait_ns` aggregate wait. No p99 (out of scope for
+this point). Eviction counters (`ivh_evict_marked`, `..._requeued`,
+`..._lookahead_refused`) are logged per run so a flat result cannot be confused
+with a knob that never engaged.
+
+**Two prerequisites, both off by default.** Without BOTH of
+`ivh_pv_evict_enable=1` and `ivh_pv_evict_node_stamp=1`, eviction fires zero
+times at every threshold from 500 us down to 10 us. `node_stamp` is the real
+blocker: at 0 the staleness test falls through to the per-CPU heartbeat arm
+gated on `ivh_pv_beat_threshold` (5 ms), which sits below its own ~3 ms noise
+floor and is documented as dead in 5.5. Both are asserted per arm.
+
+**Head bypass is ON** in every IVH arm, as are tier 1 and tier 2 -- the shipped
+spin-side stack.
+
+**Migration is OFF in every arm** (`ivh_universal_eligible=0`, asserted). Lock
+skipping is a queue-ORDER decision; vCPU placement is a separate mechanism whose
+variance here is far larger than the effect being swept. A first smoke run with
+migration on showed why: the arm that happened to follow the PV arm did 10,447
+migrations while the others did 21-293, because the PV arm perturbs
+`ivh_uc_capacity` for 2-3 runs afterwards and Gate 1 then passes everything.
+With migration off the wait spread across arms fell from 8 s to 0.7 s.
+Consequently these numbers are NOT comparable to points 7 and 8, which required
+the 8-starved/8-healthy split; host contention here is uniform (all 16 vCPUs
+~995 capacity).
+
+## 11.2 The decisive contrast: 40x less firing, no change
+
+The 2 ms arm fires essentially nothing on five of six workloads. If the
+threshold mattered, it would have to differ from the 100 us arm.
+
+| workload | evictions/run 100 us -> 2 ms | perf | wait/acq |
+|---|---|---|---|
+| hackbench_pipe_thr | 1,090 -> 24 | +0.47% | +0.45% |
+| ebizzy_mmap | 63 -> 1 | +0.04% | -5.45% |
+| dbench_16 | 195 -> 5 | +0.99% | +0.89% |
+| sysbench_mutex | 2 -> 0 | -0.36% | +20.65% |
+| parsec_vips | 5 -> 0 | -4.85% | +8.29% |
+| **pooled (n=5)** | **271 -> 6** | **-0.74% (t=-0.70)** | **+4.97% (t=1.11)** |
+
+A ~40x reduction in firing rate is indistinguishable from the most aggressive
+setting on both metrics.
+
+## 11.3 Full sweep, pooled
+
+`parsec_dedup` is EXCLUDED: its PV arm alone ranges 15.2-194.1 s, CV 82%, and
+individual runs span 15.2-231.5 s. At that variance it carries no information
+and its apparent -44% to -61% on every IVH arm is noise, not an effect. The
+other five workloads have PV-arm CV between 0.1% and 4.7%.
+
+| arm | perf vs PV | t | wait/acq vs PV | t | evictions/run |
+|---|---|---|---|---|---|
+| 100 us | +1.41% | 1.08 | +5.21% | 0.76 | 271 |
+| 250 us | +0.99% | 1.73 | +3.01% | 0.79 | 193 |
+| 500 us (shipped) | +1.11% | 1.23 | +10.38% | 1.16 | 173 |
+| 1 ms | +1.25% | 1.21 | +12.44% | 1.55 | 133 |
+| 2 ms | +0.61% | 2.08 | +10.87% | 1.10 | 6 |
+
+No arm clears |t| >= 2.57 on either metric. There is no monotonic trend in
+either column, and wait time does not fall at any threshold -- the pooled
+wait/acq change is positive (worse) at all five, though never significantly so.
+
+**The ~+1% throughput common to every arm is not eviction.** It appears
+undiminished at the 2 ms arm, which fires 6 evictions per run. It is
+attributable to tier 1 + tier 2 + head bypass, which are on in all IVH arms.
+That is consistent with the recorded t12+bypass result, smaller here because
+uniform host contention gives the spin-side stack less to work with.
+
+## 11.4 Why: the firing rate
+
+Evictions per million queued acquisitions, at the most aggressive threshold:
+
+| workload | evictions | queued acquisitions | per million |
+|---|---|---|---|
+| dbench_16 | 195 | 92,891 | 2,097 |
+| ebizzy_mmap | 63 | 155,159 | 407 |
+| hackbench_pipe_thr | 1,090 | 3,228,271 | 338 |
+| parsec_vips | 5 | 40,079 | 115 |
+| parsec_dedup | 3 | 46,409 | 69 |
+| sysbench_mutex | 2 | 113,217 | 19 |
+
+Even on the most favourable workload, at the most aggressive setting, 0.21% of
+queued acquisitions see an eviction. On four of six it is under 0.04%. A
+mechanism touching that fraction of acquisitions cannot move an aggregate, and
+no choice of threshold changes that -- lowering the cut raises firing only from
+~0.02% to ~0.2%, and it raises `lookahead_refused` faster than it raises useful
+evictions (hackbench 2,162 refusals against 1,090 marks at 100 us, versus 6
+against 24 at 2 ms), i.e. the extra candidates found at an aggressive cut are
+disproportionately waiters with nothing live behind them.
+
+## 11.5 What can be claimed
+
+The shipped 500 us is defensible only as *no worse than any alternative*. It is
+not an optimum, and the sweep cannot be used to argue that it is. The honest
+claim for the paper is the firing-rate one: the staleness threshold is
+unfalsifiable on real workloads because the predicate fires 19-2,097 times per
+million queued acquisitions, so no setting of it is distinguishable from any
+other.
+
+## 11.6 Limits
+
+1. **Uniform host contention only.** The preempted-waiter population is set by
+   the host's preemption pattern; a host starving a subset of vCPUs harder would
+   raise the firing rate and could in principle make the threshold bite. Not
+   tested here, and points 7/8's split contention is the obvious next condition.
+2. **`parsec_dedup` excluded** on variance grounds (11.3), so the pooled figures
+   are n=5, not n=6.
+3. **Migration off**, so this is the isolated spin-side result. The combined
+   configuration is point 12.
+4. **`ivh_evict_halt_averted` read 0 throughout** and is not used above; whether
+   that counter is wired is unverified.
+5. Wait is reported per acquisition as well as in total because total wait is
+   only directly comparable on fixed-work benchmarks; on the time-boxed ones
+   (ebizzy, dbench) a faster arm accrues more total wait at lower per-acquisition
+   wait. Where the two disagree, per-acquisition is the correct reading.
 
 # 12. Full test on 1 VM
 
