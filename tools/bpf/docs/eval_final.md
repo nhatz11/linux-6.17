@@ -753,14 +753,20 @@ cleanest lock-rate measurements in the set but are **flat** on Gate 2
 | HIGH | `ebizzy_mmap` | 2,909,909 | **1.49x** |
 | MID | `dbench_16` | 956,552 | 1.05x -- **negative control** |
 | MID | `parsec_dedup` | 993,941 | **3.80x** (largest) |
-| LOW | `wis_mmap2` | 285,699 | not measured |
+| LOW | `sysbench_mutex` | 115,279 | not measured; **+19.8% confirmed** (5/5, t=21.23) |
 | LOW | `parsec_vips` | 165,053 | **1.34x** |
 
 Span 48x. Four have demonstrated Gate-2 sensitivity; `dbench_16` is included
 deliberately as a **negative control** -- it is flat (1.05x) with the cleanest
 measurement in the suite (spread 1.00x), so if the other five respond and it
-does not, a systematic artifact affecting all arms is ruled out. `wis_mmap2`
-is the one arm with neither sensitivity data nor a control role.
+does not, a systematic artifact affecting all arms is ruled out. `sysbench_mutex`
+has no Gate-2 sensitivity datum but is a confirmed win at the scaled size
+(+19.8%, 5/5 pairs, t=21.23) and carries the highest contended share in the
+suite (10.72%, 8x the next).
+
+`wis_mmap2` was in this slot and was dropped on 2026-09-28: a single-arm probe
+gave **65 migrations and -0.0%** against its recorded +11.2%, so migration
+barely fires there and no threshold could modulate it.
 
 Excluded: `nhextend_full` (reserved for the AFL/adaptive-spinning work, not a
 migration workload), `stressng_dentry` (flat, and would duplicate HIGH),
