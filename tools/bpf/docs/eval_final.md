@@ -24,7 +24,7 @@ Status legend: **DONE** / **PARTIAL** / **NOT STARTED**
 | 4 | How many threads are migratable | NOT STARTED |
 | 5 | **TSC accuracy** | **DONE (4 of 4 sub-claims)** |
 | 6 | Migration impact | NOT STARTED |
-| 7 | Time-left sensitivity | PARTIAL (curve taken, see evaluation.md §11) |
+| 7 | **Time-left sensitivity** | **DONE** -- no threshold is distinguishable; ship 4 ms as the cheapest |
 | 8 | Budget sensitivity | NOT STARTED |
 | 9 | Cost vs gain | NOT STARTED |
 | 10 | Adaptive spinning is good | PARTIAL (see 5.3/5.4 for detection; throughput unmeasured) |
@@ -581,8 +581,114 @@ NHextend plus the 2 best non-microbenchmark kernel workloads, split across 4 /
 
 # 7. Time-left sensitivity
 
-PARTIAL. Curve taken; see `evaluation.md` §11. Needs the cache-locality and
-migration-cost arms to converge on 4 ms.
+DONE. 2026-09-28. `ivh_time_left_threshold_ns` swept 250 us - 16 ms, 6 workloads
+x 8 arms x 5 reps = **240 runs** (`ivh_tools/point7_full.sh`, raw data
+`p7full_data.csv`, report `ivh_tools/point7_report.py`).
+
+**The claim.** Throughput is statistically indistinguishable across the whole
+useful range of this constant, while migration cost rises monotonically with it.
+4 ms is shipped as the cheapest threshold at which no performance is given up --
+not as an optimum.
+
+## 7.1 Method
+
+Workloads are the stratified six from 15.3. Four measurements per run, kept
+SEPARATE (no ratio is formed in the harness):
+
+| metric | source |
+|---|---|
+| perf | workload metric, direction-corrected so higher is better |
+| ipi/kwork | RES+CAL+TLB per 1000 units of work, work = perf x duration. **Not** per unit throughput -- that double-counts the speedup on fixed-work benchmarks |
+| wait_ns | `ivh_slowpath_wait_ns`, aggregate spinlock wait (in-kernel) |
+| mig_cost | stopper dispatch + the actual move, **excluding** target-runqueue wait |
+
+**Migration cost is measured, not inferred**, by bpftrace with no kernel change:
+`cpu_stop_queue_work` -> `migration_cpu_stop` entry gives dispatch (~2 us);
+`migration_cpu_stop` entry -> return gives the move (~3 us). Cross-checked
+against an independent method (total `set_cpus_allowed_ptr` time minus the
+`sched_info.run_delay` delta, which is valid at `sched_schedstats=0` and never
+accrues while blocked): 4.8 us vs 6.1 us, agreeing to ~25%. Probe overhead is a
+1-2 us floor against a ~3 us signal, so these are order-of-magnitude figures --
+adequate for showing migration is not free, not for a precision claim.
+
+**Target-runqueue wait is logged but NOT counted as migration cost.** It is
+~1.5 ms modal, which is one EEVDF `base_slice_ns` (2.8 ms on this guest): the
+migrated thread lands behind an incumbent and waits a scheduling quantum. That
+is a property of how loaded the target is, not of the migration mechanism. Per
+migration: move ~3 us, dispatch ~2 us, **runqueue wait ~1,500 us**.
+
+**Capacity settling is filtered, not averaged over.** The PV arm perturbs
+`ivh_uc_capacity` for ~2-3 runs afterwards; during that window Gate 1 passes
+everything and the arm is not comparable. Rows with `g1_reject < 50,000` are
+excluded from the averages and the count of exclusions is printed.
+
+## 7.2 Result, pooled across the six workloads
+
+Normalised per workload first, so hackbench's 69 s of spin does not dominate
+sysbench's 0.17 s.
+
+| arm | perf vs PV | ipi vs PV | spin saved | mig cost | us/mig |
+|---|---|---|---|---|---|
+| 250 us | +32.8% | -8.5% | 0.35 s | 76.6 ms | 11.3 |
+| 500 us | +30.6% | -8.1% | 0.33 s | 59.2 ms | 8.6 |
+| 1 ms | +36.3% | -8.9% | 0.44 s | 65.7 ms | 10.0 |
+| 2 ms | +35.9% | -5.9% | 0.29 s | 76.9 ms | 10.0 |
+| **4 ms** | **+40.3%** | **-10.3%** | **0.43 s** | **78.8 ms** | **9.7** |
+| 8 ms | +42.6% | -4.6% | 0.53 s | 90.4 ms | 9.6 |
+| 16 ms | +45.0% | -9.8% | 0.50 s | 98.8 ms | 10.8 |
+
+## 7.3 The differences are not statistically resolvable
+
+| comparison | n | mean | t | crit | verdict |
+|---|---|---|---|---|---|
+| 250 us vs 16 ms (whole range) | 6 | +44.8 pp | 1.33 | 2.571 | **not significant** |
+| 4 ms vs 8 ms | 6 | +11.3 pp | 1.06 | 2.571 | **not significant** |
+
+Best arm per workload is scattered: 250 us x1, 2 ms x1, 4 ms x2, 8 ms x2. The
+apparent monotone rise in 7.2 is driven almost entirely by `parsec_dedup`, which
+swings **+63 pp between adjacent arms** and whose PV baseline varies 58-175 s.
+**Three of six workloads prefer 4 ms to 8 ms.**
+
+> ~~"performance rises monotonically with the threshold and it is not noise-flat"~~
+> **WITHDRAWN** (stated in-session before the paired test was run). The pooled
+> median rises but per-workload variance swamps it; t=1.33 over the full range.
+
+## 7.4 What IS directionally consistent: the cost
+
+Migration cost rises with the threshold -- 78.8 -> 90.4 -> 98.8 ms across
+4/8/16 ms -- and the mechanism is mechanical: a looser gate admits more
+candidates, so more migrations happen. Migrations at 4/8/16 ms on `ebizzy_mmap`:
+5,446 -> 7,202 -> 7,735. `dbench_16`: 50,252 -> 51,384 -> 54,490.
+
+Since throughput cannot be distinguished between arms and cost can, the cheapest
+arm that loses nothing is the rational choice. That is the argument for 4 ms.
+
+> **The congestion hypothesis is NOT supported.** Per-migration cost (`us/mig`)
+> sits at 8.6-11.3 us with no trend across a 64x threshold range. Two per-arm
+> observations had suggested it rose with the gate (4.8 -> 8.7 us on sysbench,
+> 9.2 -> 11.9 us on dedup); those do not survive averaging over 6 workloads.
+> Total cost grows because there are MORE migrations, not because each is dearer.
+
+## 7.5 The negative control worked
+
+`dbench_16` was included deliberately as a workload known flat on this knob
+(15.3). It behaved as designed: **migrations 36,628 -> 54,490 across the sweep
+(+49%) while throughput stayed at +7.9% to +9.6%.** Migration volume changed
+substantially and throughput did not, which rules out a systematic artifact
+affecting all arms equally.
+
+## 7.6 Limits
+
+1. **The 250 us and 500 us arms lost reps** to capacity-unsettling -- hackbench
+   dropped 4 of 5 at 250 us and 3 of 5 at 500 us. The low end rests on n=1 and
+   n=2 and is the weakest part of the curve.
+2. **`ipi/kwork` is unreliable on PARSEC.** dedup's swings +203% to -10.8% across
+   arms; its PV baseline is too variable. The column is solid on hackbench
+   (-76 to -80%) and sysbench (-61 to -66%), where it is also flat across arms.
+3. **`parsec_dedup` dominates every pooled mean.** Any pooled figure should be
+   sanity-checked with it removed.
+4. Migration cost carries 1-2 us of probe overhead (7.1). Constant across arms,
+   so arm-to-arm ranking is unaffected; absolute values are not precise.
 
 # 8. Budget sensitivity
 
