@@ -751,15 +751,22 @@ cleanest lock-rate measurements in the set but are **flat** on Gate 2
 |---|---|---|---|
 | HIGH | `hackbench_pipe_thr` | 7,934,408 | **1.48x** |
 | HIGH | `ebizzy_mmap` | 2,909,909 | **1.49x** |
-| MID | `nhextend_full` | 1,284,188 | not measured |
+| MID | `dbench_16` | 956,552 | 1.05x -- **negative control** |
 | MID | `parsec_dedup` | 993,941 | **3.80x** (largest) |
 | LOW | `wis_mmap2` | 285,699 | not measured |
 | LOW | `parsec_vips` | 165,053 | **1.34x** |
 
-Span 48x, four of six with demonstrated sensitivity. Excluded: `stressng_dentry`
-and `dbench_16` (flat), `perf_sched_pipe` (bimodal, spread 5.64x over 9 reps),
-`fsmark_tmpfs` and `perf_epoll_wait` (would duplicate the HIGH tier), and the
-five workloads within 2x of background.
+Span 48x. Four have demonstrated Gate-2 sensitivity; `dbench_16` is included
+deliberately as a **negative control** -- it is flat (1.05x) with the cleanest
+measurement in the suite (spread 1.00x), so if the other five respond and it
+does not, a systematic artifact affecting all arms is ruled out. `wis_mmap2`
+is the one arm with neither sensitivity data nor a control role.
+
+Excluded: `nhextend_full` (reserved for the AFL/adaptive-spinning work, not a
+migration workload), `stressng_dentry` (flat, and would duplicate HIGH),
+`perf_sched_pipe` (bimodal, spread 5.64x over 9 reps), `fsmark_tmpfs` and
+`perf_epoll_wait` (would duplicate HIGH), and the five workloads within 2x of
+background.
 
 ## 15.4 Lock rate does not predict the benefit
 
