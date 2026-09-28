@@ -533,6 +533,35 @@ Before tier 2 is deleted, the recorded `tier1+tier2` hackbench win (-3.76%,
 so it was tier 1 alone, or tier 2 acting at a low threshold as an
 unconditional early-bail (a spin-threshold cut, not a detector).
 
+**Head bypass is dead for the SAME reason, and has a second gate on top**
+(measured 2026-09-28). `ivh_head_observe()` applies the identical staleness
+test against `ivh_pv_beat_threshold`, so at the shipped 5 ms it too never
+fires. One hackbench run per threshold:
+
+| `beat_threshold` | obs_samples | obs_stale | held | free_open | actionable | bypass fired | tier2 fired |
+|---|---|---|---|---|---|---|---|
+| 11,000,000 (5 ms) | 1,726,222 | **0** | 0 | 0 | 0 | **0** | 456 |
+| 2,200,000 (1 ms) | 2,189,903 | 23,160 | 1,311 | 21,435 | 414 | 412 | 102,814 |
+| 220,000 (100 us) | 2,180,193 | 97,543 | 13,492 | 83,032 | 1,019 | 1,019 | 356,775 |
+
+The observer itself runs -- 1.7M samples per run -- and dies at the staleness
+test. Two further facts follow from the table:
+
+1. **`ivh_head_bypass_enable=1` is not sufficient.** The bypass code lives
+   inside `ivh_head_observe()`, whose only call site (`qspinlock_paravirt.h`
+   ~2010) is gated on `ivh_head_bypass_probe`, which also defaults to 0. Both
+   sysctls are required before a single bypass can fire.
+2. **The addressable case is ~2% of the opportunity even when tuned to fire.**
+   At 1 ms, 21,435 of 23,160 stale heads are `free_open` -- free AND already
+   stealable, where "a bypass adds nothing" -- against 414 actionable (1.8%).
+   This is the same shape as lock skipping's failure in section 11: the
+   unfair steal valve already covers most of the target case.
+
+Consequence for earlier results: **any arm labelled `t12+bypass` at the shipped
+`beat_threshold` was tier 1 only.** That includes every IVH arm of the point 11
+sweep. The recorded `t12+bypass = +5.73% vs stock PV` must state which
+threshold it ran at before it can be relied on.
+
 ---
 
 ## 5.6 Harnesses
@@ -849,8 +878,31 @@ blocker: at 0 the staleness test falls through to the per-CPU heartbeat arm
 gated on `ivh_pv_beat_threshold` (5 ms), which sits below its own ~3 ms noise
 floor and is documented as dead in 5.5. Both are asserted per arm.
 
-**Head bypass is ON** in every IVH arm, as are tier 1 and tier 2 -- the shipped
-spin-side stack.
+**CORRECTION (2026-09-28, after the sweep).** This sweep's IVH arms were
+configured with tier 1, tier 2 and head bypass all enabled, and are described
+below as "the spin-side stack". They were in fact **TIER 1 ONLY**. Both tier 2
+and head bypass read `ivh_pv_beat_threshold`, shipped at 11,000,000 cycles
+(5 ms), and at that value neither fires. Measured directly, one hackbench run
+per threshold:
+
+| `beat_threshold` | obs_samples | obs_stale | actionable | bypass fired | tier2 fired |
+|---|---|---|---|---|---|
+| 11,000,000 (5 ms, shipped) | 1,726,222 | **0** | 0 | **0** | 456 / 6.3M checks |
+| 2,200,000 (1 ms) | 2,189,903 | 23,160 | 414 | 412 | 102,814 |
+| 220,000 (100 us) | 2,180,193 | 97,543 | 1,019 | 1,019 | 356,775 |
+
+The observer runs (1.7M samples/run); it dies at the staleness test -- at 5 ms
+NO head is ever judged preempted. Head bypass additionally requires
+`ivh_head_bypass_probe=1`, because the bypass code lives inside
+`ivh_head_observe()` whose only call site is gated on that sysctl; it too
+defaults to 0.
+
+Nothing in the point 11 conclusion changes -- the eviction threshold is still
+inert, and that finding rests on eviction counters, not on tier 2 or bypass.
+But wherever this section says the ~+1% throughput common to every arm is
+"tier1+tier2+head bypass", read **tier 1 alone**. Whether tier 2 and bypass
+help at a threshold where they fire is a separate question, measured in the
+t12+bypass sweep.
 
 **Migration is OFF in every arm** (`ivh_universal_eligible=0`, asserted). Lock
 skipping is a queue-ORDER decision; vCPU placement is a separate mechanism whose
@@ -923,9 +975,10 @@ disruption does not terminate at 1 ms; it terminates at zero.
 
 **The ~+1% throughput common to every arm is not eviction.** It appears
 undiminished at the 2 ms arm, which fires 6 evictions per run. It is
-attributable to tier 1 + tier 2 + head bypass, which are on in all IVH arms.
-That is consistent with the recorded t12+bypass result, smaller here because
-uniform host contention gives the spin-side stack less to work with.
+attributable to **tier 1 alone** -- tier 2 and head bypass were enabled but
+fired ~0 and 0 respectively at the shipped 5 ms `beat_threshold`, as the
+correction in 11.1 sets out. This does NOT corroborate the recorded
+t12+bypass result; that configuration was not running here.
 
 ## 11.4 Why: the firing rate
 
