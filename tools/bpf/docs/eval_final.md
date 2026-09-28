@@ -36,6 +36,107 @@ Status legend: **DONE** / **PARTIAL** / **NOT STARTED**
 
 ---
 
+# Appendix A. Exact workload configurations
+
+Every recorded improvement in this file and in
+`ivh_benchmark_campaign_2026-09-15.md` was produced by one of two harnesses.
+Quoting a number against any other invocation is not a reproduction of it.
+
+**Why this appendix exists.** On 2026-09-27 a workload list was assembled from
+`screen/mig_screen.sh` and `campaign/fullstack.sh` instead of from the campaign
+registry. **5 of 19 entries were wrong**, and the errors were not cosmetic:
+`dbench_16` was missing `-F`, so it ran without fsync -- a materially different
+workload from the one that scored +19.1%. `sysbench_mutex` ran 32 threads and
+20,000 locks instead of 16 and 40,000. `schbench` ran `-m 4 -t 4` with an
+extractor matching a different output line. `wis_mmap2` ran `-s 10` instead of
+`-s 15`. `perf_sched_pipe` ran `-l 400000` instead of `-l 300000`.
+`mig_screen.sh` is an EARLIER SCREENING harness (2026-09-14) and its
+invocations differ; it is not the campaign.
+
+## A.1 Set A -- full IVH stack
+
+Source of truth: **`ivh_tools/campaign/benchmarks.tsv`**, the registry the
+campaign harness ran; its 1300 measurements are in
+`campaign/run_main/results.csv`. `dir` is `/root` unless noted.
+Direction `hi` = higher is better, `lo` = wall seconds, lower is better.
+
+| workload | recorded | command | dir |
+|---|---|---|---|
+| `fsmark_tmpfs` | +167.0% | `fs_mark -d /dev/shm/fsmark -D 16 -n 2000 -s 4096 -t 16 -L 1` | hi |
+| `perf_sched_pipe` | +146.9% | `perf bench sched pipe -l 300000` | hi |
+| `ebizzy_mmap` | +104.3% | `/home/nick/Desktop/ebizzy -S 15 -t 16 -m -s 4194304` | hi |
+| `stressng_dentry` | +99.5% | `stress-ng --dentry 16 -t 15s --metrics-brief` | hi |
+| `hackbench_pipe_thr` | +76.3% | `hackbench -T -g1 -f8 -l150000` | lo |
+| `hackbench_sock_thr` | +75.4% | `hackbench -T -s 512 -g1 -f8 -l100000` | lo |
+| `hackbench_pipe_proc` | +61.8% | `hackbench -p -g1 -f8 -l150000` | lo |
+| `perf_epoll_wait` | +53.9% | `perf bench epoll wait -t 16 -r 15` | hi |
+| `stressng_flock` | +44.2% | `stress-ng --flock 16 -t 15s --metrics-brief` | hi |
+| `sysbench_mutex` | +24.4% | `sysbench mutex --threads=16 --mutex-num=16 --mutex-locks=40000 run` | lo |
+| `stressng_mmap` | +23.4% | `stress-ng --mmap 16 -t 15s --metrics-brief` | hi |
+| `stressng_sock` | +19.7% | `stress-ng --sock 16 -t 15s --metrics-brief` | hi |
+| `dbench_16` | +19.1% | `dbench -F -t 15 16 -D /root/dbench_test` | hi |
+| `stressng_pipe` | +15.8% | `stress-ng --pipe 16 -t 15s --metrics-brief` | hi |
+| `wis_mmap2` | +11.2% | `./mmap2_threads -t 16 -s 15` *(cwd `/root/bench/will-it-scale`)* | hi |
+| `wis_mmap1` | +10.9% | `./mmap1_threads -t 16 -s 15` *(cwd `/root/bench/will-it-scale`)* | hi |
+| `stressng_futex` | +10.5% | `stress-ng --futex 16 -t 15s --metrics-brief` | hi |
+| `perf_syscall_basic` | +8.7% | `perf bench syscall basic -l 30000000` | hi |
+| `schbench` | +7.4% | `bash -c '/root/bench/schbench/schbench -m 2 -t 8 -r 15 2>&1'` | hi |
+
+## A.2 Set B -- migration alone
+
+Source of truth: **`ivh_tools/parsec_ab.sh`** driven by `parsec_redo.sh`, with
+`PKGS=<pkg> PAIRS=6 NTH=16 INPUT=native CFG=gcc`. **Input size is `native`,
+the largest PARSEC input**, on all 8 packages.
+
+| workload | recorded | command |
+|---|---|---|
+| `parsec_<pkg>` | see 10.2 | `cd /root/parsec-benchmark && ./bin/parsecmgmt -a run -p <pkg> -c gcc -i native -n 16`, timed with `date +%s.%N` |
+| `psearchy` | +0.82% ns | `cd /root/mosbench/psearchy && ./mkdb/pedsort -t /root/psearchy_db/db -c 16 -m 512 < files_6x` |
+| `tinyconfig` | +0.99% | `rm -rf $BUILD; make -C /root/kernels/linux-6.14-stock O=$BUILD tinyconfig` then time `make -C ... O=$BUILD -j16 vmlinux` |
+
+Packages, in the order `parsec_redo.sh` runs them: dedup, vips, blackscholes,
+swaptions, freqmine, ferret, canneal, bodytrack.
+
+Set B arms are NOT Set A arms: both arms are `spin_mode 1` (stock PV) with
+`ivh_pv_preempt_src=0`, and `ivh_universal_eligible` is the only variable.
+`drop_caches` before every run is mandatory -- without it the second arm of
+each pair reads a page cache the first warmed, which on dedup (large ISO read)
+alone manufactured a bogus +88%.
+
+`tinyconfig` must wipe the build directory and build the `vmlinux` target.
+Without the wipe, `make` finds nothing to do and returns in ~0.5 s having built
+nothing.
+
+## A.4 Scaled variants (PV arm >= 5 s)
+
+Two confirmed wins run under a second at their campaign invocation, too short
+for a stable throughput delta. Scaled linearly and re-confirmed against stock
+PV -- 5 pairs, arm order alternated, warmup discarded, 2026-09-28:
+
+| workload | campaign | PV | scaled | PV | IVH vs PV | pairs | t |
+|---|---|---|---|---|---|---|---|
+| `fsmark_tmpfs` | `-n 2000` | 0.48 s | **`-n 30000`** | 5.64 s | **+208.8%** thr | 5/5 | 24.96 |
+| `sysbench_mutex` | `--mutex-locks=40000` | 0.59 s | **`--mutex-locks=600000`** | 5.91 s | **+19.8%** time | 5/5 | 21.23 |
+
+Both remain decisive wins at the larger size. sysbench's migration counts
+(2,940-3,469 per IVH run, exactly 0 per PV run) confirm the mechanism engaged.
+fs_mark at `-n 30000` needs 1,875 MB in `/dev/shm`.
+
+**The ratio is not exactly scale-invariant** -- fs_mark 167 -> 209%, sysbench
+24.4 -> 19.8% -- so quote these against their own config rather than as a
+reproduction of the campaign figure. They are nonetheless far better measured:
+t=24.96 and t=21.23 here, against sub-second runs that spanned +173.6% to
++224.9% on fs_mark within a single day.
+
+---
+
+## A.3 Registry
+
+`/root/ivh_tools/ivh_benchmarks.sh` carries both sets, Set A generated verbatim
+from `benchmarks.tsv`. Use it rather than re-deriving invocations.
+
+---
+
 # 5. TSC accuracy
 
 **The claim.** On a confidential VM with no steal-time and
