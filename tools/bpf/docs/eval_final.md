@@ -49,11 +49,11 @@ only tool-invocation variants were collapsed.
 |---|---|---|---|
 | `stressng_dentry` | stress-ng | +99.5% | `stress-ng --dentry 16 -t 15s --metrics-brief` |
 | `hackbench_pipe_thr` | hackbench | +76.3% | `hackbench -T -g1 -f8 -l150000` |
-| `sysbench_mutex` | sysbench | +24.4% | `sysbench mutex --threads=16 --mutex-num=16 --mutex-locks=40000 run` |
+| `sysbench_mutex` | sysbench | **+19.8%** ‡ | `sysbench mutex --threads=16 --mutex-num=16 --mutex-locks=600000 run` |
 | `ebizzy_mmap` | ebizzy | +104.3% | `/home/nick/Desktop/ebizzy -S 15 -t 16 -m -s 4194304` |
 | `nhextend_full` | NHextend | +64.0% | `NHEXTEND_DURATION=8 NHEXTEND_LOOP_SPIN=5000 /root/linux-6.17/NHextend-full -n 16` |
 | `dbench_16` | dbench | +19.1% | `dbench -F -t 15 16 -D /root/dbench_test` |
-| `fsmark_tmpfs` | fs_mark | +167.0% | `fs_mark -d /dev/shm/fsmark -D 16 -n 2000 -s 4096 -t 16 -L 1` |
+| `fsmark_tmpfs` | fs_mark | **+208.8%** ‡ | `fs_mark -d /dev/shm/fsmark -D 16 -n 30000 -s 4096 -t 16 -L 1` |
 | `wis_mmap2` | will-it-scale | +11.2% | `./mmap2_threads -t 16 -s 15`<br>*(cwd `/root/bench/will-it-scale`)* |
 | `parsec_vips` | PARSEC | +57.39% | `./bin/parsecmgmt -a run -p vips -c gcc -i native -n 16`<br>*(cwd `/root/parsec-benchmark`)* |
 | `parsec_bodytrack` | PARSEC | +14.39% | `./bin/parsecmgmt -a run -p bodytrack -c gcc -i native -n 16`<br>*(cwd `/root/parsec-benchmark`)* |
@@ -105,28 +105,50 @@ matching a different output line, `wis_mmap2` at `-s 10` instead of `-s 15`,
 `perf_sched_pipe` at `-l 400000` instead of `-l 300000`. `mig_screen.sh` is an
 earlier screening harness (2026-09-14), not the campaign.
 
-## A.1 Scaled variants (PV arm >= 5 s)
+## A.1 ‡ Two workloads are run at a scaled size
 
-Two workloads run under a second at their recorded invocation, too short for a
-stable throughput delta. Scaled linearly and re-confirmed against stock PV --
-5 pairs, order alternated, warmup discarded, 2026-09-28:
+`fsmark_tmpfs` and `sysbench_mutex` complete in under a second at their
+campaign invocation -- too short for a stable throughput delta, where startup
+and `drop_caches` refill are a large fraction of the run. **The suite table
+above lists the SCALED configuration for both**; the campaign invocation is
+kept here for provenance.
 
-| workload | recorded cfg | PV | scaled cfg | PV | IVH vs PV | pairs | t |
+| workload | campaign cfg | PV | **suite cfg** | PV | IVH vs PV | pairs | t |
 |---|---|---|---|---|---|---|---|
 | `fsmark_tmpfs` | `-n 2000` | 0.48 s | **`-n 30000`** | 5.64 s | **+208.8%** thr | 5/5 | 24.96 |
 | `sysbench_mutex` | `--mutex-locks=40000` | 0.59 s | **`--mutex-locks=600000`** | 5.91 s | **+19.8%** time | 5/5 | 21.23 |
 
-Both remain decisive wins at the larger size; sysbench's migration counts
-(2,940-3,469 per IVH run, 0 per PV run) confirm the mechanism engaged. fs_mark
-at `-n 30000` needs 1,875 MB in `/dev/shm`.
+Re-confirmed against stock PV, 5 pairs, order alternated, warmup discarded,
+2026-09-28. sysbench's migration counts (2,940-3,469 per IVH run, 0 per PV run)
+confirm the mechanism engaged. fs_mark at `-n 30000` needs 1,875 MB in
+`/dev/shm`.
 
-**The ratio is not exactly scale-invariant** (fs_mark 167 -> 209%, sysbench
-24.4 -> 19.8%), so quote these against their own config, not as a reproduction
-of the recorded figure. They are nonetheless far better measured: t=24.96 and
-t=21.23, against sub-second runs that spanned +173.6% to +224.9% on fs_mark
-within one day.
+**The ratio is not exactly scale-invariant** -- fs_mark's recorded +167.0%
+becomes +208.8%, sysbench's +24.4% becomes +19.8% -- which is why the suite
+table quotes the SCALED figures, not the campaign ones. They are also far
+better measured: t=24.96 and t=21.23, against sub-second runs that spanned
++173.6% to +224.9% on fs_mark within a single day.
 
-## A.2 Registry
+Lock rates in section 15 are measured at the scaled configs and barely move:
+fs_mark 5,598 -> 4,672 /s, sysbench 13,390 -> 15,754 /s. No stratum changes.
+
+## A.2 Thread counts
+
+15 of 16 workloads run **16 threads/workers/clients**: `--dentry 16`,
+`-T -g1 -f8` (1 group x 8 fds = 16 tasks), `--threads=16`, `-t 16`, `-n 16`,
+`dbench ... 16`, `-m 2 -t 8`.
+
+**`perf_sched_pipe` is the exception and cannot be made 16-threaded.** perf
+6.14.11 describes it as *"Benchmark for pipe() between two processes"*, and its
+entire option set is `-G/--cgroups`, `-l/--loop`, `-n/--nonblocking`,
+`-T/--threaded`. There is no pair or instance count, so 8 pairs is not
+reachable from within the tool. Running 8 concurrent instances would give 16
+threads but is not the recorded benchmark and would not be comparable to its
++146.9%. If a uniformly 16-threaded suite is required, the substitute from the
+same family is `perf bench epoll wait -t 16 -r 15` (+53.9%, natively 16
+threads), which was collapsed out as the second-best perf-bench member.
+
+## A.3 Registry
 
 `/root/ivh_tools/ivh_benchmarks.sh` carries the suite, the collapsed
 within-family entries, and the scaled variants. Use it rather than
@@ -647,10 +669,10 @@ PV-arm rate; `PV s` is the PV-arm duration at the recorded config.
 |---|---|---|---|---|
 | `stressng_dentry` | 570,785 | 16.1 | +99.5% | settled |
 | `hackbench_pipe_thr` | 181,050 | 19.0 | +76.3% | settled |
-| `sysbench_mutex` | 13,390 | 0.59 | +24.4% | SCALED for >=5s: --mutex-locks=600000 -> 5.91s, +19.8% 5/5 t=21.23 |
+| `sysbench_mutex` | 15,754 | 6.3 | +19.8% ‡ | scaled cfg (`--mutex-locks=600000`) |
 | `ebizzy_mmap` | 13,387 | 15.3 | +104.3% | settled |
 | `dbench_16` | 7,388 | 18.4 | +19.1% | settled |
-| `fsmark_tmpfs` | 5,598 | 0.48 | +167.0% | SCALED for >=5s: -n 30000 -> 5.64s, +208.8% 5/5 t=24.96 |
+| `fsmark_tmpfs` | 4,672 | 8.1 | +208.8% ‡ | scaled cfg (`-n 30000`) |
 | `wis_mmap2` | 3,412 | 21.4 | +11.2% | settled |
 | `perf_sched_pipe` | 361 | 18.7 | +146.9% | BIMODAL 356/361/5111 -- exclude from sweeps |
 | `schbench` | 291 | 15.4 | +7.4% | settled |
