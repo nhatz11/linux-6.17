@@ -1,0 +1,165 @@
+
+#  fs_mark  -d  /dev/shm/fsmark  -D  16  -n  2000  -s  4096  -t  16  -L  1 
+#	Version 3.3, 16 thread(s) starting at Sun Sep 27 10:33:51 2026
+#	Sync method: INBAND FSYNC: fsync() per file in write loop.
+#	Directories:  Time based hash between directories across 16 subdirectories with 180 seconds per subdirectory.
+#	File names: 40 bytes long, (16 initial bytes of time stamp with 24 random bytes at end of name)
+#	Files info: size 4096 bytes, written with an IO size of 16384 bytes per write
+#	App overhead is time in microseconds spent in the test not doing file writing related system calls.
+#
+FSUse%        Count         Size    Files/sec     App Overhead
+     1        32000         4096     267699.8           166648
+
+#  fs_mark  -d  /dev/shm/fsmark  -D  16  -n  2000  -s  4096  -t  16  -L  1 
+#	Version 3.3, 16 thread(s) starting at Sun Sep 27 10:33:52 2026
+#	Sync method: INBAND FSYNC: fsync() per file in write loop.
+#	Directories:  Time based hash between directories across 16 subdirectories with 180 seconds per subdirectory.
+#	File names: 40 bytes long, (16 initial bytes of time stamp with 24 random bytes at end of name)
+#	Files info: size 4096 bytes, written with an IO size of 16384 bytes per write
+#	App overhead is time in microseconds spent in the test not doing file writing related system calls.
+#
+FSUse%        Count         Size    Files/sec     App Overhead
+     1        32000         4096     104996.0           168067
+
+#  fs_mark  -d  /dev/shm/fsmark  -D  16  -n  2000  -s  4096  -t  16  -L  1 
+#	Version 3.3, 16 thread(s) starting at Sun Sep 27 10:33:54 2026
+#	Sync method: INBAND FSYNC: fsync() per file in write loop.
+#	Directories:  Time based hash between directories across 16 subdirectories with 180 seconds per subdirectory.
+#	File names: 40 bytes long, (16 initial bytes of time stamp with 24 random bytes at end of name)
+#	Files info: size 4096 bytes, written with an IO size of 16384 bytes per write
+#	App overhead is time in microseconds spent in the test not doing file writing related system calls.
+#
+FSUse%        Count         Size    Files/sec     App Overhead
+     1        32000         4096     419531.6           144327
+
+#  fs_mark  -d  /dev/shm/fsmark  -D  16  -n  2000  -s  4096  -t  16  -L  1 
+#	Version 3.3, 16 thread(s) starting at Sun Sep 27 10:33:56 2026
+#	Sync method: INBAND FSYNC: fsync() per file in write loop.
+#	Directories:  Time based hash between directories across 16 subdirectories with 180 seconds per subdirectory.
+#	File names: 40 bytes long, (16 initial bytes of time stamp with 24 random bytes at end of name)
+#	Files info: size 4096 bytes, written with an IO size of 16384 bytes per write
+#	App overhead is time in microseconds spent in the test not doing file writing related system calls.
+#
+FSUse%        Count         Size    Files/sec     App Overhead
+     1        32000         4096     107729.9           316446
+
+#  fs_mark  -d  /dev/shm/fsmark  -D  16  -n  2000  -s  4096  -t  16  -L  1 
+#	Version 3.3, 16 thread(s) starting at Sun Sep 27 10:33:57 2026
+#	Sync method: INBAND FSYNC: fsync() per file in write loop.
+#	Directories:  Time based hash between directories across 16 subdirectories with 180 seconds per subdirectory.
+#	File names: 40 bytes long, (16 initial bytes of time stamp with 24 random bytes at end of name)
+#	Files info: size 4096 bytes, written with an IO size of 16384 bytes per write
+#	App overhead is time in microseconds spent in the test not doing file writing related system calls.
+#
+FSUse%        Count         Size    Files/sec     App Overhead
+     1        32000         4096     418066.1           193662
+
+#  fs_mark  -d  /dev/shm/fsmark  -D  16  -n  2000  -s  4096  -t  16  -L  1 
+#	Version 3.3, 16 thread(s) starting at Sun Sep 27 10:33:59 2026
+#	Sync method: INBAND FSYNC: fsync() per file in write loop.
+#	Directories:  Time based hash between directories across 16 subdirectories with 180 seconds per subdirectory.
+#	File names: 40 bytes long, (16 initial bytes of time stamp with 24 random bytes at end of name)
+#	Files info: size 4096 bytes, written with an IO size of 16384 bytes per write
+#	App overhead is time in microseconds spent in the test not doing file writing related system calls.
+#
+FSUse%        Count         Size    Files/sec     App Overhead
+     1        32000         4096     113055.3           190887
+
+#  fs_mark  -d  /dev/shm/fsmark  -D  16  -n  2000  -s  4096  -t  16  -L  1 
+#	Version 3.3, 16 thread(s) starting at Sun Sep 27 10:34:01 2026
+#	Sync method: INBAND FSYNC: fsync() per file in write loop.
+#	Directories:  Time based hash between directories across 16 subdirectories with 180 seconds per subdirectory.
+#	File names: 40 bytes long, (16 initial bytes of time stamp with 24 random bytes at end of name)
+#	Files info: size 4096 bytes, written with an IO size of 16384 bytes per write
+#	App overhead is time in microseconds spent in the test not doing file writing related system calls.
+#
+FSUse%        Count         Size    Files/sec     App Overhead
+     1        32000         4096     383506.3           131128
+
+#  fs_mark  -d  /dev/shm/fsmark  -D  16  -n  2000  -s  4096  -t  16  -L  1 
+#	Version 3.3, 16 thread(s) starting at Sun Sep 27 10:34:02 2026
+#	Sync method: INBAND FSYNC: fsync() per file in write loop.
+#	Directories:  Time based hash between directories across 16 subdirectories with 180 seconds per subdirectory.
+#	File names: 40 bytes long, (16 initial bytes of time stamp with 24 random bytes at end of name)
+#	Files info: size 4096 bytes, written with an IO size of 16384 bytes per write
+#	App overhead is time in microseconds spent in the test not doing file writing related system calls.
+#
+FSUse%        Count         Size    Files/sec     App Overhead
+     1        32000         4096     137296.8           343667
+
+#  fs_mark  -d  /dev/shm/fsmark  -D  16  -n  2000  -s  4096  -t  16  -L  1 
+#	Version 3.3, 16 thread(s) starting at Sun Sep 27 10:34:04 2026
+#	Sync method: INBAND FSYNC: fsync() per file in write loop.
+#	Directories:  Time based hash between directories across 16 subdirectories with 180 seconds per subdirectory.
+#	File names: 40 bytes long, (16 initial bytes of time stamp with 24 random bytes at end of name)
+#	Files info: size 4096 bytes, written with an IO size of 16384 bytes per write
+#	App overhead is time in microseconds spent in the test not doing file writing related system calls.
+#
+FSUse%        Count         Size    Files/sec     App Overhead
+     1        32000         4096     349949.2            97010
+
+#  fs_mark  -d  /dev/shm/fsmark  -D  16  -n  2000  -s  4096  -t  16  -L  1 
+#	Version 3.3, 16 thread(s) starting at Sun Sep 27 10:34:05 2026
+#	Sync method: INBAND FSYNC: fsync() per file in write loop.
+#	Directories:  Time based hash between directories across 16 subdirectories with 180 seconds per subdirectory.
+#	File names: 40 bytes long, (16 initial bytes of time stamp with 24 random bytes at end of name)
+#	Files info: size 4096 bytes, written with an IO size of 16384 bytes per write
+#	App overhead is time in microseconds spent in the test not doing file writing related system calls.
+#
+FSUse%        Count         Size    Files/sec     App Overhead
+     1        32000         4096     125899.2           315418
+
+#  fs_mark  -d  /dev/shm/fsmark  -D  16  -n  2000  -s  4096  -t  16  -L  1 
+#	Version 3.3, 16 thread(s) starting at Mon Sep 28 00:00:40 2026
+#	Sync method: INBAND FSYNC: fsync() per file in write loop.
+#	Directories:  Time based hash between directories across 16 subdirectories with 180 seconds per subdirectory.
+#	File names: 40 bytes long, (16 initial bytes of time stamp with 24 random bytes at end of name)
+#	Files info: size 4096 bytes, written with an IO size of 16384 bytes per write
+#	App overhead is time in microseconds spent in the test not doing file writing related system calls.
+#
+FSUse%        Count         Size    Files/sec     App Overhead
+     1        32000         4096     107750.4           157245
+
+#  fs_mark  -d  /dev/shm/fsmark  -D  16  -n  10000  -s  4096  -t  16  -L  1 
+#	Version 3.3, 16 thread(s) starting at Mon Sep 28 00:00:40 2026
+#	Sync method: INBAND FSYNC: fsync() per file in write loop.
+#	Directories:  Time based hash between directories across 16 subdirectories with 180 seconds per subdirectory.
+#	File names: 40 bytes long, (16 initial bytes of time stamp with 24 random bytes at end of name)
+#	Files info: size 4096 bytes, written with an IO size of 16384 bytes per write
+#	App overhead is time in microseconds spent in the test not doing file writing related system calls.
+#
+FSUse%        Count         Size    Files/sec     App Overhead
+     8       160000         4096     102365.4          1001861
+
+#  fs_mark  -d  /dev/shm/fsmark  -D  16  -n  20000  -s  4096  -t  16  -L  1 
+#	Version 3.3, 16 thread(s) starting at Mon Sep 28 00:00:43 2026
+#	Sync method: INBAND FSYNC: fsync() per file in write loop.
+#	Directories:  Time based hash between directories across 16 subdirectories with 180 seconds per subdirectory.
+#	File names: 40 bytes long, (16 initial bytes of time stamp with 24 random bytes at end of name)
+#	Files info: size 4096 bytes, written with an IO size of 16384 bytes per write
+#	App overhead is time in microseconds spent in the test not doing file writing related system calls.
+#
+FSUse%        Count         Size    Files/sec     App Overhead
+    16       320000         4096      99808.4          2798604
+
+#  fs_mark  -d  /dev/shm/fsmark  -D  16  -n  30000  -s  4096  -t  16  -L  1 
+#	Version 3.3, 16 thread(s) starting at Mon Sep 28 00:01:03 2026
+#	Sync method: INBAND FSYNC: fsync() per file in write loop.
+#	Directories:  Time based hash between directories across 16 subdirectories with 180 seconds per subdirectory.
+#	File names: 40 bytes long, (16 initial bytes of time stamp with 24 random bytes at end of name)
+#	Files info: size 4096 bytes, written with an IO size of 16384 bytes per write
+#	App overhead is time in microseconds spent in the test not doing file writing related system calls.
+#
+FSUse%        Count         Size    Files/sec     App Overhead
+    25       480000         4096      88523.1          3366081
+
+#  fs_mark  -d  /dev/shm/fsmark  -D  16  -n  35000  -s  4096  -t  16  -L  1 
+#	Version 3.3, 16 thread(s) starting at Mon Sep 28 00:01:10 2026
+#	Sync method: INBAND FSYNC: fsync() per file in write loop.
+#	Directories:  Time based hash between directories across 16 subdirectories with 180 seconds per subdirectory.
+#	File names: 40 bytes long, (16 initial bytes of time stamp with 24 random bytes at end of name)
+#	Files info: size 4096 bytes, written with an IO size of 16384 bytes per write
+#	App overhead is time in microseconds spent in the test not doing file writing related system calls.
+#
+FSUse%        Count         Size    Files/sec     App Overhead
+    29       560000         4096      93186.7          3715521
