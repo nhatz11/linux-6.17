@@ -36,108 +36,93 @@ Status legend: **DONE** / **PARTIAL** / **NOT STARTED**
 
 ---
 
-# Appendix A. Exact workload configurations
+# Appendix A. The benchmark suite -- 15 workloads, exact configurations
 
-Every recorded improvement in this file and in
-`ivh_benchmark_campaign_2026-09-15.md` was produced by one of two harnesses.
-Quoting a number against any other invocation is not a reproduction of it.
+**One workload per family.** Set A (full IVH stack) and Set B (migration
+alone) are merged here into a single suite: these are the workloads that show
+a benefit, regardless of which arm configuration demonstrated it. Where a
+family had several members only the strongest is kept. PARSEC packages are
+separate APPLICATIONS, not variants of one tool, so they count individually;
+only tool-invocation variants were collapsed.
 
-**Why this appendix exists.** On 2026-09-27 a workload list was assembled from
-`screen/mig_screen.sh` and `campaign/fullstack.sh` instead of from the campaign
-registry. **5 of 19 entries were wrong**, and the errors were not cosmetic:
-`dbench_16` was missing `-F`, so it ran without fsync -- a materially different
-workload from the one that scored +19.1%. `sysbench_mutex` ran 32 threads and
-20,000 locks instead of 16 and 40,000. `schbench` ran `-m 4 -t 4` with an
-extractor matching a different output line. `wis_mmap2` ran `-s 10` instead of
-`-s 15`. `perf_sched_pipe` ran `-l 400000` instead of `-l 300000`.
-`mig_screen.sh` is an EARLIER SCREENING harness (2026-09-14) and its
-invocations differ; it is not the campaign.
-
-## A.1 Set A -- full IVH stack
-
-Source of truth: **`ivh_tools/campaign/benchmarks.tsv`**, the registry the
-campaign harness ran; its 1300 measurements are in
-`campaign/run_main/results.csv`. `dir` is `/root` unless noted.
-Direction `hi` = higher is better, `lo` = wall seconds, lower is better.
-
-| workload | recorded | command | dir |
+| workload | family | recorded | command |
 |---|---|---|---|
-| `fsmark_tmpfs` | +167.0% | `fs_mark -d /dev/shm/fsmark -D 16 -n 2000 -s 4096 -t 16 -L 1` | hi |
-| `perf_sched_pipe` | +146.9% | `perf bench sched pipe -l 300000` | hi |
-| `ebizzy_mmap` | +104.3% | `/home/nick/Desktop/ebizzy -S 15 -t 16 -m -s 4194304` | hi |
-| `stressng_dentry` | +99.5% | `stress-ng --dentry 16 -t 15s --metrics-brief` | hi |
-| `hackbench_pipe_thr` | +76.3% | `hackbench -T -g1 -f8 -l150000` | lo |
-| `hackbench_sock_thr` | +75.4% | `hackbench -T -s 512 -g1 -f8 -l100000` | lo |
-| `hackbench_pipe_proc` | +61.8% | `hackbench -p -g1 -f8 -l150000` | lo |
-| `perf_epoll_wait` | +53.9% | `perf bench epoll wait -t 16 -r 15` | hi |
-| `stressng_flock` | +44.2% | `stress-ng --flock 16 -t 15s --metrics-brief` | hi |
-| `sysbench_mutex` | +24.4% | `sysbench mutex --threads=16 --mutex-num=16 --mutex-locks=40000 run` | lo |
-| `stressng_mmap` | +23.4% | `stress-ng --mmap 16 -t 15s --metrics-brief` | hi |
-| `stressng_sock` | +19.7% | `stress-ng --sock 16 -t 15s --metrics-brief` | hi |
-| `dbench_16` | +19.1% | `dbench -F -t 15 16 -D /root/dbench_test` | hi |
-| `stressng_pipe` | +15.8% | `stress-ng --pipe 16 -t 15s --metrics-brief` | hi |
-| `wis_mmap2` | +11.2% | `./mmap2_threads -t 16 -s 15` *(cwd `/root/bench/will-it-scale`)* | hi |
-| `wis_mmap1` | +10.9% | `./mmap1_threads -t 16 -s 15` *(cwd `/root/bench/will-it-scale`)* | hi |
-| `stressng_futex` | +10.5% | `stress-ng --futex 16 -t 15s --metrics-brief` | hi |
-| `perf_syscall_basic` | +8.7% | `perf bench syscall basic -l 30000000` | hi |
-| `schbench` | +7.4% | `bash -c '/root/bench/schbench/schbench -m 2 -t 8 -r 15 2>&1'` | hi |
+| `stressng_dentry` | stress-ng | +99.5% | `stress-ng --dentry 16 -t 15s --metrics-brief` |
+| `hackbench_pipe_thr` | hackbench | +76.3% | `hackbench -T -g1 -f8 -l150000` |
+| `sysbench_mutex` | sysbench | +24.4% | `sysbench mutex --threads=16 --mutex-num=16 --mutex-locks=40000 run` |
+| `ebizzy_mmap` | ebizzy | +104.3% | `/home/nick/Desktop/ebizzy -S 15 -t 16 -m -s 4194304` |
+| `nhextend_full` | NHextend | +64.0% | `NHEXTEND_DURATION=8 NHEXTEND_LOOP_SPIN=5000 /root/linux-6.17/NHextend-full -n 16` |
+| `dbench_16` | dbench | +19.1% | `dbench -F -t 15 16 -D /root/dbench_test` |
+| `fsmark_tmpfs` | fs_mark | +167.0% | `fs_mark -d /dev/shm/fsmark -D 16 -n 2000 -s 4096 -t 16 -L 1` |
+| `wis_mmap2` | will-it-scale | +11.2% | `./mmap2_threads -t 16 -s 15`<br>*(cwd `/root/bench/will-it-scale`)* |
+| `parsec_vips` | PARSEC | +57.39% | `./bin/parsecmgmt -a run -p vips -c gcc -i native -n 16`<br>*(cwd `/root/parsec-benchmark`)* |
+| `parsec_bodytrack` | PARSEC | +14.39% | `./bin/parsecmgmt -a run -p bodytrack -c gcc -i native -n 16`<br>*(cwd `/root/parsec-benchmark`)* |
+| `parsec_dedup` | PARSEC | +86.86% | `./bin/parsecmgmt -a run -p dedup -c gcc -i native -n 16`<br>*(cwd `/root/parsec-benchmark`)* |
+| `perf_sched_pipe` | perf-bench | +146.9% | `perf bench sched pipe -l 300000` |
+| `schbench` | schbench | +7.4% | `bash -c '/root/bench/schbench/schbench -m 2 -t 8 -r 15 2>&1'` |
+| `parsec_swaptions` | PARSEC | +10.43% | `./bin/parsecmgmt -a run -p swaptions -c gcc -i native -n 16`<br>*(cwd `/root/parsec-benchmark`)* |
+| `parsec_ferret` | PARSEC | +15.21% | `./bin/parsecmgmt -a run -p ferret -c gcc -i native -n 16`<br>*(cwd `/root/parsec-benchmark`)* |
 
-## A.2 Set B -- migration alone
+**Collapsed within family** (kept in `ivh_tools/ivh_benchmarks.sh`, not in the
+suite): perf-bench epoll_wait +53.9 / syscall_basic +8.7; stress-ng flock
++44.2 / mmap +23.4 / sock +19.7 / pipe +15.8 / futex +10.5; hackbench sock_thr
++75.4 / pipe_proc +61.8; will-it-scale mmap1 +10.9; PARSEC freqmine +4.96
+(below the +5% bar) / blackscholes / canneal.
 
-Source of truth: **`ivh_tools/parsec_ab.sh`** driven by `parsec_redo.sh`, with
-`PKGS=<pkg> PAIRS=6 NTH=16 INPUT=native CFG=gcc`. **Input size is `native`,
-the largest PARSEC input**, on all 8 packages.
+**Two arm configurations produced these numbers, and they are not the same.**
+Rows measured under the full IVH stack: stressng_dentry, hackbench_pipe_thr,
+sysbench_mutex, ebizzy_mmap, dbench_16, fsmark_tmpfs, wis_mmap2,
+perf_sched_pipe, schbench. Rows measured with **migration alone** (both arms
+`spin_mode 1`, `ivh_pv_preempt_src=0`, `ivh_universal_eligible` the only
+variable): all five PARSEC packages. `nhextend_full` is a third contrast
+entirely -- AFL vs spin-only, not IVH vs PV. A combined results table must say
+which arm produced which row.
 
-| workload | recorded | command |
-|---|---|---|
-| `parsec_<pkg>` | see 10.2 | `cd /root/parsec-benchmark && ./bin/parsecmgmt -a run -p <pkg> -c gcc -i native -n 16`, timed with `date +%s.%N` |
-| `psearchy` | +0.82% ns | `cd /root/mosbench/psearchy && ./mkdb/pedsort -t /root/psearchy_db/db -c 16 -m 512 < files_6x` |
-| `tinyconfig` | +0.99% | `rm -rf $BUILD; make -C /root/kernels/linux-6.14-stock O=$BUILD tinyconfig` then time `make -C ... O=$BUILD -j16 vmlinux` |
+**Sources of truth.** `ivh_tools/campaign/benchmarks.tsv` for the non-PARSEC
+rows (the registry the campaign harness ran; 1300 measurements in
+`campaign/run_main/results.csv`). `ivh_tools/parsec_ab.sh` driven by
+`parsec_redo.sh` for PARSEC, with `PAIRS=6 NTH=16 INPUT=native CFG=gcc` --
+**`native` is the largest PARSEC input**. `drop_caches` before every PARSEC
+run is mandatory; without it the second arm of each pair reads a page cache
+the first warmed, which on dedup alone manufactured a bogus +88%.
 
-Packages, in the order `parsec_redo.sh` runs them: dedup, vips, blackscholes,
-swaptions, freqmine, ferret, canneal, bodytrack.
+**Why this appendix exists.** A workload list assembled on 2026-09-27 from
+`screen/mig_screen.sh` and `campaign/fullstack.sh` had **5 of 19 entries
+wrong**: `dbench_16` missing `-F` (no fsync -- a materially different workload
+from the one that scored +19.1%), `sysbench_mutex` at 32 threads / 20,000
+locks instead of 16 / 40,000, `schbench` at `-m 4 -t 4` with an extractor
+matching a different output line, `wis_mmap2` at `-s 10` instead of `-s 15`,
+`perf_sched_pipe` at `-l 400000` instead of `-l 300000`. `mig_screen.sh` is an
+earlier screening harness (2026-09-14), not the campaign.
 
-Set B arms are NOT Set A arms: both arms are `spin_mode 1` (stock PV) with
-`ivh_pv_preempt_src=0`, and `ivh_universal_eligible` is the only variable.
-`drop_caches` before every run is mandatory -- without it the second arm of
-each pair reads a page cache the first warmed, which on dedup (large ISO read)
-alone manufactured a bogus +88%.
+## A.1 Scaled variants (PV arm >= 5 s)
 
-`tinyconfig` must wipe the build directory and build the `vmlinux` target.
-Without the wipe, `make` finds nothing to do and returns in ~0.5 s having built
-nothing.
+Two workloads run under a second at their recorded invocation, too short for a
+stable throughput delta. Scaled linearly and re-confirmed against stock PV --
+5 pairs, order alternated, warmup discarded, 2026-09-28:
 
-## A.3 Registry
-
-`/root/ivh_tools/ivh_benchmarks.sh` carries both sets, Set A generated verbatim
-from `benchmarks.tsv`. Use it rather than re-deriving invocations.
-
----
-## A.4 Scaled variants (PV arm >= 5 s)
-
-Two confirmed wins run under a second at their campaign invocation, too short
-for a stable throughput delta. Scaled linearly and re-confirmed against stock
-PV -- 5 pairs, arm order alternated, warmup discarded, 2026-09-28:
-
-| workload | campaign | PV | scaled | PV | IVH vs PV | pairs | t |
+| workload | recorded cfg | PV | scaled cfg | PV | IVH vs PV | pairs | t |
 |---|---|---|---|---|---|---|---|
 | `fsmark_tmpfs` | `-n 2000` | 0.48 s | **`-n 30000`** | 5.64 s | **+208.8%** thr | 5/5 | 24.96 |
 | `sysbench_mutex` | `--mutex-locks=40000` | 0.59 s | **`--mutex-locks=600000`** | 5.91 s | **+19.8%** time | 5/5 | 21.23 |
 
-Both remain decisive wins at the larger size. sysbench's migration counts
-(2,940-3,469 per IVH run, exactly 0 per PV run) confirm the mechanism engaged.
-fs_mark at `-n 30000` needs 1,875 MB in `/dev/shm`.
+Both remain decisive wins at the larger size; sysbench's migration counts
+(2,940-3,469 per IVH run, 0 per PV run) confirm the mechanism engaged. fs_mark
+at `-n 30000` needs 1,875 MB in `/dev/shm`.
 
-**The ratio is not exactly scale-invariant** -- fs_mark 167 -> 209%, sysbench
-24.4 -> 19.8% -- so quote these against their own config rather than as a
-reproduction of the campaign figure. They are nonetheless far better measured:
-t=24.96 and t=21.23 here, against sub-second runs that spanned +173.6% to
-+224.9% on fs_mark within a single day.
+**The ratio is not exactly scale-invariant** (fs_mark 167 -> 209%, sysbench
+24.4 -> 19.8%), so quote these against their own config, not as a reproduction
+of the recorded figure. They are nonetheless far better measured: t=24.96 and
+t=21.23, against sub-second runs that spanned +173.6% to +224.9% on fs_mark
+within one day.
+
+## A.2 Registry
+
+`/root/ivh_tools/ivh_benchmarks.sh` carries the suite, the collapsed
+within-family entries, and the scaled variants. Use it rather than
+re-deriving invocations.
 
 ---
-
----
-
 
 # 5. TSC accuracy
 
@@ -641,81 +626,87 @@ see 15.5 limit 2 for why that correction was discarded.
 
 ---
 
-## 15.1 Kernel-lock workloads -- the axis is valid here
+## 15.1 The suite, ranked by lock-acquisition rate
 
-Median over n reps. `recorded` is the workload's IVH-vs-PV figure from the
-campaign (section 6) or evaluation.md section 10.2.
+All 15 workloads at the Appendix A configurations. `contended/s` is the median
+PV-arm rate; `PV s` is the PV-arm duration at the recorded config.
 
-| workload | n | contended/s | holds/s | sec | recorded | note |
-|---|---|---|---|---|---|---|
-| stressng_dentry | 3 | 570,785 | 140,692 | 16.1 | +99.5% | settled |
-| hackbench_pipe_thr | 3 | 248,507 | 199,845 | 3.1 | +76.3% | settled |
-| sysbench_mutex | 8 | 14,887 | 8,892 | 0.6 | +24.4% | settled |
-| ebizzy_mmap | 3 | 13,387 | 10,086 | 15.3 | +104.3% | settled |
-| dbench_16 | 3 | 9,381 | 5,116 | 36.4 | +19.1% | settled |
-| psearchy | 3 | 5,536 | 2,146 | 35.3 | +0.82% ns | settled |
-| fsmark_tmpfs | 8 | 4,753 | 769 | 0.7 | +167.0% | 1 outlier |
-| wis_mmap2 | 3 | 3,623 | 1,164 | 16.4 | +11.2% | settled |
-| tinyconfig | 5 | 2,409 | 958 | 39.6 | +0.99% | settled |
-| perf_sched_pipe | 8 | 412 | 391 | 25.0 | +146.9% | **BIMODAL** 5 lo / 3 hi |
-| schbench | 3 | 299 | 221 | 15.3 | +7.4% | settled |
+**Kernel-lock workloads -- the axis is valid here**
 
-**Range 299 -> 570,785/s, a 1,907x span with no gaps.**
+| workload | contended/s | PV s | recorded | note |
+|---|---|---|---|---|
+| `stressng_dentry` | 570,785 | 16.1 | +99.5% | settled |
+| `hackbench_pipe_thr` | 181,050 | 19.0 | +76.3% | settled |
+| `sysbench_mutex` | 13,390 | 0.59 | +24.4% | SCALED for >=5s: --mutex-locks=600000 -> 5.91s, +19.8% 5/5 t=21.23 |
+| `ebizzy_mmap` | 13,387 | 15.3 | +104.3% | settled |
+| `dbench_16` | 7,388 | 18.4 | +19.1% | settled |
+| `fsmark_tmpfs` | 5,598 | 0.48 | +167.0% | SCALED for >=5s: -n 30000 -> 5.64s, +208.8% 5/5 t=24.96 |
+| `wis_mmap2` | 3,412 | 21.4 | +11.2% | settled |
+| `perf_sched_pipe` | 361 | 18.7 | +146.9% | BIMODAL 356/361/5111 -- exclude from sweeps |
+| `schbench` | 291 | 15.4 | +7.4% | settled |
 
-## 15.2 Userspace-sync workloads -- the axis is INVALID here
+Range **291 -> 570,785 /s, a 1,961x span.**
 
-| workload | n | contended/s | holds/s | sec | recorded | note |
-|---|---|---|---|---|---|---|
-| nhextend_full | 3 | 7,637 | 3,991 | 8.2 | +64.0% (AFL vs spin-only) | settled |
-| parsec_vips | 3 | 2,077 | 1,470 | 17.8 | +57.39% | settled |
-| parsec_bodytrack | 3 | 1,107 | 801 | 67.8 | +14.39% | settled |
-| parsec_dedup | 3 | 1,035 | 465 | 46.5 | +86.86% | settled |
-| parsec_freqmine | 3 | 325 | 104 | 49.8 | +4.96% | settled |
-| parsec_canneal | 3 | 249 | 146 | 85.0 | +2.01% ns | settled |
-| parsec_blackscholes | 8 | 128 | 104 | 26.1 | +8.01% | **BIMODAL** 5 lo / 3 hi |
-| parsec_swaptions | 8 | 67 | 52 | 42.0 | +10.43% | **BLIND**, at/below idle floor |
-| parsec_ferret | 8 | 58 | 28 | 77.9 | +15.21% | **BLIND**, at/below idle floor |
+**Userspace-sync workloads -- the axis is INVALID here**
+
+| workload | contended/s | PV s | recorded | note |
+|---|---|---|---|---|
+| `nhextend_full` | 7,637 | 8.2 | +64.0% | AFL vs spin-only, not IVH vs PV |
+| `parsec_vips` | 2,077 | 17.8 | +57.39% | userspace sync |
+| `parsec_bodytrack` | 1,107 | 67.8 | +14.39% | userspace sync |
+| `parsec_dedup` | 1,035 | 46.5 | +86.86% | userspace sync |
+| `parsec_swaptions` | 67 | 42.0 | +10.43% | BLIND: at/below ~64/s idle floor |
+| `parsec_ferret` | 58 | 77.9 | +15.21% | BLIND: at/below ~64/s idle floor |
 
 Idle background on this box is ~64/s. `parsec_ferret` medians **58/s** and
-`parsec_swaptions` **67/s** -- at or BELOW that floor, measured against clean
-baselines -- while carrying +15.21% and +10.43% recorded migration wins. They
-synchronise via `pthread_mutex` -> futex, which `lock:contention_begin` never
-observes. **A low reading in this table means the instrument is blind, NOT that
-the workload has little contention.** These rows must not be ranked against
-section 15.1.
+`parsec_swaptions` **67/s** -- at or BELOW that floor against clean baselines
+-- while carrying +15.21% and +10.43% recorded wins. They synchronise via
+`pthread_mutex` -> futex, which `lock:contention_begin` never observes. **A low
+reading here means the instrument is blind, NOT that the workload has little
+contention.** These rows must not be ranked against the kernel-lock table.
+`nhextend_full` is the exception: its adaptive futex lock makes real futex
+syscalls that take the kernel's `hb->lock`, so it registers at 7,637/s.
 
-`nhextend_full` is the exception among userspace workloads: its adaptive futex
-lock makes real futex syscalls that take the kernel's `hb->lock`, so it does
-register (7,637/s).
+**Every row above was measured at the Appendix A config.** Five were first
+measured at wrong invocations and re-measured on 2026-09-28
+(`ivh_tools/point15_recheck.sh`): `dbench_16` 9,381 -> 7,388 (added `-F`),
+`wis_mmap2` 3,623 -> 3,412 (`-s 10` -> `-s 15`), `schbench` 299 -> 291
+(`-m 4 -t 4` -> `-m 2 -t 8`), `sysbench_mutex` 14,887 -> 13,390 (32 threads /
+20k locks -> 16 / 40k), `hackbench_pipe_thr` 248,507 -> 181,050
+(`-g 8 -f 20 -l 2000` -> `-g1 -f8 -l150000`). **No stratum assignment changed.**
+
+## 15.2 Stratified subset for points 7, 8 and 11
+
+| stratum | workloads | contended/s |
+|---|---|---|
+| INTENSE | stressng_dentry, hackbench_pipe_thr | 570,785 / 181,050 |
+| MID | ebizzy_mmap, dbench_16 | 13,387 / 7,388 |
+| LOW | wis_mmap2, schbench | 3,412 / 291 |
+
+All six clear 5 s in both arms. `perf_sched_pipe` is excluded despite its
++146.9%: its contention rate is genuinely two-regime (356, 361, **5,111** /s
+at the correct config, with a warmup discarded and durations stable at
+18-19 s), so a per-arm median would read as a threshold effect that is not
+there. PARSEC is excluded because it cannot be placed on this axis at all.
 
 ## 15.3 Lock rate does not predict the benefit
 
 Demonstrated at both ends, which is stronger than the previous evidence for
 this claim:
 
-| workload | contended/s | recorded IVH win |
-|---|---|---|
-| parsec_dedup | 1,035 | **+86.86%** |
-| psearchy | 5,536 | **+0.82%, not significant** |
+| workload | contended/s | recorded IVH win | in the suite? |
+|---|---|---|---|
+| `parsec_dedup` | 1,035 | **+86.86%** | yes |
+| `psearchy` | 5,536 | **+0.82%, not significant** | no -- negative control |
 
-5.3x the lock rate, and the benefit inverts. This supports the existing
+5.3x the lock rate, and the benefit inverts. `psearchy` is not part of the
+15-workload suite (it shows no benefit, which is the point of citing it);
+its rate was measured in the same pass, at the `parsec_ab`-style invocation
+given in the point-15 harness. This supports the existing
 "blocking structure predicts the win, lock rate does not" finding with a direct
 measurement of the rate rather than an inference from it.
 
-## 15.4 Stratified subset for points 7, 8 and 11
-
-| stratum | workloads | contended/s |
-|---|---|---|
-| INTENSE | stressng_dentry, hackbench_pipe_thr | 570,785 / 248,507 |
-| MID | ebizzy_mmap, dbench_16 | 13,387 / 9,381 |
-| INFREQUENT | schbench, and tinyconfig or wis_mmap2 | 299 / 2,409 / 3,623 |
-
-`perf_sched_pipe` and `parsec_blackscholes` are **excluded despite being
-otherwise good candidates**: both are genuinely two-regime (401 vs 1,672/s;
-127 vs 1,447/s, each 5 reps low and 3 high). A per-arm median lands arbitrarily
-in one mode, which would read as a threshold effect that is not there.
-
-## 15.5 Limits of this measurement
+## 15.4 Limits of this measurement
 
 1. **PARSEC cannot be placed on this axis at all** (15.2). Stratifying PARSEC
    requires a futex-rate instrument that does not exist yet.
@@ -737,7 +728,7 @@ under a second at their recorded invocations. Their *rates* are stable anyway
 (sysbench 8 reps within 10%), but their *throughput* figures at that duration
 are dominated by startup, which matters for points 7/8/11 and not for this one.
 
-## 15.6 Harnesses
+## 15.5 Harnesses
 
 | file | role |
 |---|---|
