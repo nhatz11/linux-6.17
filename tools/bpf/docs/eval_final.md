@@ -899,6 +899,28 @@ No arm clears |t| >= 2.57 on either metric. There is no monotonic trend in
 either column, and wait time does not fall at any threshold -- the pooled
 wait/acq change is positive (worse) at all five, though never significantly so.
 
+**Wait time is NOT won.** The sign convention traps readers, so explicitly:
+positive = IVH waits MORE than PV = worse. Per workload, wait/acq vs PV:
+
+| workload | 100 us | 250 us | 500 us | 1 ms | 2 ms | arms reducing wait |
+|---|---|---|---|---|---|---|
+| hackbench_pipe_thr | +3.35% | +2.79% | +3.93% | +4.00% | +3.82% | 0/5 |
+| ebizzy_mmap | -4.71% | -4.88% | -8.01% | -2.19% | -9.90% | 5/5 |
+| dbench_16 | -6.93% | -5.37% | +0.11% | -3.42% | -6.11% | 4/5 |
+| sysbench_mutex | +2.96% | +7.91% | +11.93% | +31.85% | +24.23% | 0/5 |
+| parsec_vips | +31.39% | +14.60% | +43.94% | +31.94% | +42.28% | 0/5 |
+
+Only ebizzy and dbench improve; three of five workloads are worse at every
+threshold. Ranked on pooled wait, 1 ms is the WORST arm (+12.44%), not the best.
+
+**And the improvement that does exist is not skipping.** Correlating eviction
+count against wait change across all 25 (workload, arm) cells gives r = -0.185
+(t = -0.90, n = 25), not significant. If skipping bought the reduction, more
+evictions would mean more wait saved. On the two workloads that do improve, the
+LARGEST reductions come from the 2 ms arm firing 1 and 5 evictions per run --
+effectively the no-skipping arm. The intuition that fewer evictions means less
+disruption does not terminate at 1 ms; it terminates at zero.
+
 **The ~+1% throughput common to every arm is not eviction.** It appears
 undiminished at the 2 ms arm, which fires 6 evictions per run. It is
 attributable to tier 1 + tier 2 + head bypass, which are on in all IVH arms.
