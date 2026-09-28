@@ -59,13 +59,13 @@ only tool-invocation variants were collapsed.
 | `parsec_bodytrack` | PARSEC | +14.39% | `./bin/parsecmgmt -a run -p bodytrack -c gcc -i native -n 16`<br>*(cwd `/root/parsec-benchmark`)* |
 | `parsec_dedup` | PARSEC | +86.86% | `./bin/parsecmgmt -a run -p dedup -c gcc -i native -n 16`<br>*(cwd `/root/parsec-benchmark`)* |
 | `parsec_blackscholes` | PARSEC | **+8.01%** † | `./bin/parsecmgmt -a run -p blackscholes -c gcc -i native -n 16`<br>*(cwd `/root/parsec-benchmark`)* |
-| `perf_sched_pipe` | perf-bench | +146.9% | `perf bench sched pipe -l 300000` |
+| `perf_epoll_wait` | perf-bench | +53.9% | `perf bench epoll wait -t 16 -r 15` |
 | `schbench` | schbench | +7.4% | `bash -c '/root/bench/schbench/schbench -m 2 -t 8 -r 15 2>&1'` |
 | `parsec_swaptions` | PARSEC | +10.43% | `./bin/parsecmgmt -a run -p swaptions -c gcc -i native -n 16`<br>*(cwd `/root/parsec-benchmark`)* |
 | `parsec_ferret` | PARSEC | +15.21% | `./bin/parsecmgmt -a run -p ferret -c gcc -i native -n 16`<br>*(cwd `/root/parsec-benchmark`)* |
 
 **Collapsed within family** (kept in `ivh_tools/ivh_benchmarks.sh`, not in the
-suite): perf-bench epoll_wait +53.9 / syscall_basic +8.7; stress-ng flock
+suite): perf-bench sched_pipe +146.9 / syscall_basic +8.7; stress-ng flock
 +44.2 / mmap +23.4 / sock +19.7 / pipe +15.8 / futex +10.5; hackbench sock_thr
 +75.4 / pipe_proc +61.8; will-it-scale mmap1 +10.9; PARSEC freqmine +4.96
 (below the +5% bar).
@@ -134,19 +134,23 @@ fs_mark 5,598 -> 4,672 /s, sysbench 13,390 -> 15,754 /s. No stratum changes.
 
 ## A.2 Thread counts
 
-15 of 16 workloads run **16 threads/workers/clients**: `--dentry 16`,
+**All 16 workloads run 16 threads, workers or clients**: `--dentry 16`,
 `-T -g1 -f8` (1 group x 8 fds = 16 tasks), `--threads=16`, `-t 16`, `-n 16`,
 `dbench ... 16`, `-m 2 -t 8`.
 
-**`perf_sched_pipe` is the exception and cannot be made 16-threaded.** perf
-6.14.11 describes it as *"Benchmark for pipe() between two processes"*, and its
-entire option set is `-G/--cgroups`, `-l/--loop`, `-n/--nonblocking`,
-`-T/--threaded`. There is no pair or instance count, so 8 pairs is not
-reachable from within the tool. Running 8 concurrent instances would give 16
-threads but is not the recorded benchmark and would not be comparable to its
-+146.9%. If a uniformly 16-threaded suite is required, the substitute from the
-same family is `perf bench epoll wait -t 16 -r 15` (+53.9%, natively 16
-threads), which was collapsed out as the second-best perf-bench member.
+**`perf_epoll_wait` replaced `perf_sched_pipe` to achieve this.**
+`perf bench sched pipe` CANNOT be made 16-threaded: perf 6.14.11 describes it
+as *"Benchmark for pipe() between two processes"*, and its entire option set is
+`-G/--cgroups`, `-l/--loop`, `-n/--nonblocking`, `-T/--threaded` -- there is no
+pair or instance count, so 8 pairs is unreachable from within the tool.
+Running 8 concurrent instances would give 16 threads but is not the recorded
+benchmark and would not be comparable to its +146.9%.
+
+The swap trades a +146.9% headline for +53.9%, and also removes the one
+workload that was bimodal on lock rate (`perf_sched_pipe`: 356, 361, **5,111**
+/s). `perf_epoll_wait` measures 365,562 / 395,263 / 414,118 /s -- a 13%
+spread -- and 16.2 s in the PV arm. `perf_sched_pipe` remains in the registry
+and its +146.9% stands; it is simply not in the suite.
 
 ## A.3 Registry
 
@@ -674,7 +678,7 @@ PV-arm rate; `PV s` is the PV-arm duration at the recorded config.
 | `dbench_16` | 7,388 | 18.4 | +19.1% | settled |
 | `fsmark_tmpfs` | 4,672 | 8.1 | +208.8% ‡ | scaled cfg (`-n 30000`) |
 | `wis_mmap2` | 3,412 | 21.4 | +11.2% | settled |
-| `perf_sched_pipe` | 361 | 18.7 | +146.9% | BIMODAL 356/361/5111 -- exclude from sweeps |
+| `perf_epoll_wait` | 395,263 | 16.2 | +53.9% | settled (13% spread) |
 | `schbench` | 291 | 15.4 | +7.4% | settled |
 
 Range **291 -> 570,785 /s, a 1,961x span.**
@@ -716,11 +720,11 @@ measured at wrong invocations and re-measured on 2026-09-28
 | MID | ebizzy_mmap, dbench_16 | 13,387 / 7,388 |
 | LOW | wis_mmap2, schbench | 3,412 / 291 |
 
-All six clear 5 s in both arms. `perf_sched_pipe` is excluded despite its
-+146.9%: its contention rate is genuinely two-regime (356, 361, **5,111** /s
-at the correct config, with a warmup discarded and durations stable at
-18-19 s), so a per-arm median would read as a threshold effect that is not
-there. PARSEC is excluded because it cannot be placed on this axis at all.
+All six clear 5 s in both arms. PARSEC is excluded because it cannot be
+placed on this axis at all. `perf_sched_pipe` is no longer in the suite (see
+A.2): it is a 2-task benchmark and was also the only one bimodal on lock rate
+(356, 361, **5,111** /s), which would have read as a threshold effect that is
+not there.
 
 ## 15.3 Lock rate does not predict the benefit
 
