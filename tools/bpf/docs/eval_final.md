@@ -25,7 +25,7 @@ Status legend: **DONE** / **PARTIAL** / **NOT STARTED**
 | 5 | **TSC accuracy** | **DONE (4 of 4 sub-claims)** |
 | 6 | Migration impact | NOT STARTED |
 | 7 | **Time-left sensitivity** | **DONE** -- no threshold is distinguishable; ship 4 ms as the cheapest |
-| 8 | Budget sensitivity | NOT STARTED |
+| 8 | **Budget sensitivity** | **DONE** -- the value is bounded by the healthy-vCPU count, not tuned |
 | 9 | Cost vs gain | NOT STARTED |
 | 10 | Adaptive spinning is good | PARTIAL (see 5.3/5.4 for detection; throughput unmeasured) |
 | 11 | Iterations before deciding preempted | PARTIAL (publish cadence measured, see 5.4) |
@@ -695,8 +695,111 @@ affecting all arms equally.
 
 # 8. Budget sensitivity
 
-NOT STARTED. Same method as 7, for the concurrent-migration budget
-(`ivh_max_concurrent`, currently 8).
+DONE. 2026-09-28. `ivh_max_concurrent` swept 2 / 4 / 8 / 16 (1/8, 1/4, 1/2, 1x
+nproc on this 16-vCPU guest), 6 workloads x 5 arms x 5 reps = **150 runs**
+(`ivh_tools/point8_full.sh`, raw data `p8full_data.csv`). `ivh_time_left_threshold_ns`
+pinned at 4 ms throughout so only the budget varies.
+
+**The claim.** The budget is bounded above by the number of healthy vCPUs,
+because each in-flight migration reserves its target. Above that value the gate
+never fires at all; below it the gate throttles migrations but throughput does
+not change. The shipped value of 8 equals the healthy-vCPU count on this guest,
+so it is **derived from the machine rather than tuned**.
+
+## 8.1 Gate 4 has no reject counter, so occupancy was sampled directly
+
+Gate 4 is `fair.c:13942`:
+
+```c
+if ((unsigned long)atomic_read(&ivh_in_schedule) >= ivh_max_concurrent)
+        return;
+```
+
+Nothing increments a counter there, so unlike Gates 1 and 2 its firing rate
+cannot be read off. Instead `ivh_in_schedule` is sampled at 0.5 ms during every
+run and reported as `sc_max` (peak occupancy) and `at_cap%` (share of samples at
+or above the budget, i.e. when the gate was rejecting).
+
+`ivh_in_schedule` is held across the **whole** `set_cpus_allowed_ptr()` call,
+including the ~1.5 ms target-runqueue wait (see 7.1), so occupancy is dominated
+by that wait rather than by migration work.
+
+> **Two earlier readings of this counter were WRONG and are withdrawn.**
+> ~~"ivh_in_schedule is 0 in 9,551 samples"~~ and ~~"0 in 60,724 samples",~~ from
+> which ~~"Gate 4 never binds; the budget is ~500x oversized"~~ was concluded. A
+> held-open `/proc/kcore` fd serves reads from the page cache and reports a
+> FROZEN value with no error. Verified by sampling `ivh_migrations_done`: 119
+> identical samples while a reopen-per-call reader showed it advancing by 7,537.
+> The sampler now reopens per sample.
+
+## 8.2 Result, pooled across the six workloads
+
+| cap | perf vs PV | ipi vs PV | spin saved | migrations | cost | us/mig | at_cap% |
+|---|---|---|---|---|---|---|---|
+| 2 | +45.6% | -10.1% | 0.59 s | 6,327 | 85.4 ms | 10.2 | **7.2%** |
+| 4 | +46.6% | -10.1% | 0.58 s | 6,992 | 86.6 ms | 9.8 | 1.1% |
+| **8** | +42.8% | -5.9% | 0.56 s | 7,968 | 91.7 ms | 8.9 | **0.0%** |
+| 16 | +44.7% | -2.3% | 0.67 s | 7,519 | 97.2 ms | 8.5 | **0.0%** |
+
+| comparison | n | mean | t | verdict |
+|---|---|---|---|---|
+| cap2 vs cap4 | 6 | +8.1 pp | 1.37 | not significant |
+| cap4 vs cap8 | 6 | +6.9 pp | 1.22 | not significant |
+| cap8 vs cap16 | 6 | -4.2 pp | **-0.52** | not significant |
+| cap2 vs cap16 | 6 | +10.7 pp | 1.05 | not significant |
+
+## 8.3 The ceiling, which is the actual finding
+
+`sc_max` never exceeds 8-10 at any budget, and `at_cap%` is **0.0% at both cap8
+and cap16**. The mechanism is target reservation: `fair.c` does
+`atomic_fetch_or(PRMPT_HELD_MASK, prmpt_flags(target_cpu))` on selection and the
+BPF selector rejects any already-claimed CPU (`REJ_CLAIMED`, 4.0M rejections
+measured). With **8 healthy vCPUs**, at most ~8 migrations can hold distinct
+targets concurrently.
+
+So a budget above the healthy-vCPU count is unreachable by construction. cap8
+and cap16 are the same configuration in practice, and their comparison is
+correspondingly the most null in the table (t=-0.52).
+
+**Below the ceiling the gate does throttle**, and visibly: `at_cap%` runs
+7.2% pooled at cap2, reaching **20.9% on hackbench** and **18.4% on
+sysbench_mutex**. Migrations fall accordingly, 7,968 at cap8 to 6,327 at cap2.
+
+`sc_max` occasionally exceeds the budget (10 at dedup/cap16, 3 at cap2) because
+Gate 4 is a racy `atomic_read` with no serialisation -- a few candidates slip
+past concurrently. The budget is soft, not a hard limit.
+
+## 8.4 Throughput is indifferent; cost is not
+
+Migrations rise +26% (6,327 -> 7,968) and cost +14% (85.4 -> 97.2 ms) from cap2
+to cap8, while throughput stays in a 42.8-46.6% band with no significant
+difference anywhere. Same structure as point 7: the knob demonstrably changes
+migration volume and throughput does not respond.
+
+The pooled median mildly favours cap2/cap4, but the per-workload picture is
+mixed and should not be read as a result: four workloads prefer the low caps by
+0.1-4.9 pp while `hackbench` and `parsec_dedup` prefer cap8 by **46.6 pp and
+53.3 pp**. hackbench's cap2 row is n=1 (4 of 5 reps lost to capacity-unsettling)
+and its cap4 row is n=3.
+
+**Choice.** cap8 is recommended because it is *derived* -- it equals the
+healthy-vCPU count, which is where target reservation caps concurrency anyway.
+cap4 is equally defensible on cost grounds (86.6 ms vs 91.7 ms, saturating only
+1.1% of the time so it keeps headroom). No measured optimum supports either:
+every pairwise test is insignificant.
+
+## 8.5 Limits
+
+1. **hackbench lost reps at the low caps** -- n=1 at cap2, n=3 at cap4. The low
+   end of its curve is the weakest data in the sweep.
+2. **The ceiling is a property of this host's contention pattern.** 8 healthy
+   vCPUs is what this host happened to leave; on a host starving a different
+   fraction the meaningful ceiling moves with it. The *rule* (budget <= healthy
+   vCPU count) generalises; the *value* 8 does not.
+3. cap2's 7.2% saturation is fine at the contention level tested but is the arm
+   most likely to degrade under heavier host contention, which was not tested.
+4. `ipi vs PV` weakens monotonically with the cap (-10.1% to -2.3%) but carries
+   the same PARSEC instability noted in 7.6.
 
 # 9. Cost vs gain
 
