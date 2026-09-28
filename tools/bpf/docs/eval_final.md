@@ -36,7 +36,7 @@ Status legend: **DONE** / **PARTIAL** / **NOT STARTED**
 
 ---
 
-# Appendix A. The benchmark suite -- 15 workloads, exact configurations
+# Appendix A. The benchmark suite -- 16 workloads, exact configurations
 
 **One workload per family.** Set A (full IVH stack) and Set B (migration
 alone) are merged here into a single suite: these are the workloads that show
@@ -58,6 +58,7 @@ only tool-invocation variants were collapsed.
 | `parsec_vips` | PARSEC | +57.39% | `./bin/parsecmgmt -a run -p vips -c gcc -i native -n 16`<br>*(cwd `/root/parsec-benchmark`)* |
 | `parsec_bodytrack` | PARSEC | +14.39% | `./bin/parsecmgmt -a run -p bodytrack -c gcc -i native -n 16`<br>*(cwd `/root/parsec-benchmark`)* |
 | `parsec_dedup` | PARSEC | +86.86% | `./bin/parsecmgmt -a run -p dedup -c gcc -i native -n 16`<br>*(cwd `/root/parsec-benchmark`)* |
+| `parsec_blackscholes` | PARSEC | **+8.01%** † | `./bin/parsecmgmt -a run -p blackscholes -c gcc -i native -n 16`<br>*(cwd `/root/parsec-benchmark`)* |
 | `perf_sched_pipe` | perf-bench | +146.9% | `perf bench sched pipe -l 300000` |
 | `schbench` | schbench | +7.4% | `bash -c '/root/bench/schbench/schbench -m 2 -t 8 -r 15 2>&1'` |
 | `parsec_swaptions` | PARSEC | +10.43% | `./bin/parsecmgmt -a run -p swaptions -c gcc -i native -n 16`<br>*(cwd `/root/parsec-benchmark`)* |
@@ -67,7 +68,16 @@ only tool-invocation variants were collapsed.
 suite): perf-bench epoll_wait +53.9 / syscall_basic +8.7; stress-ng flock
 +44.2 / mmap +23.4 / sock +19.7 / pipe +15.8 / futex +10.5; hackbench sock_thr
 +75.4 / pipe_proc +61.8; will-it-scale mmap1 +10.9; PARSEC freqmine +4.96
-(below the +5% bar) / blackscholes / canneal.
+(below the +5% bar).
+
+† `parsec_blackscholes` is the one row whose figure is **not** a campaign
+number. It was recorded at +1.07% (4/6, t=0.76, NOT significant) and re-tested
+on 2026-09-27 at **+8.01% (6/6 pairs, t=8.88, crit 2.571, SIGNIFICANT)**,
+migration-alone arms, 330-1,348 migrations per IVH run against exactly 0 per PV
+run. **The change is not attributed**: the kernel moved to G-LOCK-48, migration
+only began firing after the `ivh_preempt_event_source` fix of the same day, and
+host contention may differ. Quote it as "+8.01% on G-LOCK-48, 2026-09-27", not
+as a correction of the recorded value.
 
 **Two arm configurations produced these numbers, and they are not the same.**
 Rows measured under the full IVH stack: stressng_dentry, hackbench_pipe_thr,
@@ -628,7 +638,7 @@ see 15.5 limit 2 for why that correction was discarded.
 
 ## 15.1 The suite, ranked by lock-acquisition rate
 
-All 15 workloads at the Appendix A configurations. `contended/s` is the median
+All 16 workloads at the Appendix A configurations. `contended/s` is the median
 PV-arm rate; `PV s` is the PV-arm duration at the recorded config.
 
 **Kernel-lock workloads -- the axis is valid here**
@@ -655,6 +665,7 @@ Range **291 -> 570,785 /s, a 1,961x span.**
 | `parsec_vips` | 2,077 | 17.8 | +57.39% | userspace sync |
 | `parsec_bodytrack` | 1,107 | 67.8 | +14.39% | userspace sync |
 | `parsec_dedup` | 1,035 | 46.5 | +86.86% | userspace sync |
+| `parsec_blackscholes` | 128 | 26.1 | +8.01% † | BIMODAL 5 reps ~127 / 3 reps ~1,447 |
 | `parsec_swaptions` | 67 | 42.0 | +10.43% | BLIND: at/below ~64/s idle floor |
 | `parsec_ferret` | 58 | 77.9 | +15.21% | BLIND: at/below ~64/s idle floor |
 
@@ -728,7 +739,35 @@ under a second at their recorded invocations. Their *rates* are stable anyway
 (sysbench 8 reps within 10%), but their *throughput* figures at that duration
 are dominated by startup, which matters for points 7/8/11 and not for this one.
 
-## 15.5 Harnesses
+
+## 15.5 Watch list -- re-check after parameter tuning
+
+Three workloads sit below the +5% bar today but are kept under observation:
+tuned Gate 2 / Gate 4 / lock-skip parameters (points 7, 8, 11) could move them
+over it, and one of their cohort already moved.
+
+| workload | latest | evidence | config |
+|---|---|---|---|
+| `parsec_canneal` | **+2.01%, NOT sig** | 4/4 pairs, t=2.60 vs crit 2.776 at n=4 — **underpowered, stopped at 4 of 6 pairs**. Recorded +0.14% ns. 249 cont/s, PV 85.0 s | `./bin/parsecmgmt -a run -p canneal -c gcc -i native -n 16` |
+| `psearchy` | +0.82%, NOT sig | 6/8 pairs. 5,536 cont/s (real kernel contention), PV 35.3 s | `cd /root/mosbench/psearchy && ./mkdb/pedsort -t /root/psearchy_db/db -c 16 -m 512 < files_6x` |
+| `tinyconfig` (kernel build) | +0.99%, sig but tiny | 9/10 pairs. 2,409 cont/s, PV 39.6 s | `rm -rf $B; make -C /root/kernels/linux-6.14-stock O=$B tinyconfig` then time `make -C ... O=$B -j16 vmlinux` |
+
+**Why they are worth re-checking.** All three were retired on the same
+sampler-corrected pass (evaluation.md 10.2) that also retired
+`parsec_blackscholes` — which, re-tested on 2026-09-27, came back at **+8.01%,
+6/6, t=8.88** and is now in the suite. The same doubt applies to these three.
+Their sampler gaps were psearchy +4.8pp (5.2 -> 0.8) and tinyconfig +5.6pp
+(7.2 -> 1.0), i.e. the same mechanism.
+
+`parsec_canneal` is the strongest candidate of the three: it was directionally
+positive on every pair measured and missed significance only because the run
+was stopped early. **Finishing its last 2 pairs is the cheapest outstanding
+measurement in this file.**
+
+`tinyconfig` must wipe the build directory and build the `vmlinux` target;
+without the wipe `make` returns in ~0.5 s having built nothing.
+
+## 15.6 Harnesses
 
 | file | role |
 |---|---|
