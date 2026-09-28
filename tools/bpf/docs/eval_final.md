@@ -627,15 +627,15 @@ excluded from the averages and the count of exclusions is printed.
 Normalised per workload first, so hackbench's 69 s of spin does not dominate
 sysbench's 0.17 s.
 
-| arm | perf vs PV | ipi vs PV | spin saved | mig cost | us/mig |
-|---|---|---|---|---|---|
-| 250 us | +32.8% | -8.5% | 0.35 s | 76.6 ms | 11.3 |
-| 500 us | +30.6% | -8.1% | 0.33 s | 59.2 ms | 8.6 |
-| 1 ms | +36.3% | -8.9% | 0.44 s | 65.7 ms | 10.0 |
-| 2 ms | +35.9% | -5.9% | 0.29 s | 76.9 ms | 10.0 |
-| **4 ms** | **+40.3%** | **-10.3%** | **0.43 s** | **78.8 ms** | **9.7** |
-| 8 ms | +42.6% | -4.6% | 0.53 s | 90.4 ms | 9.6 |
-| 16 ms | +45.0% | -9.8% | 0.50 s | 98.8 ms | 10.8 |
+| arm | perf vs PV | ipi vs PV | spin saved | **migrations** | mig cost | us/mig |
+|---|---|---|---|---|---|---|
+| 250 us | +32.8% | -8.5% | 0.35 s | 5,258 | 76.6 ms | 11.3 |
+| 500 us | +30.6% | -8.1% | 0.33 s | 4,440 | 59.2 ms | 8.6 |
+| 1 ms | +36.3% | -8.9% | 0.44 s | 4,708 | 65.7 ms | 10.0 |
+| 2 ms | +35.9% | -5.9% | 0.29 s | 5,570 | 76.9 ms | 10.0 |
+| **4 ms** | **+40.3%** | **-10.3%** | **0.43 s** | **5,318** | **78.8 ms** | **9.7** |
+| 8 ms | +42.6% | -4.6% | 0.53 s | 6,258 | 90.4 ms | 9.6 |
+| 16 ms | +45.0% | -9.8% | 0.50 s | 6,934 | 98.8 ms | 10.8 |
 
 ## 7.3 The differences are not statistically resolvable
 
@@ -659,6 +659,9 @@ Migration cost rises with the threshold -- 78.8 -> 90.4 -> 98.8 ms across
 4/8/16 ms -- and the mechanism is mechanical: a looser gate admits more
 candidates, so more migrations happen. Migrations at 4/8/16 ms on `ebizzy_mmap`:
 5,446 -> 7,202 -> 7,735. `dbench_16`: 50,252 -> 51,384 -> 54,490.
+
+Pooled migration counts track the cost directly, which is the mechanism:
+the gate admits more candidates, more migrations happen, more cost is paid.
 
 Since throughput cannot be distinguished between arms and cost can, the cheapest
 arm that loses nothing is the rational choice. That is the argument for 4 ms.
