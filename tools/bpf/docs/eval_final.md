@@ -636,97 +636,132 @@ fraction of that and represents the range better than the top of it.
 
 ## 15.0 Method
 
-**Config.** Single arm, stock PV (`/root/spin_mode 1`, `ivh_adaptive_mode==0`
-asserted), `ivh_universal_eligible=0`, `ivh_tks_sampler_ns=0`, CS stamping
-armed AFTER `spin_mode` (it clears `ivh_cs_owner_enable`), `drop_caches` before
-every run. There is no second arm because this characterises the WORKLOAD, not
-IVH -- there is nothing to compare against.
+**Purpose.** Rank the suite by how hard it exercises kernel spinlocks, so the
+parameter-sensitivity points (7, 8, 11) run on 6 workloads spanning that range
+instead of 16 through every arm.
 
-**Instruments.** Two, independent, both safe:
+**Metric: lock ACQUISITIONS per second** -- see 15.2 for why, and for the two
+instruments that were tried first and are wrong for this point.
 
-| instrument | what it counts |
-|---|---|
-| `perf stat -a -e lock:contention_begin` | kernel spinlock contention, exact |
-| `ivh_cs_prev_hold_hist` (sum) | acquisitions that formed a stamped MCS queue |
+**Instrument.** ftrace function profiler (`ivh_tools/lockrate.sh`), counting
+entries to `_raw_spin_lock{,_irqsave,_irq,_bh,_nested,...}`,
+`_raw_spin_trylock{,_bh}`, the rwlock variants, and both queued-spinlock
+slowpaths. No PMU (none is virtualised on this TDX guest), no BPF. fentry on
+`_raw_spin_lock*` was rejected: bpftrace flags it a "dangerous function" that
+risks kernel deadlock and drops events under its own mitigation, and a lossy
+counter cannot rank anything.
 
-They agree on the ranking, which is what makes the stratification trustworthy.
-`fentry` on `_raw_spin_lock*` was rejected: bpftrace flags it a "dangerous
-function" that risks kernel deadlock *and* drops events under its own
-mitigation, and a lossy counter cannot stratify.
+**Procedure.** 3 reps per workload, `drop_caches` before each, medians reported
+with the max/min spread so instability is visible rather than hidden. The idle
+background (54,071/s, same instrument) is measured and subtracted. PARSEC
+packages are run directly from their `run/` directory, never through
+`parsecmgmt` (15.2).
 
-**Procedure.** Each workload runs 3x; any workload flagged UNSTABLE (>3x
-spread across reps), NEAR-IDLE (<2x background) or SHORT (<1 s) then gets +5
-reps. Medians over all reps are reported. `drop_caches` before every run.
-Anomaly re-runs additionally sampled a 3 s idle background before each run --
-see 15.5 limit 2 for why that correction was discarded.
+**Arm.** Any -- the profiler is independent of IVH state. `ivh_prelock_calls`
+would NOT be: it sits behind the `ivh_universal_eligible` bail and reads zero in
+the PV arm.
 
----
+**Two failures worth not repeating.** (1) `/root/spin_mode` clears
+`ivh_cs_owner_enable`/`ivh_cs_owner_clear`, so any CS-histogram reading must be
+re-armed after every arm switch. (2) At the scaled size `fsmark_tmpfs` writes
+1,875 MB per run; without a `rm -rf` in the command it filled a 7.4 GB tmpfs
+after 4 runs and every later run exited in ~0.15 s having written nothing --
+visible only as a 289x spread, not as an error.
 
-## 15.1 The suite, ranked by lock-acquisition rate
+## 15.1 Lock ACQUISITIONS per second
 
-All 16 workloads at the Appendix A configurations. `contended/s` is the median
-PV-arm rate; `PV s` is the PV-arm duration at the recorded config.
+Median of 3 reps, ftrace function profiler, background subtracted. `slow%` is
+the share of acquisitions that reached a queued-spinlock slowpath, i.e. that
+were contended.
 
-**Kernel-lock workloads -- the axis is valid here**
+| workload | acq/s | net acq/s | slow% | spread | tier |
+|---|---|---|---|---|---|
+| `stressng_dentry` | 8,657,248 | 8,603,177 | 5.10% | 1.02x | HIGH |
+| `hackbench_pipe_thr` | 7,988,479 | 7,934,408 | 6.79% | 1.01x | HIGH |
+| `perf_epoll_wait` | 3,473,030 | 3,418,960 | 0.63% | 1.02x | HIGH |
+| `fsmark_tmpfs` | 3,418,085 | 3,364,015 | 1.65% | 1.12x | HIGH |
+| `ebizzy_mmap` | 2,963,979 | 2,909,909 | 0.62% | 1.16x | HIGH |
+| `nhextend_full` | 1,338,259 | 1,284,188 | 1.47% | 1.01x | MID |
+| `parsec_dedup` | 1,048,012 | 993,941 | 1.21% | 1.26x | MID |
+| `dbench_16` | 1,010,623 | 956,552 | 0.76% | 1.00x | MID |
+| `wis_mmap2` | 339,770 | 285,699 | 1.30% | 1.21x | LOW |
+| `parsec_vips` | 219,124 | 165,053 | 0.57% | 1.03x | LOW |
+| `sysbench_mutex` | 169,349 | 115,279 | **10.72%** | 1.09x | LOW |
+| `parsec_bodytrack` | 128,341 | 74,270 | 1.17% | 1.18x | LOW † |
+| `schbench` | 121,828 | 67,758 | 0.22% | 1.05x | LOW † |
+| `parsec_blackscholes` | 103,644 | 49,574 | 0.77% | 1.63x | LOW † |
+| `parsec_ferret` | 65,957 | 11,886 | 0.08% | 1.03x | LOW † |
+| `parsec_swaptions` | 55,293 | 1,223 | 0.14% | 1.01x | LOW † |
 
-| workload | contended/s | PV s | recorded | note |
+Idle background **54,071/s**, measured with the same instrument and subtracted.
+**†** = net rate within 2x of background, so the placement is weak;
+`parsec_swaptions` is indistinguishable from an idle box.
+
+**`slow%` is the more discriminating column than the rate.** `sysbench_mutex`
+contends on **10.72%** of its acquisitions while `parsec_ferret` contends on
+**0.08%** -- a 134x difference in the *character* of the locking at similar
+absolute rates. Only `stressng_dentry` and `hackbench_pipe_thr` combine a high
+rate with high contention.
+
+## 15.2 Why this is acquisitions and not contentions
+
+IVH acts at **acquisition**: `ivh_pre_lock()` is called from `_raw_spin_lock*`
+(`kernel/locking/spinlock.c:308,327,345`) on every acquisition. Contention is a
+different and much smaller population -- `lock:contention_begin` fires only in
+`queued_spin_lock_slowpath` (`qspinlock.c:334`).
+
+Three instruments were tried; the first two are wrong for this point and are
+recorded so the numbers are not re-quoted:
+
+| instrument | dentry | dedup | schbench | why it is wrong here |
 |---|---|---|---|---|
-| `stressng_dentry` | 570,785 | 16.1 | +99.5% | settled |
-| `hackbench_pipe_thr` | 181,050 | 19.0 | +76.3% | settled |
-| `sysbench_mutex` | 15,754 | 6.3 | +19.8% ‡ | scaled cfg (`--mutex-locks=600000`) |
-| `ebizzy_mmap` | 13,387 | 15.3 | +104.3% | settled |
-| `dbench_16` | 7,388 | 18.4 | +19.1% | settled |
-| `fsmark_tmpfs` | 4,672 | 8.1 | +208.8% ‡ | scaled cfg (`-n 30000`) |
-| `wis_mmap2` | 3,412 | 21.4 | +11.2% | settled |
-| `perf_epoll_wait` | 395,263 | 16.2 | +53.9% | settled (13% spread) |
-| `schbench` | 291 | 15.4 | +7.4% | settled |
+| ~~`lock:contention_begin`~~ | 572,465 | 1,035 | 248 | contended only -- 0.2-11% of acquisitions. Ranked `parsec_dedup` *below the 64/s idle floor* while it is a top-3 IVH win (+86.86%) |
+| ~~`ivh_prelock_calls`~~ | 6,269,192 | 272,228 | 61,516 | only acquisitions ELIGIBLE for IVH: five bails in `ivh_pre_lock()` including `!rcu_preempt_depth()`, and the comment there says "an enormous share of `spin_lock()` callers (dcache, lockref, net, slab)" hold an RCU reader. Reads zero in the PV arm by construction |
+| **ftrace function profiler** | 8,657,248 | 1,048,012 | 121,828 | every `_raw_spin_lock*` / rwlock / slowpath entry. **Used above** |
 
-Range **291 -> 570,785 /s, a 1,961x span.**
+> ~~"PARSEC cannot be placed on this axis -- the instrument is blind to
+> userspace synchronisation"~~ **WITHDRAWN.** PARSEC acquires kernel spinlocks
+> constantly (page faults, mmap, file I/O, thread creation); it just does not
+> *contend*. `parsec_dedup` is 1,048,012 acquisitions/s at 1.21% contended. The
+> axis was wrong, not the workloads.
 
-**Userspace-sync workloads -- the axis is INVALID here**
+**PARSEC must be run WITHOUT `parsecmgmt`.** That harness is a shell wrapper
+which itself acquires ~600,000 spinlocks/s: `parsecmgmt -a status`, doing no
+application work at all, measured **599,374/s**. Tracing `parsecmgmt -a run`
+therefore measures the wrapper, and all six packages came out within 1.6% of
+each other (807k-826k/s) regardless of application. `parsec_blackscholes` read
+825,500/s through the harness and **103,644/s** run directly -- 87% harness.
+Section 15.1 runs each package's `native.runconf` `run_exec`/`run_args`
+directly from its `run/` directory.
 
-| workload | contended/s | PV s | recorded | note |
-|---|---|---|---|---|
-| `nhextend_full` | 7,637 | 8.2 | +64.0% | AFL vs spin-only, not IVH vs PV |
-| `parsec_vips` | 2,077 | 17.8 | +57.39% | userspace sync |
-| `parsec_bodytrack` | 1,107 | 67.8 | +14.39% | userspace sync |
-| `parsec_dedup` | 1,035 | 46.5 | +86.86% | userspace sync |
-| `parsec_blackscholes` | 128 | 26.1 | +8.01% † | BIMODAL 5 reps ~127 / 3 reps ~1,447 |
-| `parsec_swaptions` | 67 | 42.0 | +10.43% | BLIND: at/below ~64/s idle floor |
-| `parsec_ferret` | 58 | 77.9 | +15.21% | BLIND: at/below ~64/s idle floor |
+**Instrument caveat:** the profiler costs time per call, so a fixed-duration
+workload does less work while traced. Counts are exact; absolute throughput
+under tracing is not comparable to an untraced run. It is also system-wide with
+no PID filter, hence the background subtraction.
 
-Idle background on this box is ~64/s. `parsec_ferret` medians **58/s** and
-`parsec_swaptions` **67/s** -- at or BELOW that floor against clean baselines
--- while carrying +15.21% and +10.43% recorded wins. They synchronise via
-`pthread_mutex` -> futex, which `lock:contention_begin` never observes. **A low
-reading here means the instrument is blind, NOT that the workload has little
-contention.** These rows must not be ranked against the kernel-lock table.
-`nhextend_full` is the exception: its adaptive futex lock makes real futex
-syscalls that take the kernel's `hb->lock`, so it registers at 7,637/s.
+## 15.3 Stratified subset for points 7, 8 and 11
 
-**Every row above was measured at the Appendix A config.** Five were first
-measured at wrong invocations and re-measured on 2026-09-28
-(`ivh_tools/point15_recheck.sh`): `dbench_16` 9,381 -> 7,388 (added `-F`),
-`wis_mmap2` 3,623 -> 3,412 (`-s 10` -> `-s 15`), `schbench` 299 -> 291
-(`-m 4 -t 4` -> `-m 2 -t 8`), `sysbench_mutex` 14,887 -> 13,390 (32 threads /
-20k locks -> 16 / 40k), `hackbench_pipe_thr` 248,507 -> 181,050
-(`-g 8 -f 20 -l 2000` -> `-g1 -f8 -l150000`). **No stratum assignment changed.**
+Chosen for tier spread AND for demonstrated Gate-2 sensitivity (the
+worst/best throughput ratio across thresholds, `campaign/point7_0925_225925.csv`),
+because the two axes do not agree: `stressng_dentry` and `dbench_16` are the
+cleanest lock-rate measurements in the set but are **flat** on Gate 2
+(1.04x, 1.05x), so choosing on rate alone bakes in a null result.
 
-## 15.2 Stratified subset for points 7, 8 and 11
+| tier | workload | net acq/s | Gate-2 ratio |
+|---|---|---|---|
+| HIGH | `hackbench_pipe_thr` | 7,934,408 | **1.48x** |
+| HIGH | `ebizzy_mmap` | 2,909,909 | **1.49x** |
+| MID | `nhextend_full` | 1,284,188 | not measured |
+| MID | `parsec_dedup` | 993,941 | **3.80x** (largest) |
+| LOW | `wis_mmap2` | 285,699 | not measured |
+| LOW | `parsec_vips` | 165,053 | **1.34x** |
 
-| stratum | workloads | contended/s |
-|---|---|---|
-| INTENSE | stressng_dentry, hackbench_pipe_thr | 570,785 / 181,050 |
-| MID | ebizzy_mmap, dbench_16 | 13,387 / 7,388 |
-| LOW | wis_mmap2, schbench | 3,412 / 291 |
+Span 48x, four of six with demonstrated sensitivity. Excluded: `stressng_dentry`
+and `dbench_16` (flat), `perf_sched_pipe` (bimodal, spread 5.64x over 9 reps),
+`fsmark_tmpfs` and `perf_epoll_wait` (would duplicate the HIGH tier), and the
+five workloads within 2x of background.
 
-All six clear 5 s in both arms. PARSEC is excluded because it cannot be
-placed on this axis at all. `perf_sched_pipe` is no longer in the suite (see
-A.2): it is a 2-task benchmark and was also the only one bimodal on lock rate
-(356, 361, **5,111** /s), which would have read as a threshold effect that is
-not there.
-
-## 15.3 Lock rate does not predict the benefit
+## 15.4 Lock rate does not predict the benefit
 
 Demonstrated at both ends, which is stronger than the previous evidence for
 this claim:
@@ -743,7 +778,7 @@ given in the point-15 harness. This supports the existing
 "blocking structure predicts the win, lock rate does not" finding with a direct
 measurement of the rate rather than an inference from it.
 
-## 15.4 Limits of this measurement
+## 15.5 Limits of this measurement
 
 1. **PARSEC cannot be placed on this axis at all** (15.2). Stratifying PARSEC
    requires a futex-rate instrument that does not exist yet.
@@ -766,7 +801,7 @@ under a second at their recorded invocations. Their *rates* are stable anyway
 are dominated by startup, which matters for points 7/8/11 and not for this one.
 
 
-## 15.5 Watch list -- re-check after parameter tuning
+## 15.6 Watch list -- re-check after parameter tuning
 
 Three workloads sit below the +5% bar today but are kept under observation:
 tuned Gate 2 / Gate 4 / lock-skip parameters (points 7, 8, 11) could move them
@@ -793,7 +828,7 @@ measurement in this file.**
 `tinyconfig` must wipe the build directory and build the `vmlinux` target;
 without the wipe `make` returns in ~0.5 s having built nothing.
 
-## 15.6 Harnesses
+## 15.7 Harnesses
 
 | file | role |
 |---|---|
