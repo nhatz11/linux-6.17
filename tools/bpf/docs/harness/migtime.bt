@@ -1,0 +1,46 @@
+#!/usr/bin/env bpftrace
+/*
+ * IVH migration timing, no kernel rebuild.
+ *
+ *   t_eval   kprobe bpf_sched_pre_lock_migrate   -- evaluation starts
+ *   t_commit kprobe set_cpus_allowed_ptr (FIRST) -- migration decided + destination chosen
+ *   t_attach tracepoint sched_migrate_task       -- dest rq assigned (set_task_cpu)
+ *   t_run    tracepoint sched_switch next==tid   -- actually running on target
+ *
+ *   select_us = t_commit - t_eval    decide-to-migrate + choose destination
+ *   cost_us   = t_attach - t_commit  stop task, detach, attach to dest rq
+ *   total_us  = t_attach - t_eval    MIGRATION COST as defined
+ *   delay_us  = t_run    - t_attach  MIGRATION DELAY as defined
+ *
+ * mechanism 0 calls set_cpus_allowed_ptr TWICE (restrict, then restore); the
+ * @armed state machine counts only the first. Gating sched_migrate_task on
+ * @commit excludes CFS load-balancer migrations IVH did not cause.
+ */
+kprobe:bpf_sched_pre_lock_migrate { @eval[tid] = nsecs; @armed[tid] = 1; @n_eval = count(); }
+
+kprobe:set_cpus_allowed_ptr /@armed[tid] == 1/ {
+    @commit[tid] = nsecs; @armed[tid] = 2;
+    @select_us = hist((nsecs - @eval[tid]) / 1000);
+    @select_sum_ns = sum(nsecs - @eval[tid]);
+    @n_commit = count();
+}
+
+tracepoint:sched:sched_migrate_task /@commit[args->pid]/ {
+    @cost_us    = hist((nsecs - @commit[args->pid]) / 1000);
+    @cost_sum_ns = sum(nsecs - @commit[args->pid]);
+    @total_us   = hist((nsecs - @eval[args->pid]) / 1000);
+    @total_sum_ns = sum(nsecs - @eval[args->pid]);
+    @n_mig = count();
+    @attach[args->pid] = nsecs;
+    delete(@commit[args->pid]);
+}
+
+tracepoint:sched:sched_switch /@attach[args->next_pid]/ {
+    @delay_us = hist((nsecs - @attach[args->next_pid]) / 1000);
+    @delay_sum_ns = sum(nsecs - @attach[args->next_pid]);
+    @n_run = count();
+    delete(@attach[args->next_pid]);
+}
+
+kretprobe:bpf_sched_pre_lock_migrate { delete(@armed[tid]); delete(@eval[tid]); }
+END { clear(@eval); clear(@armed); clear(@commit); clear(@attach); }

@@ -1269,3 +1269,156 @@ without the wipe `make` returns in ~0.5 s having built nothing.
 | `ivh_tools/point15_report.py` | report, splits the two groups |
 | `ivh_tools/ivh_benchmarks.sh` | workload registry with recorded deltas |
 | `ivh_tools/point15_0927-220345.csv` | raw data (`_rerun.csv` for the re-runs) |
+
+---
+
+# Appendix A: the exact sysctl state behind the ladder verdict (2026-09-29)
+
+The 2026-09-29 additive-ladder run is what the decision "adaptive spinning ships
+as skip + hb + heh + t2 on top of mig+t1" rests on. Until now that
+configuration existed only in `ivh_tools/ladder.sh`; this appendix records it as
+kernel state. Every value below was produced by APPLYING each arm with
+`ivh_tools/ladder_arm.sh` -- which sources `setarm()` extracted verbatim from
+`ladder.sh`, so the two cannot drift -- and then dumping all 88
+`/proc/sys/kernel/ivh_*` entries.
+
+Reproduce any arm with:
+
+```
+bash /root/ivh_tools/ladder_arm.sh mig_t1_heh_t2_sk_hb   # arm 5, the shipped stack
+bash /root/ivh_tools/pvbase.sh                            # the stock-PV baseline
+```
+
+## A.0 WARNING: `spin_mode 1` alone does not give you stock PV
+
+`ivh_head_bypass_probe` is read inside `pv_wait_node()`
+(`qspinlock_paravirt.h:2010`) with **no `ivh_adaptive_mode` gate**. A leftover
+`probe=1` from a previous bypass arm therefore keeps firing at
+`ivh_adaptive_mode=0`. Measured 2026-09-29 on one hackbench run:
+
+```
+spin_mode 1, bypass sysctls left on   ->  ivh_head_bypass_fired delta = 13
+spin_mode 1, bypass sysctls zeroed    ->  ivh_head_bypass_fired delta =  0
+```
+
+13 fires is small, but a baseline that runs any IVH code is not a baseline.
+`ivh_tools/pvbase.sh` zeroes all 17 feature sysctls by hand and asserts eight of
+them; use it, never bare `spin_mode 1`.
+
+## A.1 The sysctls that differ across the six states
+
+| sysctl | stock PV | 1 mig+t1 | 2 +HEH | 3 +t2 | 4 +skip | 5 +hb SHIPPED |
+|---|---|---|---|---|---|---|
+| `ivh_adaptive_mode` | 0 | 2 | 2 | 2 | 2 | 2 |
+| `ivh_cs_criterion` | 0 | 0 | 1 | 1 | 1 | 1 |
+| `ivh_cs_head_bail` | 0 | 0 | 1 | 1 | 1 | 1 |
+| `ivh_cs_head_probe` | 0 | 0 | 1 | 1 | 1 | 1 |
+| `ivh_cs_owner_clear` | 0 | 0 | 1 | 1 | 1 | 1 |
+| `ivh_cs_owner_enable` | 0 | 0 | 1 | 1 | 1 | 1 |
+| `ivh_cs_scan` | 0 | 0 | 1 | 1 | 1 | 1 |
+| `ivh_cs_track_enabled` | 0 | 1 | 1 | 1 | 1 | 1 |
+| `ivh_head_bypass_enable` | 0 | 0 | 0 | 0 | 0 | 1 |
+| `ivh_head_bypass_probe` | 0 | 0 | 0 | 0 | 0 | 1 |
+| `ivh_head_bypass_runs` | 0 | 1 | 1 | 1 | 1 | 1 |
+| `ivh_pv_beat_threshold` | 2200000 | 11000000 | 11000000 | 2200000 | 2200000 | 2200000 |
+| `ivh_pv_evict_enable` | 0 | 0 | 0 | 0 | 1 | 1 |
+| `ivh_pv_evict_lookahead` | 0 | 1 | 1 | 1 | 1 | 1 |
+| `ivh_pv_evict_node_stamp` | 0 | 1 | 1 | 1 | 1 | 1 |
+| `ivh_pv_preempt_src` | 0 | 2 | 2 | 2 | 2 | 2 |
+| `ivh_pv_requeue_nosteal` | 0 | 1 | 1 | 1 | 1 | 1 |
+| `ivh_pv_tier2_enable` | 0 | 0 | 0 | 1 | 1 | 1 |
+| `ivh_universal_eligible` | 0 | 1 | 1 | 1 | 1 | 1 |
+
+Identical in all six states (69 sysctls):
+
+```
+ivh_adaptive_irqoff_bail_gate=0
+ivh_cap_source=3
+ivh_capacity_threshold=1010
+ivh_cs_noise_cycles=550000
+ivh_cs_owed_ticks=2
+ivh_cs_owner_fast=0
+ivh_cs_prompt_cycles=19800
+ivh_cs_react_hist=0
+ivh_cs_recall_hist=0
+ivh_cs_tick_period=2200000
+ivh_cs_verdict=0
+ivh_eval_cooldown_ns=50000
+ivh_head_bypass_hold=0
+ivh_head_bypass_max=4
+ivh_head_bypass_onexit=1
+ivh_max_concurrent=8
+ivh_migrate_mechanism=0
+ivh_migration_timeout_ns=500000
+ivh_preempt_event_source=2
+ivh_pv_allow=1
+ivh_pv_beat_publish_mask=4095
+ivh_pv_camp_probe=0
+ivh_pv_evict_age_hist=0
+ivh_pv_evict_cheap_now=1
+ivh_pv_evict_debug=0
+ivh_pv_evict_gap_hist=0
+ivh_pv_evict_hop_cap=2
+ivh_pv_evict_promo_hist=0
+ivh_pv_evict_quiet=0
+ivh_pv_evict_threshold=1100000
+ivh_pv_irqoff_halt=0
+ivh_pv_requeue_max=4
+ivh_pv_requeue_none=0
+ivh_pv_rot_enable=0
+ivh_pv_rot_probe=0
+ivh_pv_rot_skip_max=4
+ivh_pv_skip_point=0
+ivh_pv_spin_threshold=32768
+ivh_pv_tas=0
+ivh_pv_tier1_confirm=0
+ivh_pv_tier1_enable=1
+ivh_pv_tier1_halt_min=0
+ivh_pv_trylock_relaxed=0
+ivh_pv_unhalt_avail=1
+ivh_pv_unlock_reserve=0
+ivh_pv_wait_trace=0
+ivh_sched_timeout_ms=1
+ivh_selection_trylock=1
+ivh_skipcheck_hist=0
+ivh_slowpath_wait_measure=1
+ivh_steal_source=2
+ivh_time_left_source=1
+ivh_time_left_threshold_ns=4000000
+ivh_tks_carry_ticks=8
+ivh_tks_deadband_ns=1000
+ivh_tks_duty_pct=100
+ivh_tks_idle_sub=0
+ivh_tks_on_ns=10000000
+ivh_tks_phase_pct=0
+ivh_tks_sampler_ns=0
+ivh_uc_duty_ns=0
+ivh_uc_ema_alpha_q16=868
+ivh_uc_enabled=1
+ivh_uc_min_avail_pct=10
+ivh_uc_min_steal_ns=500000
+ivh_uc_used_source=0
+ivh_uc_window_ns=200000000
+ivh_vact_jump_ns=1500000
+ivh_vact_min_preempt_ns=2000
+```
+
+## A.2 Notes on the load-bearing values
+
+- **`ivh_pv_beat_threshold`** is shared by tier 2 AND head bypass. At the shipped
+  11,000,000 (5 ms) NEITHER fires. Arms 3-5 use **2,200,000 (1 ms)**, where
+  bypass was validated at 99.7% taken and tier 2 fires ~64k/run.
+- **`ivh_head_bypass_enable=1` is not sufficient** -- `ivh_head_bypass_probe=1`
+  is also required, because the bypass code lives inside `ivh_head_observe()`
+  whose only call site is gated on the probe.
+- **`ivh_preempt_event_source=2`** is required or migration never fires; at 0,
+  Gate 2 reads a dead paravirt field.
+- **Migration is ON in every IVH arm** (`ivh_universal_eligible=1`,
+  `ivh_pv_preempt_src=2`, `ivh_time_left_threshold_ns=4000000`,
+  `ivh_max_concurrent=8`). It is the baseline mechanism, not a variable.
+- **`spin_mode` must be called FIRST** in any arm setup: it sets
+  `tier1_enable=1`, `tier2_enable=1` and forces `beat_threshold=11000000`, so
+  every feature write must follow it.
+- `ivh_pv_spin_threshold=32768` and `ivh_pv_tier1_enable=1` in all five IVH arms.
+- Skip parameters (arms 4-5): `hop_cap=2`, `requeue_max=4`, `skip_point=0`,
+  `evict_threshold=1100000`, `lookahead=1`, `nosteal=1`, `node_stamp=1`.
