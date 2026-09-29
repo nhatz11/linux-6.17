@@ -90,6 +90,19 @@ static __always_inline u64 ivh_cs_clock(void)
  * (bpf_sched_cfs_select_run_cpu_spin() is still Step 1's inert stub).
  */
 extern unsigned long ivh_universal_eligible;
+
+/*
+ * G-LOCK-49: make G-LOCK-40's RCU guard switchable, for measurement ONLY.
+ *
+ * 1 (default) = G-LOCK-40 behaviour: never migrate from inside an RCU reader.
+ * 0           = pre-G-LOCK-40 behaviour, which is UNSAFE. It permits a
+ *               GFP_KERNEL allocation and a wait_for_completion() inside a
+ *               preemptible-RCU reader, extending the grace period by the whole
+ *               migration latency. The symptom is RCU stalls under memory
+ *               pressure, and this build cannot warn (DEBUG_ATOMIC_SLEEP and
+ *               PROVE_LOCKING are off). Set to 0 only for a bounded experiment.
+ */
+extern unsigned long ivh_rcu_guard;
 bool ivh_eval_cooldown_ok(void);
 void bpf_sched_pre_lock_migrate(void);
 

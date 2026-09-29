@@ -142,7 +142,7 @@ static __always_inline void ivh_pre_lock(raw_spinlock_t *lock)
 	 * on those configs. Skipping is always safe: IVH is best-effort and
 	 * retries on the task's next acquisition outside the reader.
 	 */
-	if (rcu_preempt_depth())
+	if (READ_ONCE(ivh_rcu_guard) && rcu_preempt_depth())
 		return;
 	/*
 	 * Only migrate a genuinely runnable task. A caller may already have

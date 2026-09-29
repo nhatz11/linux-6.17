@@ -56,6 +56,7 @@ unsigned long ivh_migration_timeout_ns = 500000UL;
 unsigned long ivh_max_concurrent = 8UL;
 unsigned long ivh_sched_timeout_ms = 1UL;
 unsigned long ivh_eval_cooldown_ns = 50000UL;
+unsigned long ivh_rcu_guard = 1UL;   /* G-LOCK-49: see bpf_sched.h */
 unsigned long ivh_time_left_source = 1UL;
 unsigned long ivh_selection_trylock = 0UL;
 unsigned long ivh_migrate_mechanism = 0UL;
@@ -339,6 +340,13 @@ static const struct ctl_table ivh_sysctls[] = {
 	{
 		.procname	= "ivh_sched_timeout_ms",
 		.data		= &ivh_sched_timeout_ms,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_rcu_guard",
+		.data		= &ivh_rcu_guard,
 		.maxlen		= sizeof(unsigned long),
 		.mode		= 0644,
 		.proc_handler	= proc_doulongvec_minmax,
