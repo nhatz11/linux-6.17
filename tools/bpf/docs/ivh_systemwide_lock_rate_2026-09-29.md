@@ -102,7 +102,7 @@ other than lock behaviour. This puts a number on point 15's "PARSEC is the wrong
 instrument" for each package rather than as a blanket claim -- and `vips` (7.9x
 floor) and `dedup` (21.6x) are genuine exceptions that should not be lumped in.
 
-## 5. Two registry invocations are too short to measure
+## 5. Two registry invocations are too short to measure -- already solved
 
 `campaign/benchmarks.tsv` as written:
 
@@ -113,22 +113,41 @@ fs_mark -d /dev/shm/fsmark -D 16 -n 2000 -s 4096 -t 16 -L 1
     Count 32000  Files/sec 294,049      real 0m0.136s       <- tmpfs absorbs it
 ```
 
-Both needed all 7 reps and neither converged (spread 1.91x and 1.27x). Their
-rates are substantially process startup. Scaled to a ~10-33s window (same work,
-more of it; fsmark looped because -n/-L scale FILE COUNT and 100 iterations needs
-~13GB of /dev/shm):
+Both needed all 7 reps here and neither converged (spread 1.91x and 1.27x).
 
-| workload | rate error | slowpath error |
-|---|---|---|
-| fsmark | 4,231,795 -> 3,708,331 (**+14% high**) | 1.49% -> 0.75% (**2x high**) |
-| sysbench_mutex | 341,767 -> 266,840 (**+28% high**) | 20.22% -> 28.99% (**understated**) |
+**CORRECTION (2026-09-29).** An earlier revision of this file presented these as
+an open problem and proposed new "long variants". That was wrong: the scaled
+configurations already exist and are recorded in `eval_final.md`, validated
+2026-09-28 at 5/5 pairs:
 
-fsmark's CV collapses 8.3 -> 0.3 once the window is long enough, so that variance
-was pure startup noise. sysbench_mutex stays at CV 22% over 10s -- that variance
-is the workload. Its real 28.99% contended share is the **highest in the suite**,
-above hackbench's 16.92%.
+| workload | campaign cfg | PV | **suite cfg** | PV | IVH vs PV | t |
+|---|---|---|---|---|---|---|
+| `fsmark_tmpfs` | `-n 2000` | 0.48 s | **`-n 30000`** | 5.64 s | +208.8% thr | 24.96 |
+| `sysbench_mutex` | `--mutex-locks=40000` | 0.59 s | **`--mutex-locks=600000`** | 5.91 s | +19.8% time | 21.23 |
 
-The registry was NOT modified; the long forms are reported as separate rows.
+These scale the WORK (a single run does more), which is the right shape. The
+`fsmark_long` measured here -- 100 iterations of the short invocation -- is the
+WRONG shape: it charges 100 process startups into the measurement, the very
+defect that makes the short form untrustworthy. It is retained below only as
+evidence of the size of the error, and should not be used.
+
+```
+fsmark_tmpfs (-n 2000, 0.14s)   4,231,795 acq/s   1.49% slowpath   CV 8.3
+fsmark_long  (100x loop, 32.8s) 3,708,331 acq/s   0.75% slowpath   CV 0.3
+sysbench_mutex (0.31s)            341,767 acq/s  20.22% slowpath   CV 22.6
+sysbench_mutex_long (10.0s)       266,840 acq/s  28.99% slowpath   CV 22.1
+```
+
+The short forms overstate rate by +14% and +28%; fsmark's contended share is 2x
+too high and sysbench's is understated -- its real share is the HIGHEST in the
+suite, above hackbench's 16.92%. fsmark's CV collapses 8.3 -> 0.3 once the window
+is long enough, so that variance was pure startup noise; sysbench_mutex stays at
+CV 22% over 10 s, so that variance is the workload.
+
+**Config authority.** `campaign/benchmarks.tsv` holds the CAMPAIGN config.
+`eval_final.md`'s "suite cfg" SUPERSEDES it for the scaled workloads. Check both
+before quoting an invocation. Lock rates for the scaled configs have not been
+re-measured here; the rows above are the campaign configs.
 
 ## 6. Rate does not predict the IVH win -- now on a system-wide counter
 
