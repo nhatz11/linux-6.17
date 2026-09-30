@@ -1422,3 +1422,98 @@ ivh_vact_min_preempt_ns=2000
 - `ivh_pv_spin_threshold=32768` and `ivh_pv_tier1_enable=1` in all five IVH arms.
 - Skip parameters (arms 4-5): `hop_cap=2`, `requeue_max=4`, `skip_point=0`,
   `evict_threshold=1100000`, `lookahead=1`, `nosteal=1`, `node_stamp=1`.
+
+---
+
+# Appendix B: Point 4 -- the migratable-thread census (2026-09-30)
+
+Of the threads a workload spawns, how many can IVH act on at a lock acquisition,
+how many cannot, and why. **No kernel build required.**
+
+## B.1 Method
+
+`ivh_pre_lock()` is `__always_inline` and absent from `/proc/kallsyms`, so it
+cannot be probed. It is instead probed at its THREE call sites
+(`kernel/locking/spinlock.c:308,327,345`) -- `_raw_spin_lock`,
+`_raw_spin_lock_irqsave`, `_raw_spin_lock_irq` -- all of which call it BEFORE the
+IRQ-disabling acquire, so none is structurally dead. `ivh_eval_cooldown_ok()` IS
+a global symbol and is reached only after every static gate passes, so the tids
+seen there are the provably migratable population. Tools: `ivh_tools/point4.bt`,
+`point4.sh`, `point4_all.sh`.
+
+Two traps, both hit and fixed:
+* Linux truncates `comm` to 15 chars, so `memtier_benchmark` never matches --
+  use `memtier_benchma`.
+* The probe must ATTACH BEFORE the workload starts. kprobe setup takes seconds
+  and `fsmark` completes in ~1.5 s under IVH, so an attach-after ordering
+  measured nothing and looked like a genuine zero.
+
+## B.2 Results
+
+Full stack, `tlt=10ms`, `cap=8`, `ivh_rcu_guard=0`. Each row filtered to the
+workload's own user threads (no kernel threads counted).
+
+```
+workload                 pass %  not running %   pinned %   acquisitions   evaluated
+ebizzy_mmap               99.1%           0.5%       0.4%     16,929,315     578,201
+hackbench_pipe_thr        98.9%           0.7%       0.4%     12,044,516     218,411
+dbench_16                 87.8%           5.7%       6.5%      3,610,407     175,797
+wis_mmap2                  0.2%           0.8%      99.0%      3,472,822         887
+fsmark_tmpfs              98.4%           1.4%       0.2%      7,541,153     234,472
+memtier_memcached         97.3%           1.2%       1.2%     27,173,501     519,897
+nhextend_full             90.2%           9.0%       0.8%      7,520,986     336,129
+parsec_vips               94.1%           1.9%       3.9%        592,344      87,980
+parsec_dedup              98.5%           0.5%       1.0%      4,026,602     344,463
+tinyconfig                81.1%           5.1%      12.4%        249,240      15,700
+parsec_bodytrack          82.0%           9.9%       8.1%        621,832      49,390
+parsec_canneal            99.5%           0.0%       0.5%         83,952      47,428
+```
+
+Remainder to 100% is nested acquisition (`lock_depth > 0`): tinyconfig 1.4%,
+memtier 0.2%, others ~0. Columns are ACQUISITION counts, not thread counts.
+
+## B.3 The two reject conditions
+
+**`not running`** -- `current->__state != TASK_RUNNING`. The caller already did
+`set_current_state(TASK_INTERRUPTIBLE)` as part of a prepare-to-wait sequence and
+is taking this lock as bookkeeping before its own `schedule()`. Migrating there
+would consume the sleep state and dequeue the task on a wakeup nobody will send
+-- a lost wakeup. Skipping is safe; IVH retries on the next acquisition while
+running. Tracks how much a workload blocks: nhextend 9.0%, bodytrack 9.9% at the
+top, ebizzy 0.5% at the bottom.
+
+**`pinned`** -- `cpumask_weight(current->cpus_ptr) <= 1` (`fair.c:13938`, checked
+AFTER the cooldown). Three causes:
+1. DELIBERATE affinity. `will-it-scale`'s `*_threads` harness pins each worker to
+   its own CPU -- verified directly: worker tids read `Cpus_allowed_list` 0,1,2,...
+   while only the main thread reads 0-15. That is the entire 99.0%.
+2. SELF-INFLICTED. Migration mechanism 0 sets `cpus_mask = {target_cpu}` for the
+   duration of a move, so any lock taken inside that window reads as pinned.
+   That is the 0.2-1.2% on everything else -- IVH seeing its own migrations.
+3. SHORT-LIVED FORKS. tinyconfig's 12.4%: a kernel build forks hundreds of
+   processes frequently mid-migration or mid-exit when they take locks.
+
+## B.4 What the census actually shows
+
+1. **Thread eligibility is almost never the constraint.** Eleven of twelve
+   workloads have 81-99.5% of acquisitions eligible.
+2. **The cooldown is the dominant filter, and it is not a gate.** ebizzy passes
+   99.1% of acquisitions and evaluates 3.8% of them; `ivh_eval_cooldown_ns=50000`
+   discards the other 96%. Funnel: 16,929,315 acquisitions -> 15,060,621 gated ->
+   578,201 evaluated -> ~9,870 migrations.
+3. **`wis_mmap2` is structurally unmigratable** -- 887 evaluations out of 3.47M
+   acquisitions -- which is why it produced ~480 migrations regardless of any
+   parameter in points 7 and 8. Yet an A/B (n=5) attributes its gain to migration
+   anyway: pv 253,405 / adaptive-spinning-only 261,383 (+3.15%) / full 302,165
+   (+19.24%). ~480 migrations carry +16pp. NOT EXPLAINED; do not cite wis as
+   evidence for coverage-driven benefit until it is.
+4. **Kernel threads are not excluded.** `ivh_pre_lock()` never tests
+   `PF_KTHREAD`. A system-wide probe (no comm filter) during an nhextend run:
+   73,182 kernel-thread acquisitions passed every gate and 2,394 reached the
+   decision, dominated by `rcu_preempt` (51,925) and `migration/N` (~18,400) --
+   IVH evaluating whether to migrate the migration machinery. Per-CPU kthreads
+   are rejected only incidentally, by the pinned gate.
+5. **nhextend's gate entries are not its lock.** `ivh_adaptive_futex_lock.h` is a
+   userspace spin-then-futex lock whose fast path never enters the kernel. Its
+   stacks are ~611,000 `open()` and ~611,000 `cpu_clock_sample()` per 8 s run;
+   futex appears at a count of 1. The lock under test is invisible to IVH.

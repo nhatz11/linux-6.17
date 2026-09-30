@@ -1,0 +1,227 @@
+arm: full stack, tlt=10ms, cap=8, rcu_guard=0
+
+=== ebizzy_mmap (comm=ebizzy) ===
+  rcu_guard=0
+  threads seen taking locks            16
+  threads that passed ALL gates        16   (reached ivh_eval_cooldown_ok)
+  threads that evaluated migration     16   (reached bpf_sched_pre_lock_migrate)
+  threads NEVER migratable              0
+
+  acquisitions: 16,929,315   passed gates: 15,060,621   evaluated: 578,201
+
+  why NOT migratable (per acquisition):
+    0_PASSES_visible_gates               16,773,002   99.1%
+    5_not_TASK_RUNNING                       80,416    0.5%
+    G3_pinned_to_one_cpu                     75,897    0.4%
+  threads pinned to one cpu            16
+  acquisitions in an RCU reader      16,086,978  (95.0% of all)
+
+  passes everything bpftrace can see :   16,773,002
+  actually reached the gated call    :   15,060,621
+  => failed on preemptible()/in_task():    1,712,381  ( 10.2% of visible-pass)
+
+=== hackbench_pipe_thr (comm=hackbench) ===
+  rcu_guard=0
+  threads seen taking locks            17
+  threads that passed ALL gates        17   (reached ivh_eval_cooldown_ok)
+  threads that evaluated migration     17   (reached bpf_sched_pre_lock_migrate)
+  threads NEVER migratable              0
+
+  acquisitions: 12,044,516   passed gates: 8,766,898   evaluated: 218,411
+
+  why NOT migratable (per acquisition):
+    0_PASSES_visible_gates               11,917,247   98.9%
+    5_not_TASK_RUNNING                       82,890    0.7%
+    G3_pinned_to_one_cpu                     44,378    0.4%
+  threads pinned to one cpu            16
+  acquisitions in an RCU reader         296,389  (2.5% of all)
+
+  passes everything bpftrace can see :   11,917,247
+  actually reached the gated call    :    8,766,898
+  => failed on preemptible()/in_task():    3,150,349  ( 26.4% of visible-pass)
+
+=== dbench_16 (comm=dbench) ===
+  rcu_guard=0
+  threads seen taking locks            17
+  threads that passed ALL gates        17   (reached ivh_eval_cooldown_ok)
+  threads that evaluated migration     17   (reached bpf_sched_pre_lock_migrate)
+  threads NEVER migratable              0
+
+  acquisitions: 3,610,407   passed gates: 2,443,082   evaluated: 175,797
+
+  why NOT migratable (per acquisition):
+    0_PASSES_visible_gates                3,169,952   87.8%
+    G3_pinned_to_one_cpu                    233,574    6.5%
+    5_not_TASK_RUNNING                      206,881    5.7%
+  threads pinned to one cpu            16
+  acquisitions in an RCU reader         370,240  (10.3% of all)
+
+  passes everything bpftrace can see :    3,169,952
+  actually reached the gated call    :    2,443,082
+  => failed on preemptible()/in_task():      726,870  ( 22.9% of visible-pass)
+
+=== wis_mmap2 (comm=mmap2_threads) ===
+  rcu_guard=0
+  threads seen taking locks            17
+  threads that passed ALL gates        16   (reached ivh_eval_cooldown_ok)
+  threads that evaluated migration     16   (reached bpf_sched_pre_lock_migrate)
+  threads NEVER migratable              1
+
+  acquisitions: 2,501,814   passed gates: 505   evaluated: 474
+
+  why NOT migratable (per acquisition):
+    G3_pinned_to_one_cpu                  2,479,663   99.1%
+    5_not_TASK_RUNNING                       22,139    0.9%
+    0_PASSES_visible_gates                        1    0.0%
+  threads pinned to one cpu            16
+  acquisitions in an RCU reader           1,118  (0.0% of all)
+
+  passes everything bpftrace can see :            1
+  actually reached the gated call    :          505
+  => failed on preemptible()/in_task():         -504  (-50400.0% of visible-pass)
+
+=== fsmark_tmpfs (comm=fs_mark) ===
+  rcu_guard=0
+  threads seen taking locks             0
+  threads that passed ALL gates         0   (reached ivh_eval_cooldown_ok)
+  threads that evaluated migration      0   (reached bpf_sched_pre_lock_migrate)
+  threads NEVER migratable              0
+
+  acquisitions: 0   passed gates: 0   evaluated: 0
+
+  why NOT migratable (per acquisition):
+  threads pinned to one cpu             0
+  acquisitions in an RCU reader               0  (0.0% of all)
+
+=== memtier_memcached (comm=memtier_benchmark) ===
+  rcu_guard=0
+  threads seen taking locks             0
+  threads that passed ALL gates         0   (reached ivh_eval_cooldown_ok)
+  threads that evaluated migration      0   (reached bpf_sched_pre_lock_migrate)
+  threads NEVER migratable              0
+
+  acquisitions: 0   passed gates: 0   evaluated: 0
+
+  why NOT migratable (per acquisition):
+  threads pinned to one cpu             0
+  acquisitions in an RCU reader               0  (0.0% of all)
+
+=== nhextend_full (comm=NHextend-full) ===
+  rcu_guard=0
+  threads seen taking locks            17
+  threads that passed ALL gates        17   (reached ivh_eval_cooldown_ok)
+  threads that evaluated migration     17   (reached bpf_sched_pre_lock_migrate)
+  threads NEVER migratable              0
+
+  acquisitions: 4,110,195   passed gates: 2,608,849   evaluated: 184,482
+
+  why NOT migratable (per acquisition):
+    0_PASSES_visible_gates                3,707,894   90.2%
+    5_not_TASK_RUNNING                      368,374    9.0%
+    G3_pinned_to_one_cpu                     33,927    0.8%
+  threads pinned to one cpu            16
+  acquisitions in an RCU reader       1,119,891  (27.2% of all)
+
+  passes everything bpftrace can see :    3,707,894
+  actually reached the gated call    :    2,608,849
+  => failed on preemptible()/in_task():    1,099,045  ( 29.6% of visible-pass)
+
+=== parsec_vips (comm=vips) ===
+  rcu_guard=0
+  threads seen taking locks            19
+  threads that passed ALL gates        19   (reached ivh_eval_cooldown_ok)
+  threads that evaluated migration     19   (reached bpf_sched_pre_lock_migrate)
+  threads NEVER migratable              0
+
+  acquisitions: 592,344   passed gates: 364,092   evaluated: 87,980
+
+  why NOT migratable (per acquisition):
+    0_PASSES_visible_gates                  557,670   94.1%
+    G3_pinned_to_one_cpu                     23,174    3.9%
+    5_not_TASK_RUNNING                       11,494    1.9%
+  threads pinned to one cpu            19
+  acquisitions in an RCU reader          99,018  (16.7% of all)
+
+  passes everything bpftrace can see :      557,670
+  actually reached the gated call    :      364,092
+  => failed on preemptible()/in_task():      193,578  ( 34.7% of visible-pass)
+
+=== parsec_dedup (comm=dedup) ===
+  rcu_guard=0
+  threads seen taking locks            18
+  threads that passed ALL gates        18   (reached ivh_eval_cooldown_ok)
+  threads that evaluated migration     18   (reached bpf_sched_pre_lock_migrate)
+  threads NEVER migratable              0
+
+  acquisitions: 4,026,602   passed gates: 3,617,402   evaluated: 344,463
+
+  why NOT migratable (per acquisition):
+    0_PASSES_visible_gates                3,967,156   98.5%
+    G3_pinned_to_one_cpu                     39,118    1.0%
+    5_not_TASK_RUNNING                       20,327    0.5%
+  threads pinned to one cpu            17
+  acquisitions in an RCU reader       2,711,809  (67.3% of all)
+
+  passes everything bpftrace can see :    3,967,156
+  actually reached the gated call    :    3,617,402
+  => failed on preemptible()/in_task():      349,754  (  8.8% of visible-pass)
+
+=== tinyconfig (comm=make) ===
+  rcu_guard=0
+  threads seen taking locks           807
+  threads that passed ALL gates       796   (reached ivh_eval_cooldown_ok)
+  threads that evaluated migration    795   (reached bpf_sched_pre_lock_migrate)
+  threads NEVER migratable             11
+
+  acquisitions: 249,240   passed gates: 166,936   evaluated: 15,700
+
+  why NOT migratable (per acquisition):
+    0_PASSES_visible_gates                  202,037   81.1%
+    G3_pinned_to_one_cpu                     30,840   12.4%
+    5_not_TASK_RUNNING                       12,773    5.1%
+    3_lock_depth>0_nested                     3,590    1.4%
+  threads pinned to one cpu           779
+  acquisitions in an RCU reader          73,003  (29.3% of all)
+
+  passes everything bpftrace can see :      202,037
+  actually reached the gated call    :      166,936
+  => failed on preemptible()/in_task():       35,101  ( 17.4% of visible-pass)
+
+=== parsec_bodytrack (comm=bodytrack) ===
+  rcu_guard=0
+  threads seen taking locks            18
+  threads that passed ALL gates        18   (reached ivh_eval_cooldown_ok)
+  threads that evaluated migration     18   (reached bpf_sched_pre_lock_migrate)
+  threads NEVER migratable              0
+
+  acquisitions: 621,832   passed gates: 190,311   evaluated: 49,390
+
+  why NOT migratable (per acquisition):
+    0_PASSES_visible_gates                  510,178   82.0%
+    5_not_TASK_RUNNING                       61,453    9.9%
+    G3_pinned_to_one_cpu                     50,201    8.1%
+  threads pinned to one cpu            18
+  acquisitions in an RCU reader          45,971  (7.4% of all)
+
+  passes everything bpftrace can see :      510,178
+  actually reached the gated call    :      190,311
+  => failed on preemptible()/in_task():      319,867  ( 62.7% of visible-pass)
+
+=== parsec_canneal (comm=canneal) ===
+  rcu_guard=0
+  threads seen taking locks             1
+  threads that passed ALL gates         1   (reached ivh_eval_cooldown_ok)
+  threads that evaluated migration      1   (reached bpf_sched_pre_lock_migrate)
+  threads NEVER migratable              0
+
+  acquisitions: 83,952   passed gates: 47,942   evaluated: 47,428
+
+  why NOT migratable (per acquisition):
+    0_PASSES_visible_gates                   83,573   99.5%
+    G3_pinned_to_one_cpu                        379    0.5%
+  threads pinned to one cpu             1
+  acquisitions in an RCU reader          52,189  (62.2% of all)
+
+  passes everything bpftrace can see :       83,573
+  actually reached the gated call    :       47,942
+  => failed on preemptible()/in_task():       35,631  ( 42.6% of visible-pass)
