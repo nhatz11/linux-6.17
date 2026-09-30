@@ -13887,12 +13887,24 @@ static __always_inline bool ivh_gate_time_left_reject(struct rq *rq, u64 last_cs
 			u64 ref = max(rq->ivh_vact_last_preempt_tsc,
 				      rq->ivh_vact_idle_exit_tsc);
 
-			last_active = use_ewma ? READ_ONCE(rq->ewma_act_ns) :
+			/*
+			 * G-LOCK-52: zero means "no EWMA available" -- either
+			 * not yet seeded, or expired by ivh_ucw_tick() because
+			 * vcap stopped writing it. Fall back to the always-live
+			 * last_active rather than to 0, which would stop Gate 2
+			 * rejecting and silently INCREASE migrations. The
+			 * freshness test costs nothing here because the tick
+			 * already did it.
+			 */
+			u64 e = use_ewma ? READ_ONCE(rq->ewma_act_ns) : 0;
+
+			last_active = e ? e :
 				ivh_tsc_cycles_to_ns(rq->ivh_vact_last_active_c);
 			elapsed_since_active = ivh_tsc_cycles_to_ns(ivh_raw_tsc() - ref);
 		} else {
-			last_active = use_ewma ? READ_ONCE(rq->ewma_act_ns)
-					       : rq->last_active_time;
+			u64 e = use_ewma ? READ_ONCE(rq->ewma_act_ns) : 0;
+
+			last_active = e ? e : rq->last_active_time;
 			elapsed_since_active = sched_clock() -
 				max(rq->last_preemption, (u64)rq->last_idle_tp);
 		}

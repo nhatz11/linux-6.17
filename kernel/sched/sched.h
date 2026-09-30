@@ -185,6 +185,29 @@ extern void ivh_ucw_tick(void);			/* kernel/sched/core.c */
 extern unsigned long ivh_act_ema_alpha_q16;	/* kernel/sched/bpf_sched.c */
 extern unsigned long ivh_act_clamp_ns;		/* kernel/sched/bpf_sched.c */
 
+/*
+ * G-LOCK-52: active time can come from vcap too.
+ *
+ * ivh_act_writer: 0 = ivh_vact_tick() computes the EWMA in-kernel
+ * (default); 1 = vcap writes rq->ewma_act_ns via /proc/ivh_act_write.
+ *
+ * Userspace is the better instrument here, which is the opposite of what
+ * I first argued. The in-kernel detector runs on the 1kHz tick and only
+ * classifies gaps above ivh_vact_jump_ns (1.5ms), so a burst is quantised
+ * to whole tick periods and anything shorter than 1.5ms is invisible.
+ * vcap's spin measures every gap in its window at ~100ns resolution
+ * directly -- it is not "sampling a 148Hz signal at 1Hz", it measures the
+ * signal itself during the burst. Strictly better resolved.
+ *
+ * STALENESS FAILS BACK, NOT OPEN. A stale capacity can safely read 1024
+ * (Gate 1 rejects, IVH goes quiet), but a stale active time reading 0
+ * would make Gate 2 stop rejecting -- i.e. MORE migrations, the wrong
+ * direction. So ivh_ucw_tick() zeroes ewma_act_ns when it expires, and the
+ * source=2 gate branch falls back to the always-live last_active when it
+ * sees zero. No rdtsc is added to the gate to achieve that.
+ */
+extern unsigned long ivh_act_writer;		/* kernel/sched/bpf_sched.c */
+
 /* ivh_steal_source: 0 (default) = paravirt_steal_clock() host truth;
  * 2 = ivh_tick_steal_accumulate()'s tick-gap estimator, the one production
  * actually runs. Value 1 (REF_TSC-inferred, Plan 2) is a documented dead
@@ -1579,6 +1602,9 @@ struct rq {
 	u64			ivh_ucw_stamp;		/* ivh_raw_tsc() at that write */
 	u64			ivh_ucw_writes;		/* instrumentation */
 	u64			ivh_ucw_stale_events;	/* instrumentation */
+	u64			ivh_acw_stamp;		/* G-LOCK-52: active-time write */
+	u64			ivh_acw_writes;
+	u64			ivh_acw_stale_events;
 };
 
 #ifdef CONFIG_FAIR_GROUP_SCHED

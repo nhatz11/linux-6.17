@@ -325,6 +325,7 @@ unsigned long ivh_ucw_max_age_ns = 3000000000UL;	/* 3 s */
  */
 unsigned long ivh_act_ema_alpha_q16 = 19195UL;
 unsigned long ivh_act_clamp_ns = 100000000UL;		/* 100 ms */
+unsigned long ivh_act_writer = 0UL;			/* G-LOCK-52 */
 
 static const struct ctl_table ivh_sysctls[] = {
 	{
@@ -499,6 +500,13 @@ static const struct ctl_table ivh_sysctls[] = {
 	{
 		.procname	= "ivh_act_ema_alpha_q16",
 		.data		= &ivh_act_ema_alpha_q16,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_act_writer",
+		.data		= &ivh_act_writer,
 		.maxlen		= sizeof(unsigned long),
 		.mode		= 0644,
 		.proc_handler	= proc_doulongvec_minmax,

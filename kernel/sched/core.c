@@ -735,6 +735,29 @@ static void ivh_uc_maybe_close_window(struct rq *rq, u64 now)
 static DEFINE_PER_CPU(u64, ivh_act_hist[IVH_BEAT_AGE_HIST_BUCKETS]);
 
 /*
+ * ivh_acw_expire - G-LOCK-52. Zero a stale userspace-written ewma_act_ns so
+ * the source=2 gate branch falls back to last_active. Zeroing is the fail-
+ * BACK: leaving a frozen value would keep Gate 2 rejecting on evidence that
+ * no longer exists, and the gate's own `e ? e : last_active` then picks the
+ * live detector up transparently.
+ */
+static void ivh_acw_expire(struct rq *rq, u64 now)
+{
+	u64 max_age_ns = READ_ONCE(ivh_ucw_max_age_ns);
+
+	if (!READ_ONCE(ivh_act_writer))
+		return;
+	if (!rq->ivh_acw_stamp ||
+	    (max_age_ns &&
+	     (s64)(now - rq->ivh_acw_stamp) > (s64)ivh_tsc_ns_to_cycles(max_age_ns))) {
+		if (READ_ONCE(rq->ewma_act_ns)) {
+			WRITE_ONCE(rq->ewma_act_ns, 0);
+			rq->ivh_acw_stale_events++;
+		}
+	}
+}
+
+/*
  * ivh_ucw_tick - G-LOCK-51's staleness watchdog for userspace-written
  * capacity. Runs on the tick, NOT in the gate: ivh_gate_capacity() stays a
  * single plain load, because the one place this project cannot afford an
@@ -752,11 +775,15 @@ void ivh_ucw_tick(void)
 	u64 max_age_ns, now;
 	s64 age;
 
-	if (likely(!READ_ONCE(ivh_cap_writer)))
+	if (likely(!READ_ONCE(ivh_cap_writer) && !READ_ONCE(ivh_act_writer)))
 		return;
 
 	max_age_ns = READ_ONCE(ivh_ucw_max_age_ns);
 	now = ivh_raw_tsc();
+	ivh_acw_expire(rq, now);
+
+	if (!READ_ONCE(ivh_cap_writer))
+		return;
 	age = (s64)(now - rq->ivh_ucw_stamp);
 
 	if (unlikely(!rq->ivh_ucw_stamp) ||
@@ -770,6 +797,7 @@ void ivh_ucw_tick(void)
 
 	WRITE_ONCE(rq->ivh_uc_capacity, READ_ONCE(rq->ivh_ucw_capacity_raw));
 }
+
 
 /*
  * ============================ G-LOCK-51 procfs ============================
@@ -874,71 +902,191 @@ static const struct proc_ops ivh_cap_write_ops = {
 	.proc_lseek	= noop_llseek,
 };
 
+/*
+ * Per-OPEN snapshot buffer.
+ *
+ * The first version generated into a local buffer and guarded with
+ * `if (*ppos) return 0`. That is wrong: simple_read_from_buffer() advances
+ * *ppos, so any reader whose buffer is smaller than the file got EOF on its
+ * SECOND read and silently saw a truncated file. awk uses 1024 bytes and
+ * the file is ~1759, so awk saw 8 of 16 CPUs with no error -- precisely the
+ * plausible-but-wrong failure this interface was supposed to make
+ * impossible.
+ *
+ * Correct shape: regenerate at *ppos==0 into a buffer owned by this open,
+ * and serve continuations from it. Partial reads work; an lseek(0) + read
+ * regenerates, so a held fd cannot serve stale bytes; and reading past the
+ * end still returns 0. Generation happens in read(), never in open(), which
+ * is the property that matters (memory ivh_kcore_fd_must_reopen).
+ */
+struct ivh_stats_buf {
+	char   *buf;
+	size_t  len;
+};
+
+static int ivh_cpu_stats_open(struct inode *ino, struct file *f)
+{
+	struct ivh_stats_buf *sb = kzalloc(sizeof(*sb), GFP_KERNEL);
+
+	if (!sb)
+		return -ENOMEM;
+	f->private_data = sb;
+	return 0;
+}
+
+static int ivh_cpu_stats_release(struct inode *ino, struct file *f)
+{
+	struct ivh_stats_buf *sb = f->private_data;
+
+	if (sb) {
+		kfree(sb->buf);
+		kfree(sb);
+	}
+	return 0;
+}
+
+/*
+ * /proc/ivh_act_write -- G-LOCK-52. Same format and same all-or-nothing
+ * contract as ivh_cap_write, but values are NANOSECONDS of mean active
+ * burst, not a 1024-scale ratio, so the only bound is the clamp.
+ */
+static ssize_t ivh_act_write(struct file *f, const char __user *ubuf,
+			     size_t count, loff_t *ppos)
+{
+	char buf[IVH_CAP_WRITE_MAX], *p;
+	int n = 0, cpu;
+	u64 now, cap_ns = READ_ONCE(ivh_act_clamp_ns);
+
+	if (count == 0 || count >= sizeof(buf))
+		return -EINVAL;
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+	buf[count] = '\0';
+
+	p = buf;
+	while (*p && n < nr_cpu_ids) {
+		char *end;
+
+		while (*p == ' ' || *p == '\t' || *p == '\n')
+			p++;
+		if (!*p)
+			break;
+		simple_strtoull(p, &end, 10);
+		if (end == p)
+			return -EINVAL;
+		n++;
+		p = end;
+		while (*p == ';' || *p == ',' || *p == ' ' || *p == '\n')
+			p++;
+	}
+	if (!n)
+		return -EINVAL;
+
+	now = ivh_raw_tsc();
+	p = buf;
+	for (cpu = 0; cpu < n; cpu++) {
+		unsigned long long v;
+		char *end;
+		struct rq *rq;
+
+		while (*p == ' ' || *p == '\t' || *p == '\n')
+			p++;
+		v = simple_strtoull(p, &end, 10);
+		p = end;
+		while (*p == ';' || *p == ',' || *p == ' ' || *p == '\n')
+			p++;
+
+		if (!cpu_online(cpu))
+			continue;
+		if (cap_ns && v > cap_ns)
+			v = cap_ns;
+		rq = cpu_rq(cpu);
+		WRITE_ONCE(rq->ewma_act_ns, v);
+		WRITE_ONCE(rq->ivh_acw_stamp, now);
+		rq->ivh_acw_writes++;
+	}
+	return count;
+}
+
+static const struct proc_ops ivh_act_write_ops = {
+	.proc_write	= ivh_act_write,
+	.proc_lseek	= noop_llseek,
+};
+
 static ssize_t ivh_cpu_stats_read(struct file *f, char __user *ubuf,
 				  size_t count, loff_t *ppos)
 {
-	char *buf;
-	size_t sz = 256 + (size_t)nr_cpu_ids * 192;
+	struct ivh_stats_buf *sb = f->private_data;
+	size_t sz = 256 + (size_t)nr_cpu_ids * 224;
 	int len = 0, cpu;
 	u64 now;
-	ssize_t ret;
 
-	/* Second read on the same fd: EOF, never a repeat of stale bytes. */
-	if (*ppos)
-		return 0;
+	if (!sb)
+		return -EINVAL;
 
-	buf = kmalloc(sz, GFP_KERNEL);
-	if (!buf)
-		return -ENOMEM;
+	if (*ppos == 0) {
+		kfree(sb->buf);
+		sb->len = 0;
+		sb->buf = kmalloc(sz, GFP_KERNEL);
+		if (!sb->buf)
+			return -ENOMEM;
 
-	now = ivh_raw_tsc();
-	len += scnprintf(buf + len, sz - len,
-			 "# ivh_cpu_stats v1 tsc_khz=%u seq=%llu now_tsc=%llu\n",
-			 tsc_khz, atomic64_inc_return(&ivh_cpu_stats_seq), now);
-	len += scnprintf(buf + len, sz - len,
-			 "# cpu tsc idle_ns steal_ns used_ns nr_running jumps "
-			 "idle_expl last_active_c ewma_act_ns uc_cap ucw_age_c "
-			 "ucw_writes ucw_stale\n");
+		now = ivh_raw_tsc();
+		len += scnprintf(sb->buf + len, sz - len,
+				 "# ivh_cpu_stats v2 tsc_khz=%u seq=%llu now_tsc=%llu\n",
+				 tsc_khz,
+				 atomic64_inc_return(&ivh_cpu_stats_seq), now);
+		len += scnprintf(sb->buf + len, sz - len,
+				 "# cpu tsc idle_ns steal_ns used_ns nr_running jumps "
+				 "idle_expl last_active_c ewma_act_ns uc_cap ucw_age_c "
+				 "ucw_writes ucw_stale acw_age_c acw_writes\n");
 
-	for_each_online_cpu(cpu) {
-		struct rq *rq = cpu_rq(cpu);
-		u64 used;
+		for_each_online_cpu(cpu) {
+			struct rq *rq = cpu_rq(cpu);
+			u64 used;
 
-		used = kcpustat_cpu(cpu).cpustat[CPUTIME_USER]
-		     + kcpustat_cpu(cpu).cpustat[CPUTIME_NICE]
-		     + kcpustat_cpu(cpu).cpustat[CPUTIME_SYSTEM];
+			used = kcpustat_cpu(cpu).cpustat[CPUTIME_USER]
+			     + kcpustat_cpu(cpu).cpustat[CPUTIME_NICE]
+			     + kcpustat_cpu(cpu).cpustat[CPUTIME_SYSTEM];
 
-		len += scnprintf(buf + len, sz - len,
-			"%d %llu %llu %llu %llu %u %llu %llu %llu %llu %lu %lld %llu %llu\n",
-			cpu,
-			ivh_raw_tsc(),
-			ivh_idle_ns(cpu),
-			ivh_uc_steal_ns(cpu),
-			used,
-			rq->nr_running,
-			rq->ivh_vact_jumps,
-			rq->ivh_vact_idle_explained,
-			rq->ivh_vact_last_active_c,
-			READ_ONCE(rq->ewma_act_ns),
-			READ_ONCE(rq->ivh_uc_capacity),
-			rq->ivh_ucw_stamp ? (s64)(now - rq->ivh_ucw_stamp) : -1,
-			rq->ivh_ucw_writes,
-			rq->ivh_ucw_stale_events);
+			len += scnprintf(sb->buf + len, sz - len,
+				"%d %llu %llu %llu %llu %u %llu %llu %llu %llu %lu %lld %llu %llu %lld %llu\n",
+				cpu,
+				ivh_raw_tsc(),
+				ivh_idle_ns(cpu),
+				ivh_uc_steal_ns(cpu),
+				used,
+				rq->nr_running,
+				rq->ivh_vact_jumps,
+				rq->ivh_vact_idle_explained,
+				rq->ivh_vact_last_active_c,
+				READ_ONCE(rq->ewma_act_ns),
+				READ_ONCE(rq->ivh_uc_capacity),
+				rq->ivh_ucw_stamp ? (s64)(now - rq->ivh_ucw_stamp) : -1,
+				rq->ivh_ucw_writes,
+				rq->ivh_ucw_stale_events,
+				rq->ivh_acw_stamp ? (s64)(now - rq->ivh_acw_stamp) : -1,
+				rq->ivh_acw_writes);
+		}
+		sb->len = len;
 	}
 
-	ret = simple_read_from_buffer(ubuf, count, ppos, buf, len);
-	kfree(buf);
-	return ret;
+	if (!sb->buf)
+		return 0;
+	return simple_read_from_buffer(ubuf, count, ppos, sb->buf, sb->len);
 }
 
 static const struct proc_ops ivh_cpu_stats_ops = {
+	.proc_open	= ivh_cpu_stats_open,
 	.proc_read	= ivh_cpu_stats_read,
 	.proc_lseek	= default_llseek,
+	.proc_release	= ivh_cpu_stats_release,
 };
 
 static int __init ivh_proc_init(void)
 {
 	proc_create("ivh_cap_write", 0200, NULL, &ivh_cap_write_ops);
+	proc_create("ivh_act_write", 0200, NULL, &ivh_act_write_ops);
 	proc_create("ivh_cpu_stats", 0444, NULL, &ivh_cpu_stats_ops);
 	return 0;
 }
@@ -1054,7 +1202,7 @@ void ivh_vact_tick(void)
 			 * those dominate the average, and they also push the
 			 * Q16 accumulator past the bound ivh_uc_ema() assumes.
 			 */
-			if (actc > 0) {
+			if (actc > 0 && !READ_ONCE(ivh_act_writer)) {
 				u64 act_ns = ivh_tsc_cycles_to_ns((u64)actc);
 				u64 cap_ns = READ_ONCE(ivh_act_clamp_ns);
 
