@@ -13669,6 +13669,58 @@ static DEFINE_PER_CPU(u64, ivh_steal_imminent_capacity_reject);
 static DEFINE_PER_CPU(u64, ivh_steal_imminent_time_left_reject);
 
 /*
+ * G-LOCK-50 (DIAGNOSTIC ONLY, no behaviour change): Gate 2's denominator
+ * and its degenerate-input rate.
+ *
+ * ivh_steal_imminent_time_left_reject already counts Gate 2 FIRINGS, but
+ * nothing counts how often Gate 2 is CONSULTED -- and Gate 1 runs first,
+ * so the two are not complements. Without the denominator a threshold
+ * sweep cannot distinguish "the knob does nothing" from "the gate is
+ * never reached", which is precisely the ambiguity that left the
+ * ivh_time_left_threshold_ns sweep (eval_final.md sec 7, 240 runs,
+ * t=1.33) unresolved.
+ *
+ * ivh_g2_zero_input counts evaluations where the gate's own input is 0.
+ * Gate 2's `last_active != 0` guard then short-circuits to "do not
+ * reject" for a bookkeeping reason rather than a physical one; a
+ * 2026-09-30 snapshot put this at 11-15% of samples on contended vCPUs
+ * and it is one of the two defects an EWMA would repair. Pairs with
+ * bucket 0 of ivh_act_hist (kernel/sched/core.c), which is the same
+ * event counted at the producer.
+ */
+static DEFINE_PER_CPU(u64, ivh_g2_eval);
+static DEFINE_PER_CPU(u64, ivh_g2_zero_input);
+
+/*
+ * ivh_act_hist (kernel/sched/core.c) counts one sample per PREEMPTION
+ * EVENT. Gate 2 does not sample that way: it reads whatever value is
+ * current at an arbitrary lock acquisition, and a long burst stays current
+ * for longer than a short one. The consumed distribution is therefore
+ * LENGTH-BIASED relative to the produced one, with mean E[X^2]/E[X]
+ * instead of E[X] -- for a heavy-tailed series those differ by an order of
+ * magnitude, and it is the consumed one that sets the firing rate.
+ *
+ * Measured on G-LOCK-49 before this build: Gate 2 fired 32,370,242 times
+ * against ~74,374,133 consultations (43.5%), which the produced
+ * distribution alone cannot explain and which refutes "Gate 2 never
+ * rejects". The live hypothesis this histogram tests is that the consumed
+ * distribution is BIMODAL -- a near-zero mode and a stale multi-second
+ * mode, with little mass across the 500us..10ms band the
+ * ivh_time_left_threshold_ns sweep covered. That shape would produce a
+ * high firing rate AND an inert knob simultaneously, which is the
+ * combination actually observed and which no single-mode model explains.
+ *
+ * Same 32-bucket log2 geometry as ivh_act_hist, so the two are directly
+ * comparable bucket-for-bucket. NOTE the unit caveat: at
+ * ivh_preempt_event_source != 2 the field read is rq->last_active_time,
+ * which is NANOSECONDS, not TSC cycles -- but that branch is degenerate-
+ * zero on this kernel (no CONFIG_PARAVIRT_TIME_ACCOUNTING) so every sample
+ * lands in bucket 0 and the scale mismatch cannot silently corrupt a
+ * reading. Production runs source=2, where this is cycles.
+ */
+static DEFINE_PER_CPU(u64, ivh_g2_act_hist[IVH_BEAT_AGE_HIST_BUCKETS]);
+
+/*
  * ivh_wait diagnostic registry -- EXPERIMENT ONLY (bare-schedule() hang
  * investigation, production 2026-06-30). Records every in-flight
  * self-migration attempt in bpf_sched_pre_lock_migrate() below. Ported:
@@ -13847,6 +13899,28 @@ static __always_inline bool ivh_steal_imminent(struct rq *rq)
 	if (ivh_gate_capacity(rq, cap_src) > ivh_capacity_threshold) {
 		this_cpu_inc(ivh_steal_imminent_capacity_reject);
 		return false;
+	}
+
+	/*
+	 * G-LOCK-50 diagnostic. Counted here and NOT in
+	 * ivh_rq_capacity_and_timeleft_ok() below, for the reason that
+	 * function's own comment gives: it runs on every return-to-userspace
+	 * for every eligible thread and would swamp these counters with
+	 * advisory evaluations that never correspond to a real decision.
+	 * The field read is the one the LIVE branch reads, so the zero-rate
+	 * stays honest under either ivh_preempt_event_source.
+	 */
+	{
+		u64 act = tsc_pe ? rq->ivh_vact_last_active_c
+				 : rq->last_active_time;
+		int ab = !act ? 0 :
+			 (act >= (1ULL << (IVH_BEAT_AGE_HIST_BUCKETS - 1)) ?
+			  IVH_BEAT_AGE_HIST_BUCKETS - 1 : ilog2(act));
+
+		this_cpu_inc(ivh_g2_eval);
+		this_cpu_inc(ivh_g2_act_hist[ab]);
+		if (!act)
+			this_cpu_inc(ivh_g2_zero_input);
 	}
 
 	if (ivh_gate_time_left_reject(rq, current->last_cs_ns, tsc_pe)) {

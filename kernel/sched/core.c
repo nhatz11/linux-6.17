@@ -701,6 +701,31 @@ static void ivh_uc_maybe_close_window(struct rq *rq, u64 now)
 }
 
 /*
+ * G-LOCK-50 (DIAGNOSTIC ONLY, no behaviour change): the burst-length
+ * distribution that Gate 2 actually consumes.
+ *
+ * ivh_gate_time_left_reject()'s tsc_pe branch reads ONE sample --
+ * rq->ivh_vact_last_active_c, the single most recent burst. A 2026-09-30
+ * pass found that sample's median at ~0.79ms on contended vCPUs while the
+ * rate-derived mean is 5.67ms (85.7M jumps / 20h: (uptime-steal)/jumps,
+ * uniform to 0.5% across cpu0-7). A 7.2x mean/median ratio means the
+ * series is heavy-tailed, so the median says nothing about where an EWMA
+ * of it would settle -- and an EWMA is what turns
+ * ivh_time_left_threshold_ns from inert into tunable, or does not.
+ * Deciding that from a /proc/kcore snapshot is not possible: the snapshot
+ * is a biased draw from a 148Hz signal. This histogram is the unbiased
+ * population, taken at the write site, under real load.
+ *
+ * log2 buckets in raw TSC cycles, same scale and same 32-bucket geometry
+ * as ivh_cs_prev_hold_hist (<asm/ivh_tsc_beat.h>), so
+ * read_ivh_counters.py's existing print_age_hist() labels it for free.
+ * Bucket 0 = zero/negative, which is ALSO the case Gate 2 short-circuits
+ * on via its `last_active != 0` guard -- so bucket 0 is directly
+ * comparable against ivh_g2_zero_input in kernel/sched/fair.c.
+ */
+static DEFINE_PER_CPU(u64, ivh_act_hist[IVH_BEAT_AGE_HIST_BUCKETS]);
+
+/*
  * ivh_vact_tick - minimal Part C port: TSC-native, steal-time-independent
  * host-preemption detection at tick granularity. Feeds
  * ivh_gate_time_left_reject()'s tsc_pe==true branch (kernel/sched/fair.c).
@@ -781,6 +806,22 @@ void ivh_vact_tick(void)
 		rq->ivh_vact_burst_start_tsc = rq->ivh_vact_idle_exit_tsc;
 		rq->ivh_vact_idle_explained++;
 	} else {
+		/*
+		 * G-LOCK-50 diagnostic. Bucket the burst BEFORE publishing
+		 * it, so the histogram counts exactly the population that
+		 * reaches rq->ivh_vact_last_active_c -- one increment per
+		 * detected host preemption, ~148/s/vCPU under load. The
+		 * publish below is unchanged.
+		 */
+		{
+			s64 actc = (s64)(old - rq->ivh_vact_burst_start_tsc);
+			int ab = actc <= 0 ? 0 :
+				 (actc >= (1LL << (IVH_BEAT_AGE_HIST_BUCKETS - 1)) ?
+				  IVH_BEAT_AGE_HIST_BUCKETS - 1 : ilog2((u64)actc));
+
+			this_cpu_inc(ivh_act_hist[ab]);
+		}
+
 		rq->ivh_vact_last_active_c    = old - rq->ivh_vact_burst_start_tsc;
 		rq->ivh_vact_last_preempt_start_tsc = old;	/* G-LOCK-41 */
 		rq->ivh_vact_last_preempt_tsc = now;
