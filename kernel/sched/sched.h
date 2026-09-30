@@ -136,6 +136,55 @@ extern unsigned long ivh_uc_min_steal_ns;
 extern unsigned long ivh_uc_min_avail_pct;
 extern void ivh_uc_tick(void);			/* kernel/sched/core.c */
 
+/*
+ * G-LOCK-51: capacity computed in userspace again (vcap), delivered through
+ * /proc/ivh_cap_write into rq->ivh_uc_capacity -- the SAME field and the
+ * SAME ivh_cap_source=3 selector the in-kernel estimator publishes to, so
+ * the BPF side (ivh_cap_of(), the ivh_cfg map) is untouched and the
+ * ivh_cfg != ivh_cap_source trap cannot re-arm. Only the WRITER changes.
+ *
+ * ivh_cap_writer picks which writer owns the field:
+ *   0 (default) = ivh_uc_tick(), the in-kernel estimator. Unchanged.
+ *   1           = userspace. ivh_uc_close() stops publishing and
+ *                 ivh_ucw_tick() republishes the last userspace value,
+ *                 or SCHED_CAPACITY_SCALE if it has gone stale.
+ * The in-kernel estimator is deliberately NOT deleted: keeping both live
+ * on one boot is what makes kernel-vs-vcap a same-boot A/B instead of a
+ * cross-reboot comparison.
+ *
+ * ivh_ucw_max_age_ns is a function of vcap's launch cadence and a mismatch
+ * is silent, so it is a knob, not a constant. Stale fails CLOSED (capacity
+ * reads 1024 -> Gate 1 rejects -> IVH goes quiet) because a dead daemon
+ * must not leave every gate verdict frozen at its last value.
+ */
+extern unsigned long ivh_cap_writer;		/* kernel/sched/bpf_sched.c */
+extern unsigned long ivh_ucw_max_age_ns;	/* kernel/sched/bpf_sched.c */
+extern void ivh_ucw_tick(void);			/* kernel/sched/core.c */
+
+/*
+ * G-LOCK-51: Gate 2's active-time EWMA. ivh_time_left_source=2 is source 1's
+ * formula verbatim with rq->ewma_act_ns substituted for
+ * rq->ivh_vact_last_active_c -- same idle-exit max() reference, same units,
+ * so flipping 1<->2 changes the INPUT and nothing else and the two are a
+ * true A/B. (Source 0 is a different formula AND a dead field; it is left
+ * alone.)
+ *
+ * Why an EWMA is worth having even though G-LOCK-50 showed last_active is
+ * not degenerate: last_active is a single draw, and because Gate 2 samples
+ * it at an arbitrary lock acquisition it is LENGTH-BIASED -- measured
+ * consumed mean 6154us against a produced mean of 3389us, 1.8x. An EWMA
+ * estimates the produced mean instead. Expect it to fire LESS at equal
+ * threshold; arms at equal threshold are therefore NOT comparable between
+ * source 1 and source 2.
+ *
+ * ivh_act_clamp_ns exists because the produced series has CV=10.4 -- a
+ * handful of ~1s bursts on quiet vCPUs dominate the variance and would
+ * drag the average around. Clamping also keeps the Q16 accumulator inside
+ * the shift bound ivh_uc_ema() assumes.
+ */
+extern unsigned long ivh_act_ema_alpha_q16;	/* kernel/sched/bpf_sched.c */
+extern unsigned long ivh_act_clamp_ns;		/* kernel/sched/bpf_sched.c */
+
 /* ivh_steal_source: 0 (default) = paravirt_steal_clock() host truth;
  * 2 = ivh_tick_steal_accumulate()'s tick-gap estimator, the one production
  * actually runs. Value 1 (REF_TSC-inferred, Plan 2) is a documented dead
@@ -1515,6 +1564,21 @@ struct rq {
 	u64			ivh_vact_last_active_c;
 	u64			ivh_vact_jumps;		/* instrumentation */
 	u64			ivh_vact_idle_explained;	/* instrumentation */
+
+	/*
+	 * G-LOCK-51. APPENDED AT THE END OF struct rq ON PURPOSE: every
+	 * field above keeps its byte offset, so read_vact_rq.py's hardcoded
+	 * pahole table (and drift_snap.py, bench_guard.sh, g43_audit.sh,
+	 * g41_run.sh) stay correct across this build. Inserting into the
+	 * middle of the IVH block instead would shift every later field and
+	 * those tools would silently read neighbours and print plausible
+	 * garbage -- the same failure class as the frozen-kcore fd.
+	 */
+	u64			ewma_act_q;		/* Q16 accumulator for ewma_act_ns */
+	u64			ivh_ucw_capacity_raw;	/* last capacity userspace wrote */
+	u64			ivh_ucw_stamp;		/* ivh_raw_tsc() at that write */
+	u64			ivh_ucw_writes;		/* instrumentation */
+	u64			ivh_ucw_stale_events;	/* instrumentation */
 };
 
 #ifdef CONFIG_FAIR_GROUP_SCHED

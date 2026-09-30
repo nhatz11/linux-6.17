@@ -294,6 +294,38 @@ unsigned long ivh_uc_used_source = 0UL;
 unsigned long ivh_uc_min_steal_ns = 10000UL;
 unsigned long ivh_uc_min_avail_pct = 10UL;
 
+/*
+ * G-LOCK-51. ivh_cap_writer: 0 = the in-kernel ivh_uc_tick() estimator owns
+ * rq->ivh_uc_capacity (default, unchanged behaviour); 1 = userspace (vcap)
+ * owns it via /proc/ivh_cap_write and ivh_ucw_tick() republishes/expires it.
+ * ivh_cap_source stays 3 either way and the ivh_cfg BPF map never moves --
+ * only the writer changes, which is what keeps the BPF side a literal no-op
+ * and stops the ivh_cfg != ivh_cap_source trap from re-arming.
+ *
+ * ivh_ucw_max_age_ns: how stale a userspace-written capacity may be before
+ * it is treated as absent. ~3x vcap's full loop period is the right order.
+ * 0 disables expiry -- available for a deliberate experiment, but it is the
+ * setting that lets a dead daemon freeze every Gate 1 verdict silently, so
+ * it is not a default.
+ */
+unsigned long ivh_cap_writer = 0UL;
+unsigned long ivh_ucw_max_age_ns = 3000000000UL;	/* 3 s */
+
+/*
+ * G-LOCK-51 Gate 2 EWMA. alpha is Q16: 19195/65536 = 0.29289, matching
+ * vcap's own steady-state decay (main.cpp:124-131) so the two estimators
+ * are comparable. At ~148 detected preemptions/s/vCPU that is a ~20ms time
+ * constant, the right order for a signal Gate 2 consults per acquisition.
+ *
+ * ivh_act_clamp_ns: ceiling applied to a burst BEFORE it enters the EWMA.
+ * G-LOCK-50 measured the produced series at CV=10.4 -- a handful of ~1s
+ * bursts on quiet vCPUs carry most of the variance. 100ms is ~30x the
+ * measured produced mean (3389us), so it truncates only the genuine tail.
+ * 0 disables clamping.
+ */
+unsigned long ivh_act_ema_alpha_q16 = 19195UL;
+unsigned long ivh_act_clamp_ns = 100000000UL;		/* 100 ms */
+
 static const struct ctl_table ivh_sysctls[] = {
 	{
 		.procname	= "ivh_cs_track_enabled",
@@ -446,6 +478,34 @@ static const struct ctl_table ivh_sysctls[] = {
 	{
 		.procname	= "ivh_uc_min_steal_ns",
 		.data		= &ivh_uc_min_steal_ns,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_cap_writer",
+		.data		= &ivh_cap_writer,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_ucw_max_age_ns",
+		.data		= &ivh_ucw_max_age_ns,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_act_ema_alpha_q16",
+		.data		= &ivh_act_ema_alpha_q16,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_act_clamp_ns",
+		.data		= &ivh_act_clamp_ns,
 		.maxlen		= sizeof(unsigned long),
 		.mode		= 0644,
 		.proc_handler	= proc_doulongvec_minmax,

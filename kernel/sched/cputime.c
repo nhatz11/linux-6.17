@@ -564,6 +564,16 @@ void account_process_tick(struct task_struct *p, int user_tick)
 	if (!READ_ONCE(ivh_tks_sampler_ns))
 		ivh_vact_tick();
 	ivh_uc_tick();
+	/*
+	 * G-LOCK-51: republish/expire userspace-written capacity. Ordered
+	 * AFTER ivh_uc_tick() so that at ivh_cap_writer=1 the userspace
+	 * value is the last write to rq->ivh_uc_capacity in the tick, and
+	 * same placement discipline as its neighbours -- before the
+	 * vtime_accounting_enabled_this_cpu() early return, so a future
+	 * nohz_full config cannot silently punch holes in the watchdog.
+	 * Returns immediately at ivh_cap_writer=0, the default.
+	 */
+	ivh_ucw_tick();
 
 	if (vtime_accounting_enabled_this_cpu())
 		return;

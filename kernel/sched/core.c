@@ -661,9 +661,18 @@ static void ivh_uc_close(struct rq *rq, u64 now)
 
 	rq->ivh_uc_capacity_wall = (unsigned long)(rq->ivh_uc_ema_wall_q >> 16);
 	rq->ivh_uc_capacity_acct = (unsigned long)(rq->ivh_uc_ema_acct_q >> 16);
-	WRITE_ONCE(rq->ivh_uc_capacity,
-		   READ_ONCE(ivh_uc_used_source) ? rq->ivh_uc_capacity_acct
-						  : rq->ivh_uc_capacity_wall);
+	/*
+	 * G-LOCK-51: at ivh_cap_writer=1 userspace (vcap) owns
+	 * rq->ivh_uc_capacity and ivh_ucw_tick() republishes it. Keep
+	 * computing both variants regardless -- that is what makes
+	 * kernel-vs-vcap a same-boot A/B rather than a cross-reboot one --
+	 * but do not publish, or the two writers would race and the field
+	 * would flip between estimators at tick cadence.
+	 */
+	if (!READ_ONCE(ivh_cap_writer))
+		WRITE_ONCE(rq->ivh_uc_capacity,
+			   READ_ONCE(ivh_uc_used_source) ? rq->ivh_uc_capacity_acct
+							  : rq->ivh_uc_capacity_wall);
 
 	rq->ivh_uc_raw_wall = x_wall;
 	rq->ivh_uc_raw_acct = x_acct;
@@ -724,6 +733,216 @@ static void ivh_uc_maybe_close_window(struct rq *rq, u64 now)
  * comparable against ivh_g2_zero_input in kernel/sched/fair.c.
  */
 static DEFINE_PER_CPU(u64, ivh_act_hist[IVH_BEAT_AGE_HIST_BUCKETS]);
+
+/*
+ * ivh_ucw_tick - G-LOCK-51's staleness watchdog for userspace-written
+ * capacity. Runs on the tick, NOT in the gate: ivh_gate_capacity() stays a
+ * single plain load, because the one place this project cannot afford an
+ * rdtsc is the qspinlock path.
+ *
+ * Fails CLOSED. A stale value means vcap died, and a dead daemon must not
+ * leave every Gate 1 verdict frozen at whatever it last wrote -- that is
+ * invisible in throughput data and would silently invalidate every
+ * subsequent run. SCHED_CAPACITY_SCALE is the "do not act" value: Gate 1
+ * rejects, IVH goes quiet, and ivh_ucw_stale_events makes it loud.
+ */
+void ivh_ucw_tick(void)
+{
+	struct rq *rq = this_rq();
+	u64 max_age_ns, now;
+	s64 age;
+
+	if (likely(!READ_ONCE(ivh_cap_writer)))
+		return;
+
+	max_age_ns = READ_ONCE(ivh_ucw_max_age_ns);
+	now = ivh_raw_tsc();
+	age = (s64)(now - rq->ivh_ucw_stamp);
+
+	if (unlikely(!rq->ivh_ucw_stamp) ||
+	    (max_age_ns && age > (s64)ivh_tsc_ns_to_cycles(max_age_ns))) {
+		if (READ_ONCE(rq->ivh_uc_capacity) != SCHED_CAPACITY_SCALE) {
+			WRITE_ONCE(rq->ivh_uc_capacity, SCHED_CAPACITY_SCALE);
+			rq->ivh_ucw_stale_events++;
+		}
+		return;
+	}
+
+	WRITE_ONCE(rq->ivh_uc_capacity, READ_ONCE(rq->ivh_ucw_capacity_raw));
+}
+
+/*
+ * ============================ G-LOCK-51 procfs ============================
+ *
+ * Two files, one in each direction, and both shaped by a failure this
+ * project has already paid for.
+ *
+ * /proc/ivh_cap_write  (write-only)  userspace -> rq->ivh_uc_capacity
+ * /proc/ivh_cpu_stats  (read-only)   kernel    -> vcap's inputs
+ *
+ * The read file is deliberately NOT a seq_file. Memory
+ * ivh_kcore_fd_must_reopen: a held-open fd that is merely re-read served
+ * frozen, page-cached values and faked a Gate 4 conclusion twice. Content
+ * here is generated inside read() at *ppos==0, so a held fd read twice gets
+ * EOF -- a visible, immediate failure -- while an lseek(0) + read gets a
+ * genuinely fresh snapshot. The header also carries now_tsc and a
+ * monotonic seq, so a frozen reading has a frozen timestamp: two
+ * independent tripwires for the same bug class.
+ */
+#define IVH_CAP_WRITE_MAX 512
+
+static atomic64_t ivh_cpu_stats_seq = ATOMIC64_INIT(0);
+
+/*
+ * Parse "v0;v1;...;vN;" -- byte-identical to what vcap's give_to_kernel()
+ * already emits (main.cpp:491-498), so the daemon side is a pathname
+ * change and nothing else.
+ *
+ * ALL-OR-NOTHING. Validate every token first, publish only if the whole
+ * line is good: a half-updated capacity vector observed mid-scan by the BPF
+ * destination selector would silently bias target choice, and that is
+ * exactly the class of bug that does not show up in throughput data.
+ */
+static ssize_t ivh_cap_write(struct file *f, const char __user *ubuf,
+			     size_t count, loff_t *ppos)
+{
+	char buf[IVH_CAP_WRITE_MAX], *p;
+	int n = 0, cpu;
+	u64 now;
+
+	if (count == 0 || count >= sizeof(buf))
+		return -EINVAL;
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+	buf[count] = '\0';
+
+	/*
+	 * TWO PASSES, and no array: NR_CPUS is 8192 here, so an
+	 * unsigned long vals[NR_CPUS] is a 64KB stack frame. Pass 1
+	 * validates the whole line and publishes nothing; pass 2 re-parses
+	 * and publishes. Same all-or-nothing guarantee, 0 bytes of stack.
+	 */
+	p = buf;
+	while (*p && n < nr_cpu_ids) {
+		unsigned long v;
+		char *end;
+
+		while (*p == ' ' || *p == '\t' || *p == '\n')
+			p++;
+		if (!*p)
+			break;
+		v = simple_strtoul(p, &end, 10);
+		if (end == p)
+			return -EINVAL;
+		/* Same range ivh_uc_close() clamps to. */
+		if (v < 1 || v > SCHED_CAPACITY_SCALE)
+			return -ERANGE;
+		n++;
+		p = end;
+		while (*p == ';' || *p == ',' || *p == ' ' || *p == '\n')
+			p++;
+	}
+	if (!n)
+		return -EINVAL;
+
+	now = ivh_raw_tsc();
+	p = buf;
+	for (cpu = 0; cpu < n; cpu++) {
+		unsigned long v;
+		char *end;
+		struct rq *rq;
+
+		while (*p == ' ' || *p == '\t' || *p == '\n')
+			p++;
+		v = simple_strtoul(p, &end, 10);
+		p = end;
+		while (*p == ';' || *p == ',' || *p == ' ' || *p == '\n')
+			p++;
+
+		if (!cpu_online(cpu))
+			continue;
+		rq = cpu_rq(cpu);
+		WRITE_ONCE(rq->ivh_ucw_capacity_raw, v);
+		WRITE_ONCE(rq->ivh_ucw_stamp, now);
+		rq->ivh_ucw_writes++;
+	}
+	return count;
+}
+
+static const struct proc_ops ivh_cap_write_ops = {
+	.proc_write	= ivh_cap_write,
+	.proc_lseek	= noop_llseek,
+};
+
+static ssize_t ivh_cpu_stats_read(struct file *f, char __user *ubuf,
+				  size_t count, loff_t *ppos)
+{
+	char *buf;
+	size_t sz = 256 + (size_t)nr_cpu_ids * 192;
+	int len = 0, cpu;
+	u64 now;
+	ssize_t ret;
+
+	/* Second read on the same fd: EOF, never a repeat of stale bytes. */
+	if (*ppos)
+		return 0;
+
+	buf = kmalloc(sz, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	now = ivh_raw_tsc();
+	len += scnprintf(buf + len, sz - len,
+			 "# ivh_cpu_stats v1 tsc_khz=%u seq=%llu now_tsc=%llu\n",
+			 tsc_khz, atomic64_inc_return(&ivh_cpu_stats_seq), now);
+	len += scnprintf(buf + len, sz - len,
+			 "# cpu tsc idle_ns steal_ns used_ns nr_running jumps "
+			 "idle_expl last_active_c ewma_act_ns uc_cap ucw_age_c "
+			 "ucw_writes ucw_stale\n");
+
+	for_each_online_cpu(cpu) {
+		struct rq *rq = cpu_rq(cpu);
+		u64 used;
+
+		used = kcpustat_cpu(cpu).cpustat[CPUTIME_USER]
+		     + kcpustat_cpu(cpu).cpustat[CPUTIME_NICE]
+		     + kcpustat_cpu(cpu).cpustat[CPUTIME_SYSTEM];
+
+		len += scnprintf(buf + len, sz - len,
+			"%d %llu %llu %llu %llu %u %llu %llu %llu %llu %lu %lld %llu %llu\n",
+			cpu,
+			ivh_raw_tsc(),
+			ivh_idle_ns(cpu),
+			ivh_uc_steal_ns(cpu),
+			used,
+			rq->nr_running,
+			rq->ivh_vact_jumps,
+			rq->ivh_vact_idle_explained,
+			rq->ivh_vact_last_active_c,
+			READ_ONCE(rq->ewma_act_ns),
+			READ_ONCE(rq->ivh_uc_capacity),
+			rq->ivh_ucw_stamp ? (s64)(now - rq->ivh_ucw_stamp) : -1,
+			rq->ivh_ucw_writes,
+			rq->ivh_ucw_stale_events);
+	}
+
+	ret = simple_read_from_buffer(ubuf, count, ppos, buf, len);
+	kfree(buf);
+	return ret;
+}
+
+static const struct proc_ops ivh_cpu_stats_ops = {
+	.proc_read	= ivh_cpu_stats_read,
+	.proc_lseek	= default_llseek,
+};
+
+static int __init ivh_proc_init(void)
+{
+	proc_create("ivh_cap_write", 0200, NULL, &ivh_cap_write_ops);
+	proc_create("ivh_cpu_stats", 0444, NULL, &ivh_cpu_stats_ops);
+	return 0;
+}
+late_initcall(ivh_proc_init);
 
 /*
  * ivh_vact_tick - minimal Part C port: TSC-native, steal-time-independent
@@ -820,6 +1039,36 @@ void ivh_vact_tick(void)
 				  IVH_BEAT_AGE_HIST_BUCKETS - 1 : ilog2((u64)actc));
 
 			this_cpu_inc(ivh_act_hist[ab]);
+
+			/*
+			 * G-LOCK-51: Gate 2's EWMA input. Computed HERE, at
+			 * the event, on the owning CPU -- not in userspace.
+			 * A userspace EWMA would have to sample this series
+			 * through /proc at O(1Hz) while it changes at ~148Hz
+			 * and would alias badly; vcap's estimator is fine but
+			 * would be fed at the wrong rate.
+			 *
+			 * Clamp first. The produced series has CV=10.4
+			 * (G-LOCK-50: SD 35ms against a 3.4ms mean, from a
+			 * handful of ~1s bursts on quiet vCPUs). Unclamped
+			 * those dominate the average, and they also push the
+			 * Q16 accumulator past the bound ivh_uc_ema() assumes.
+			 */
+			if (actc > 0) {
+				u64 act_ns = ivh_tsc_cycles_to_ns((u64)actc);
+				u64 cap_ns = READ_ONCE(ivh_act_clamp_ns);
+
+				if (cap_ns && act_ns > cap_ns)
+					act_ns = cap_ns;
+
+				if (unlikely(!rq->ewma_act_q))
+					rq->ewma_act_q = act_ns << 16;
+				else
+					ivh_uc_ema(&rq->ewma_act_q, act_ns,
+						   (u32)READ_ONCE(ivh_act_ema_alpha_q16));
+
+				WRITE_ONCE(rq->ewma_act_ns, rq->ewma_act_q >> 16);
+			}
 		}
 
 		rq->ivh_vact_last_active_c    = old - rq->ivh_vact_burst_start_tsc;

@@ -13864,15 +13864,35 @@ static __always_inline bool ivh_gate_time_left_reject(struct rq *rq, u64 last_cs
 		/* Later tree's formula -- the one production actually runs. */
 		u64 last_active, elapsed_since_active;
 		s64 runway, time_left;
+		/*
+		 * G-LOCK-51: source 2 is THIS formula with rq->ewma_act_ns
+		 * substituted for the single most recent burst. Same idle-exit
+		 * max() reference, same units (ewma_act_ns is published in ns
+		 * by ivh_vact_tick(), and the tsc_pe branch converts
+		 * last_active to ns too), so flipping 1<->2 changes the input
+		 * and nothing else. That is deliberate: source 0 is a
+		 * DIFFERENT formula as well as a dead field, so it could never
+		 * have served as a controlled comparison.
+		 *
+		 * Expect source 2 to reject LESS at equal threshold.
+		 * last_active is sampled at an arbitrary lock acquisition and
+		 * is therefore length-biased (G-LOCK-50: consumed mean 6154us
+		 * vs produced mean 3389us); the EWMA estimates the produced
+		 * mean. Arms at equal ivh_time_left_threshold_ns are NOT
+		 * comparable across sources -- retune, do not diff.
+		 */
+		bool use_ewma = READ_ONCE(ivh_time_left_source) == 2;
 
 		if (tsc_pe) {
 			u64 ref = max(rq->ivh_vact_last_preempt_tsc,
 				      rq->ivh_vact_idle_exit_tsc);
 
-			last_active = ivh_tsc_cycles_to_ns(rq->ivh_vact_last_active_c);
+			last_active = use_ewma ? READ_ONCE(rq->ewma_act_ns) :
+				ivh_tsc_cycles_to_ns(rq->ivh_vact_last_active_c);
 			elapsed_since_active = ivh_tsc_cycles_to_ns(ivh_raw_tsc() - ref);
 		} else {
-			last_active = rq->last_active_time;
+			last_active = use_ewma ? READ_ONCE(rq->ewma_act_ns)
+					       : rq->last_active_time;
 			elapsed_since_active = sched_clock() -
 				max(rq->last_preemption, (u64)rq->last_idle_tp);
 		}
