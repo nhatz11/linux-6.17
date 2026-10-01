@@ -1901,6 +1901,7 @@ static int pv_wait_node(struct mcs_spinlock *node, struct mcs_spinlock *prev,
 	unsigned long loop;
 	unsigned long threshold;
 	u64 halt_tsc;
+	u64 ivh_halt_m;	/* G-LOCK-53 */
 	struct ivh_hb_state hb = { };
 
 	for (;;) {
@@ -2253,7 +2254,12 @@ static int pv_wait_node(struct mcs_spinlock *node, struct mcs_spinlock *prev,
 			lockevent_cond_inc(pv_wait_early, wait_early);
 			this_cpu_inc(ivh_halt_from_node);
 			halt_tsc = ivh_raw_tsc();
+			/* G-LOCK-53: gated/sched_clock halt, subset of
+			 * ivh_slowpath_wait_ns. Runs ALONGSIDE the raw-TSC
+			 * ungated record below, which other analyses need. */
+			ivh_halt_m = ivh_slowpath_halt_begin();
 			pv_wait(&pn->state, VCPU_HALTED);
+			ivh_slowpath_halt_end(ivh_halt_m);
 			ivh_node_halt_record(cause, ivh_raw_tsc() - halt_tsc);
 		}
 
@@ -3502,6 +3508,7 @@ pv_wait_head_or_lock(struct qspinlock *lock, struct mcs_spinlock *node,
 	bool bail = false;
 	int cause = IVH_CS_HALT_EXHAUST;
 	u64 halt_tsc;
+	u64 ivh_halt_m;	/* G-LOCK-53 */
 
 	/*
 	 * If pv_kick_node() already advanced our state, we don't need to
@@ -3808,7 +3815,9 @@ pv_wait_head_or_lock(struct qspinlock *lock, struct mcs_spinlock *node,
 		 * visible. Records only; nothing reads these back.
 		 */
 		halt_tsc = ivh_raw_tsc();
+		ivh_halt_m = ivh_slowpath_halt_begin();	/* G-LOCK-53 */
 		pv_wait(&lock->locked, _Q_SLOW_VAL);
+		ivh_slowpath_halt_end(ivh_halt_m);
 		{
 			u64 d = ivh_raw_tsc() - halt_tsc;
 

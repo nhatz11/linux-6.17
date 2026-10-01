@@ -307,6 +307,31 @@ extern unsigned long ivh_adaptive_irqoff_bail_gate;
  */
 extern unsigned long ivh_slowpath_wait_measure;
 DECLARE_PER_CPU(u64, ivh_slowpath_wait_ns);
+/*
+ * G-LOCK-53: halt time inside the slowpath, measured with the SAME CLOCK and
+ * behind the SAME GATE as ivh_slowpath_wait_ns.
+ *
+ * tools/bpf/docs/spin_time_measurement.md withdrew the old spin-time formula
+ *   spin = ivh_slowpath_wait_ns - (node_halt_cycles + head_halt_cycles)/2.2
+ * for two independent reasons: the halt sites carry no
+ * ivh_slowpath_wait_measure/in_interrupt() gate (so the subtrahend contains
+ * time the minuend never saw), and they use raw TSC against the minuend's
+ * sched_clock() (so /2.2 is an approximation). Measured halt/wall ratio
+ * spanned 0.030..1.746 over 243 runs, three of them implying NEGATIVE spin.
+ *
+ * This counter removes both defects: it accumulates sched_clock() deltas and
+ * only while ivh_slowpath_measure_ok() holds, so it is a strict SUBSET of
+ * ivh_slowpath_wait_ns and
+ *     spin_ns = ivh_slowpath_wait_ns - ivh_slowpath_halt_ns
+ * cannot go negative by construction. No /2.2.
+ *
+ * The existing ivh_node_halt_cycles / ivh_head_halt_cycles are deliberately
+ * left alone -- the halt-cause histograms and bail analyses depend on their
+ * ungated, raw-TSC semantics.
+ */
+DECLARE_PER_CPU(u8, ivh_slowpath_measuring);
+DECLARE_PER_CPU(u64, ivh_slowpath_halt_ns);
+DECLARE_PER_CPU(u64, ivh_slowpath_halt_events);
 
 /*
  * G-LOCK-38 item 1: the TRUE denominator. One ungated inc per xchg_tail()

@@ -58,11 +58,65 @@
  * support. Excluding interrupt-context entries entirely is the same choice
  * the precedent made, for the same reason.
  */
+/*
+ * G-LOCK-53: the ONE gate both the wait and the halt accumulators use. Any
+ * future change must apply to both or spin_ns goes negative again -- that is
+ * precisely the defect spin_time_measurement.md withdrew.
+ */
+static __always_inline bool ivh_slowpath_measure_ok(void)
+{
+	return READ_ONCE(ivh_slowpath_wait_measure) && !in_interrupt();
+}
+
 static __always_inline u64 ivh_slowpath_wait_begin(void)
 {
-	if (likely(!READ_ONCE(ivh_slowpath_wait_measure)) || in_interrupt())
+	if (likely(!ivh_slowpath_measure_ok()))
+		return 0;
+	this_cpu_write(ivh_slowpath_measuring, 1);
+	return sched_clock();
+}
+
+/*
+ * Halt bracket -- counts halt time ONLY while an enclosing slowpath wait is
+ * actually being measured, which is what makes halt a strict SUBSET of
+ * ivh_slowpath_wait_ns rather than merely "similarly gated".
+ *
+ * Re-evaluating ivh_slowpath_measure_ok() at the halt site is not sufficient.
+ * Two cases it gets wrong:
+ *   1. An interrupt lands mid-slowpath and takes its OWN contended lock. Its
+ *      wait_begin() returns 0 (in_interrupt()), but a naive halt gate would
+ *      still fire and charge that halt against the outer invocation's wait.
+ *      This is exactly memtier's profile: its halts come from net_rx_action,
+ *      tcp_v4_rcv, ep_poll_callback and sched_tick -- all interrupt context --
+ *      which is why its halt total exceeded its measured wait (ratio 1.275)
+ *      while task-context workloads sat at 0.01-0.24.
+ *   2. ivh_slowpath_wait_measure toggled on mid-slowpath: wait_begin() already
+ *      returned 0, so there is no window to be a subset of.
+ *
+ * The per-CPU depth flag is set by wait_begin() only when it really started
+ * measuring, and cleared by wait_end(). Safe as per-CPU state because the
+ * slowpath runs with preemption disabled on one CPU; the nested-interrupt case
+ * is excluded by the !in_interrupt() test, so the flag is never consumed by an
+ * invocation other than the one that set it.
+ */
+static __always_inline u64 ivh_slowpath_halt_begin(void)
+{
+	if (likely(!this_cpu_read(ivh_slowpath_measuring)) || in_interrupt())
 		return 0;
 	return sched_clock();
+}
+
+static __always_inline void ivh_slowpath_halt_end(u64 start)
+{
+	u64 now;
+
+	if (!start)
+		return;
+	now = sched_clock();
+	if (now > start) {
+		this_cpu_add(ivh_slowpath_halt_ns, now - start);
+		this_cpu_inc(ivh_slowpath_halt_events);
+	}
 }
 
 static __always_inline void ivh_slowpath_wait_end(u64 start)
@@ -71,6 +125,7 @@ static __always_inline void ivh_slowpath_wait_end(u64 start)
 
 	if (!start)
 		return;
+	this_cpu_write(ivh_slowpath_measuring, 0);
 
 	/*
 	 * Guard against a backwards TSC (unstable/unsynced across a vCPU

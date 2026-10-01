@@ -1343,6 +1343,10 @@ unsigned long ivh_adaptive_irqoff_bail_gate = 0UL;
 unsigned long ivh_slowpath_wait_measure = 0UL;
 DEFINE_PER_CPU(u64, ivh_slowpath_wait_ns);
 DEFINE_PER_CPU(u64, ivh_slowpath_wait_events);
+/* G-LOCK-53: see arch/x86/include/asm/qspinlock.h for why these exist. */
+DEFINE_PER_CPU(u8, ivh_slowpath_measuring);
+DEFINE_PER_CPU(u64, ivh_slowpath_halt_ns);
+DEFINE_PER_CPU(u64, ivh_slowpath_halt_events);
 
 #define ivh_pv_trace(fmt, ...)						\
 	do {								\
