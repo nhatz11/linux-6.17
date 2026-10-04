@@ -47,6 +47,20 @@
 #define PV_PREV_CHECK_MASK	0xff
 
 /*
+ * G-LOCK-54: the cadence above is now the FLOOR, not the whole story.
+ * ivh_pv_prev_check_mask (default 0xff) coarsens it at runtime and is NESTED
+ * INSIDE this constant at all three sites. For any mask of the form 2^n-1 with
+ * n >= 8 the nesting is exact -- (loop & mask) == 0 implies
+ * (loop & PV_PREV_CHECK_MASK) == 0 -- so 255 of every 256 iterations take the
+ * identical already-folded test they took before, and the runtime load happens
+ * only on the 1-in-256 that would have proceeded anyway. The default build is
+ * therefore free by construction; no hoist, no extra parameter.
+ * The mask CANNOT be made finer than 256: that is what the floor forbids, and
+ * a finer check would add remote reads with no new information, because the
+ * stamp it reads only refreshes on (loop & ivh_pv_beat_publish_mask) == 0.
+ */
+
+/*
  * Queue node uses: VCPU_RUNNING & VCPU_HALTED (& VCPU_SKIPPED).
  * Queue head uses: VCPU_RUNNING & VCPU_HASHED.
  */
@@ -1334,6 +1348,16 @@ pv_wait_early(struct pv_node *prev, unsigned long loop)
 
 	if ((loop & PV_PREV_CHECK_MASK) != 0)
 		return PV_BAIL_NONE;
+	if ((loop & READ_ONCE(ivh_pv_prev_check_mask)) != 0)
+		return PV_BAIL_NONE;
+	/*
+	 * Counted HERE, before every tier-1/tier-2 gate below, so the firing
+	 * rate of the cadence itself can be proven. ivh_beat_tier2_checked is
+	 * NOT a substitute: it sits behind tier 1 not firing, src != 0 and
+	 * mode == ADAPTIVE, so it cannot distinguish "the mask changed" from
+	 * "the write was refused".
+	 */
+	this_cpu_inc(ivh_prev_check_fired);
 
 	mode = READ_ONCE(ivh_adaptive_mode);
 
@@ -2009,7 +2033,8 @@ static int pv_wait_node(struct mcs_spinlock *node, struct mcs_spinlock *prev,
 			 * tier 2 is off, which is every arm we ship.
 			 */
 			if (unlikely(READ_ONCE(ivh_head_bypass_probe)) &&
-			    !(loop & PV_PREV_CHECK_MASK))
+			    !(loop & PV_PREV_CHECK_MASK) &&
+			    !(loop & READ_ONCE(ivh_pv_prev_check_mask)))
 				ivh_head_observe(lock, pp, &hb);
 
 			cause = pv_wait_early(pp, loop);
@@ -3631,7 +3656,8 @@ pv_wait_head_or_lock(struct qspinlock *lock, struct mcs_spinlock *node,
 			 * not-taken branch.
 			 */
 			if (unlikely(probe) &&
-			    (loop & PV_PREV_CHECK_MASK) == 0) {
+			    (loop & PV_PREV_CHECK_MASK) == 0 &&
+			    (loop & READ_ONCE(ivh_pv_prev_check_mask)) == 0) {
 				bool hit = ivh_cs_head_probe_one(lock, pp,
 						cs_gate, &ep_acq, &ep_start,
 						&ep_any);
@@ -3805,7 +3831,20 @@ pv_wait_head_or_lock(struct qspinlock *lock, struct mcs_spinlock *node,
 		 * close the gap but break the ivh_head_arm == ivh_halt_from_head
 		 * site identity that is Stage 0's acceptance check.
 		 */
-		WRITE_ONCE(pn->head_ctl, HC(0, 0, HEAD_ARMED));
+		/*
+		 * G-LOCK-54 fix: HC(0, ...) zeroes the UPPER 32 bits, which is
+		 * where ivh_node_stamp_set() put the halt stamp ~25 lines above
+		 * (the `if (ivh_pv_tier1_halt_min) ivh_node_stamp_set()` site).
+		 * Writing HC(0, 0, HEAD_ARMED) here therefore destroyed that
+		 * stamp before pv_wait(), so the G-LOCK-44 head stamp has never
+		 * been readable by a successor and ivh_node_halt_fresh() fell
+		 * through to "unknown" for the single longest-lived halt in the
+		 * queue -- exactly the node the duration gate exists to see.
+		 * Preserve the stamp; set only the state field.
+		 */
+		WRITE_ONCE(pn->head_ctl,
+			   (READ_ONCE(pn->head_ctl) & ~0xffffffffULL) |
+			   HEAD_ARMED);
 		/*
 		 * Stage B: measure the halt, do not assume it helped. Bracketed
 		 * exactly as pv_wait_node() brackets its own pv_wait(), and

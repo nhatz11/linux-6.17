@@ -1530,6 +1530,12 @@ static unsigned long ivh_evict_thr_max = 22000000UL;	/* 10 ms */
  */
 #define IVH_EVICT_THRESHOLD_US	500ULL
 unsigned long ivh_pv_beat_publish_mask = 0xfffUL;
+/*
+ * G-LOCK-54. 0xff == the old compile-time PV_PREV_CHECK_MASK, so the default
+ * build is behaviourally identical to G-LOCK-53. See the extern in
+ * <asm/ivh_tsc_beat.h> for the nesting argument and the range rationale.
+ */
+unsigned long ivh_pv_prev_check_mask __read_mostly = 0xffUL;
 
 /*
  * is_cs_preempted() knobs. All default 0 / inert: at these values the feature
@@ -1587,6 +1593,7 @@ DEFINE_PER_CPU(u64, ivh_beat_tier1_fired);
 DEFINE_PER_CPU(u64, ivh_halt_from_node);
 DEFINE_PER_CPU(u64, ivh_halt_from_head);
 DEFINE_PER_CPU(u64, ivh_beat_tier2_checked);
+DEFINE_PER_CPU(u64, ivh_prev_check_fired);
 DEFINE_PER_CPU(u64, ivh_beat_tier2_fired);
 DEFINE_PER_CPU(u64, ivh_node_spin_iters_sum);
 DEFINE_PER_CPU(u64, ivh_node_spin_attempts);
@@ -2300,6 +2307,56 @@ static int ivh_pv_proc_tier1_confirm(const struct ctl_table *table, int write,
  * (0xff, kernel/locking/qspinlock_paravirt.h) and must be a (2^n - 1) form,
  * because the spin loops test `(loop & mask) == 0`.
  */
+/*
+ * G-LOCK-54: ivh_pv_prev_check_mask.
+ *
+ * Deliberately NOT cross-validated against ivh_pv_beat_publish_mask. The
+ * publish >= check rule is a store-rate efficiency heuristic ("publishing more
+ * often than anyone reads is pure waste"), not a correctness requirement, and
+ * making BOTH handlers validate against each other creates an ordering trap:
+ * with the arm scripts' publish=255 the check mask could not be raised at all
+ * until publish was raised first, and a script without `set -e` would take the
+ * -EINVAL silently and sweep a value it never applied. This project has
+ * already lost measurements to a silently-refused mask.
+ *
+ * What IS enforced, because each is a real hazard:
+ *   val < 0xff   -- a finer check than the floor pounds the predecessor's
+ *                   cacheline for no new information; val == 0 would run
+ *                   pv_wait_early()'s full body, including two remote loads,
+ *                   on EVERY iteration across all vCPUs.
+ *   val > 0xfff  -- beyond this the cadence approaches the spin budget.
+ *   not 2^n-1    -- the loops test (loop & mask) == 0.
+ *   val >= ivh_pv_spin_threshold -- the test would never fire, taking tier 1,
+ *                   tier 2, head bypass and the CS head probe dark at once
+ *                   while every enable= sysctl still reads 1.
+ */
+static int ivh_pv_proc_prev_check_mask(const struct ctl_table *table, int write,
+				       void *buffer, size_t *lenp, loff_t *ppos)
+{
+	unsigned long val = READ_ONCE(ivh_pv_prev_check_mask);
+	struct ctl_table tmp = *table;
+	int ret;
+
+	tmp.data = &val;
+	ret = proc_doulongvec_minmax(&tmp, write, buffer, lenp, ppos);
+	if (ret || !write)
+		return ret;
+
+	if (val < 0xffUL || val > 0xfffUL || (val & (val + 1))) {
+		pr_err("IVH: refusing ivh_pv_prev_check_mask=0x%lx: must be of the form 2^n-1 within [0xff, 0xfff]\n",
+		       val);
+		return -EINVAL;
+	}
+	if (val >= READ_ONCE(ivh_pv_spin_threshold)) {
+		pr_err("IVH: refusing ivh_pv_prev_check_mask=0x%lx: must stay below ivh_pv_spin_threshold=%lu, or the check never fires\n",
+		       val, READ_ONCE(ivh_pv_spin_threshold));
+		return -EINVAL;
+	}
+
+	WRITE_ONCE(ivh_pv_prev_check_mask, val);
+	return 0;
+}
+
 static int ivh_pv_proc_beat_publish_mask(const struct ctl_table *table, int write,
 					 void *buffer, size_t *lenp, loff_t *ppos)
 {
@@ -2731,6 +2788,13 @@ static const struct ctl_table ivh_pv_sysctls[] = {
 		.maxlen		= sizeof(unsigned long),
 		.mode		= 0644,
 		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_pv_prev_check_mask",
+		.data		= &ivh_pv_prev_check_mask,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= ivh_pv_proc_prev_check_mask,
 	},
 	{
 		.procname	= "ivh_pv_beat_publish_mask",

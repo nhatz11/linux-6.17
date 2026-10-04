@@ -89,6 +89,18 @@ DECLARE_PER_CPU_ALIGNED(struct ivh_tsc_beat, ivh_tsc_beat);
 extern unsigned long ivh_pv_preempt_src;
 extern unsigned long ivh_pv_beat_threshold;
 extern unsigned long ivh_pv_beat_publish_mask;
+/*
+ * ivh_pv_prev_check_mask (G-LOCK-54) -- how often a spinning waiter inspects
+ * its PREDECESSOR, as (loop & mask) == 0. Default 0xff reproduces the old
+ * compile-time PV_PREV_CHECK_MASK exactly. NESTED INSIDE that constant at all
+ * three call sites, so it can only make the check COARSER, never finer: a
+ * finer check cannot see anything new, because the stamp it reads refreshes
+ * only on (loop & ivh_pv_beat_publish_mask) == 0.
+ * Range [0xff, 0xfff], 2^n-1, and strictly below ivh_pv_spin_threshold --
+ * at mask >= threshold the test never fires and tier 1, tier 2, head bypass
+ * and the CS head probe all go dark while every enable= sysctl still reads 1.
+ */
+extern unsigned long ivh_pv_prev_check_mask;
 
 /*
  * ivh_pv_tier1_confirm (G-LOCK-25 scoping) -- tier 1 (prev->state !=
@@ -172,6 +184,8 @@ DECLARE_PER_CPU(u64, ivh_halt_from_head);
  * `tier2_fired / tier2_checked` directly instead of inferring it.
  */
 DECLARE_PER_CPU(u64, ivh_beat_tier2_checked);
+/* Incremented at the prev-check cadence test itself, BEFORE any tier gate. */
+DECLARE_PER_CPU(u64, ivh_prev_check_fired);
 DECLARE_PER_CPU(u64, ivh_beat_tier2_fired);
 /*
  * Spin-iteration accounting (GLOCK-10): ivh_lock_halt only measures time
