@@ -2303,9 +2303,18 @@ static int ivh_pv_proc_tier1_confirm(const struct ctl_table *table, int write,
 }
 
 /*
- * The publish mask must stay coarser than or equal to PV_PREV_CHECK_MASK
- * (0xff, kernel/locking/qspinlock_paravirt.h) and must be a (2^n - 1) form,
- * because the spin loops test `(loop & mask) == 0`.
+ * The publish mask must be a (2^n - 1) form, because the spin loops test
+ * `(loop & mask) == 0`.
+ *
+ * G-LOCK-54: the floor moved 0xff -> 0x1f. The old floor encoded "publishing
+ * more often than anyone reads is pure waste" (a store-rate heuristic, not
+ * correctness) and assumed the reader's cadence was the fixed 0xff. Now that
+ * ivh_pv_prev_check_mask is itself tunable, that assumption no longer holds,
+ * and a 32/64/128-iteration experiment on BOTH masks has to be expressible.
+ * What the floor still buys is the one case that is genuinely dangerous:
+ * mask == 0 passes a bare 2^n-1 test and makes the gated body run on EVERY
+ * iteration -- for the check mask that is two remote cacheline loads per
+ * iteration on all 16 vCPUs. 0x1f keeps 0/1/3/7/15 rejected.
  */
 /*
  * G-LOCK-54: ivh_pv_prev_check_mask.
@@ -2342,8 +2351,8 @@ static int ivh_pv_proc_prev_check_mask(const struct ctl_table *table, int write,
 	if (ret || !write)
 		return ret;
 
-	if (val < 0xffUL || val > 0xfffUL || (val & (val + 1))) {
-		pr_err("IVH: refusing ivh_pv_prev_check_mask=0x%lx: must be of the form 2^n-1 within [0xff, 0xfff]\n",
+	if (val < 0x1fUL || val > 0xfffUL || (val & (val + 1))) {
+		pr_err("IVH: refusing ivh_pv_prev_check_mask=0x%lx: must be of the form 2^n-1 within [0x1f, 0xfff]\n",
 		       val);
 		return -EINVAL;
 	}
@@ -2369,8 +2378,8 @@ static int ivh_pv_proc_beat_publish_mask(const struct ctl_table *table, int writ
 	if (ret || !write)
 		return ret;
 
-	if (val < 0xffUL || (val & (val + 1))) {
-		pr_err("IVH: refusing ivh_pv_beat_publish_mask=0x%lx: must be of the form 2^n-1 and >= PV_PREV_CHECK_MASK (0xff)\n",
+	if (val < 0x1fUL || (val & (val + 1))) {
+		pr_err("IVH: refusing ivh_pv_beat_publish_mask=0x%lx: must be of the form 2^n-1 and >= 0x1f\n",
 		       val);
 		return -EINVAL;
 	}
