@@ -1,0 +1,18 @@
+  === hackbench: migcost_light, 35179 completed migrations tracked ===
+    top comm           hackbench
+    MECH  total     117.3 ms   per migration    3.33 us   <- THE migration cost
+    DELAY total    8512.1 ms   per migration  241.97 us   (target-rq wait, NOT summed)
+    rwsem WRITE wait         7.7 ms  (comm git)
+    rwsem READ wait          2.5 ms  (comm git)
+  === memtier: migcost_light, 138522 completed migrations tracked ===
+    top comm           memtier_benchma
+    MECH  total     248.3 ms   per migration    1.79 us   <- THE migration cost
+    DELAY total   13122.6 ms   per migration   94.73 us   (target-rq wait, NOT summed)
+    rwsem WRITE wait       130.7 ms  (comm memtier_benchma)
+    rwsem READ wait          1.4 ms  (comm memtier_benchma)
+  === ebizzy: migcost_light, 27826 completed migrations tracked ===
+    top comm           ebizzy
+    MECH  total     107.6 ms   per migration    3.87 us   <- THE migration cost
+    DELAY total   17368.7 ms   per migration  624.19 us   (target-rq wait, NOT summed)
+    rwsem WRITE wait    101743.1 ms  (comm ebizzy)
+    rwsem READ wait      47033.1 ms  (comm ebizzy)
