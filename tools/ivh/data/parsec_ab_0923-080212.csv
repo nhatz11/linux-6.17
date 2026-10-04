@@ -1,0 +1,13 @@
+pkg,pair,arm,seconds,migrations
+swaptions,1,off,40.976249849,0
+swaptions,1,on,36.517185962,478
+swaptions,2,off,40.596021669,0
+swaptions,2,on,38.037883992,428
+swaptions,3,off,41.078588905,0
+swaptions,3,on,35.250228755,405
+swaptions,4,off,40.655439249,0
+swaptions,4,on,38.227684252,341
+swaptions,5,off,40.729609512,0
+swaptions,5,on,34.403707801,478
+swaptions,6,off,40.782382280,0
+swaptions,6,on,34.424226724,493

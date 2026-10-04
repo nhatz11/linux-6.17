@@ -1,0 +1,5 @@
+OK         perf_futex_wake = 0.1140 (1s)
+OK         perf_futex_wake_par = 0.0604 (2s)
+OK         perf_futex_requeue = 0.0080 (1s)
+OK         schbench = 3345.33 (15s)
+=== validation done ===

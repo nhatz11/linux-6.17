@@ -1,0 +1,140 @@
+#!/usr/bin/env bpftrace
+/*
+ * migcost_light.bt -- the low-perturbation version. $1 = seconds.
+ *
+ * WHY: migcost.bt put a kprobe on bpf_sched_pre_lock_migrate, which is entered
+ * ~48,000 times/s. Measured 2026-10-02 on nhextend_fin: migrations/run fell
+ * 1071/2190/1779 (untraced) to 399/1659/1805 (traced) and the headline went
+ * +17.5% -> +7.0%. A probe that changes the thing it measures by that much
+ * cannot be the authoritative instrument.
+ *
+ * Every probe here fires at the MIGRATION rate (~2-3k/s), not the pre-lock
+ * rate, and -- the part that matters -- all of them sit OUTSIDE my_spinlock.
+ * bpf_sched_pre_lock_migrate takes that single global raw spinlock around
+ * bpf_sched_cfs_select_run_cpu_spin() and drops it again BEFORE calling
+ * set_cpus_allowed_ptr, so probing from set_cpus_allowed_ptr onwards cannot
+ * lengthen the one critical section whose contention (ivh_trylock_misses)
+ * decides whether other threads get to migrate at all.
+ *
+ *   t_commit kprobe:set_cpus_allowed_ptr(current, ...)   committing the move
+ *   t_onrq   tp:sched:sched_migrate_task                 now on the TARGET rq
+ *   t_run    tp:sched:sched_switch (as next)             running on the target
+ *
+ * MECH  = t_onrq - t_commit    migration mechanism
+ * DELAY = t_run  - t_onrq      target runqueue wait
+ *
+ * NOT measurable here: the prologue (4 gates, lock_depth++, my_spinlock
+ * trylock) and the cfs_select walk. Those come from migcost.bt and are
+ * reported as PERTURBED, because measuring them is what does the damage.
+ */
+BEGIN { @dur = (uint64)$1; printf("migcost_light armed for %d s\n", @dur); }
+interval:s:1 { @el = @el + 1; if (@el >= @dur) { exit(); } }
+
+kprobe:set_cpus_allowed_ptr
+/ arg0 == (uint64)curtask /
+{
+	@commit[tid] = nsecs;
+	@commits = count();
+}
+
+tracepoint:sched:sched_migrate_task
+/ @commit[args->pid] != 0 /
+{
+	@onrq[args->pid] = nsecs;
+	@onrqs = count();
+	@sys_migrated[args->pid] = 1;
+	@dest_cpu[args->dest_cpu] = count();
+}
+
+tracepoint:sched:sched_switch
+/ @onrq[args->next_pid] != 0 /
+{
+	$p = args->next_pid;
+	$c = @commit[$p];
+	$o = @onrq[$p];
+	$r = nsecs;
+
+	@n                        = count();
+	@c_n[args->next_comm]     = count();
+	@c_mech[args->next_comm]  = sum($o - $c);
+	@c_delay[args->next_comm] = sum($r - $o);
+	@h_mech_us                = hist(($o - $c) / 1000);
+	@h_delay_us               = hist(($r - $o) / 1000);
+
+	delete(@commit[$p]);
+	delete(@onrq[$p]);
+}
+
+/*
+ * ivh_cs_enter cost, SPLIT (fixed 2026-10-02).
+ *
+ * The whole-syscall duration is NOT the trap: ivh_cs_enter ->
+ * bpf_sched_pre_lock_migrate -> set_cpus_allowed_ptr BLOCKS in
+ * affine_move_task()'s wait_for_completion until the task is running on the
+ * target, so a migrating call's duration already CONTAINS cost+delay and must
+ * never be added to them.
+ *
+ * @sys_trap_* : calls during which NO migration happened -- the gates rejected,
+ *               or the target was the current CPU. Duration = syscall entry,
+ *               dispatch, the 4 gates, return. THIS is the trap cost.
+ * @sys_mig_*  : calls that blocked through a migration. Reported separately so
+ *               the overlap is visible instead of silently summed.
+ * Every call pays the trap, so total trap = mean(@sys_trap) * all calls.
+ */
+kprobe:__x64_sys_ivh_cs_enter
+{
+	@sys_t0[tid] = nsecs;
+	delete(@sys_migrated[tid]);
+}
+kretprobe:__x64_sys_ivh_cs_enter
+/ @sys_t0[tid] != 0 /
+{
+	$d = nsecs - @sys_t0[tid];
+	@sys_n          = count();
+	@sys_ns         = sum($d);
+	@c_sys_n[comm]  = count();
+	@c_sys_ns[comm] = sum($d);
+	if (@sys_migrated[tid] != 0) {
+		@sys_mig_n   = count();
+		@sys_mig_ns  = sum($d);
+		@h_sys_mig_us = hist($d / 1000);
+	} else {
+		@sys_trap_n   = count();
+		@sys_trap_ns  = sum($d);
+		@h_sys_trap_us = hist($d / 1000);
+	}
+	delete(@sys_t0[tid]);
+	delete(@sys_migrated[tid]);
+}
+
+/*
+ * rwsem slowpath wait, per comm. ivh_slowpath_wait_ns counts QSPINLOCKS ONLY,
+ * and ebizzy -m contends on mmap_lock, which is an rwsem -- so on that workload
+ * the qspinlock counter alone measures a term worth <1% of vCPU time and misses
+ * the lock that actually serialises it. Time inside rwsem_down_*_slowpath is
+ * the lock wait (optimistic spin plus block), which is what migration is meant
+ * to shorten. Measured rate under ebizzy: 1,925 write + 1,150 read per second,
+ * i.e. the same order as the migration rate, so this is affordable here.
+ */
+kprobe:rwsem_down_write_slowpath { @rww_t0[tid] = nsecs; }
+kretprobe:rwsem_down_write_slowpath
+/ @rww_t0[tid] != 0 /
+{
+	@rww_ns[comm] = sum(nsecs - @rww_t0[tid]);
+	@rww_n[comm]  = count();
+	delete(@rww_t0[tid]);
+}
+kprobe:rwsem_down_read_slowpath { @rwr_t0[tid] = nsecs; }
+kretprobe:rwsem_down_read_slowpath
+/ @rwr_t0[tid] != 0 /
+{
+	@rwr_ns[comm] = sum(nsecs - @rwr_t0[tid]);
+	@rwr_n[comm]  = count();
+	delete(@rwr_t0[tid]);
+}
+
+/* GC: no per-tid state may outlive the call that created it. */
+kretprobe:set_cpus_allowed_ptr { delete(@commit[tid]); delete(@onrq[tid]); }
+
+END { clear(@commit); clear(@onrq); clear(@sys_t0); clear(@sys_migrated);
+      clear(@rww_t0); clear(@rwr_t0); clear(@dur); clear(@el); }

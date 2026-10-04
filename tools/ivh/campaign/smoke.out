@@ -1,0 +1,47 @@
+[07:32:33] === campaign start: kernel 6.17.0-G-LOCK-39-sampler+, 75 workloads, screen=2 confirm=0 ===
+[07:32:33] capacity 0-7/8-15 = 375/1023  (half contention expected: low/1024)
+[07:33:20] perf_sched_pipe block 1 (screen) order=[pv ivh ivh pv] capacity=364/1023
+[07:33:39]   perf_sched_pipe blk1 pos1 pv = 15609
+[07:33:46]   perf_sched_pipe blk1 pos2 ivh = 48679
+[07:33:50]   perf_sched_pipe blk1 pos3 ivh = 63789
+[07:34:08]   perf_sched_pipe blk1 pos4 pv = 17013
+[07:34:55] perf_sched_pipe block 2 (screen) order=[ivh pv pv ivh] capacity=367/1023
+[07:35:03]   perf_sched_pipe blk2 pos1 ivh = 42072
+[07:35:22]   perf_sched_pipe blk2 pos2 pv = 15395
+[07:35:39]   perf_sched_pipe blk2 pos3 pv = 17525
+[07:35:44]   perf_sched_pipe blk2 pos4 ivh = 61085
+[07:36:31] ebizzy_mmap block 1 (screen) order=[pv ivh ivh pv] capacity=372/1023
+[07:36:47]   ebizzy_mmap blk1 pos1 pv = 538
+[07:37:02]   ebizzy_mmap blk1 pos2 ivh = 2145
+[07:37:17]   ebizzy_mmap blk1 pos3 ivh = 2104
+[07:37:32]   ebizzy_mmap blk1 pos4 pv = 543
+[07:38:19] ebizzy_mmap block 2 (screen) order=[ivh pv pv ivh] capacity=372/1023
+[07:38:34]   ebizzy_mmap blk2 pos1 ivh = 2121
+[07:38:49]   ebizzy_mmap blk2 pos2 pv = 561
+[07:39:04]   ebizzy_mmap blk2 pos3 pv = 524
+[07:39:20]   ebizzy_mmap blk2 pos4 ivh = 2105
+[07:40:07] fsmark_tmpfs block 1 (screen) order=[pv ivh ivh pv] capacity=372/1023
+[07:40:07]   fsmark_tmpfs blk1 pos1 pv = 144204.8
+[07:40:07]   fsmark_tmpfs blk1 pos2 ivh = 293591.3
+[07:40:07]   fsmark_tmpfs blk1 pos3 ivh = 339984.1
+[07:40:08]   fsmark_tmpfs blk1 pos4 pv = 82062.0
+[07:40:56] fsmark_tmpfs block 2 (screen) order=[ivh pv pv ivh] capacity=377/1023
+[07:40:56]   fsmark_tmpfs blk2 pos1 ivh = 333470.8
+[07:40:57]   fsmark_tmpfs blk2 pos2 pv = 104965.1
+[07:40:57]   fsmark_tmpfs blk2 pos3 pv = 102536.0
+[07:40:57]   fsmark_tmpfs blk2 pos4 ivh = 477391.6
+[07:41:44] stressng_dentry block 1 (screen) order=[pv ivh ivh pv] capacity=379/1023
+[07:42:01]   stressng_dentry blk1 pos1 pv = 52463.07
+[07:42:17]   stressng_dentry blk1 pos2 ivh = 110095.08
+[07:42:33]   stressng_dentry blk1 pos3 ivh = 111064.44
+[07:42:49]   stressng_dentry blk1 pos4 pv = 53441.33
+[07:42:49]   note: kernel WARNING count 1 -> 3 (recorded, not fatal)
+[07:43:37] stressng_dentry block 2 (screen) order=[ivh pv pv ivh] capacity=372/1014
+[07:43:53]   stressng_dentry blk2 pos1 ivh = 110871.89
+[07:44:09]   stressng_dentry blk2 pos2 pv = 53364.62
+[07:44:25]   stressng_dentry blk2 pos3 pv = 51059.74
+[07:44:41]   stressng_dentry blk2 pos4 ivh = 109999.03
+[07:44:41] === screen phase complete ===
+[07:44:41] === candidates: ebizzy_mmap fsmark_tmpfs perf_sched_pipe stressng_dentry ebizzy_mmap fsmark_tmpfs perf_sched_pipe stressng_dentry  ===
+[07:44:41] === campaign complete -> /root/ivh_tools/campaign/smoke_0924_073231 ===
+[07:44:41] campaign exiting; restoring IVH+AS

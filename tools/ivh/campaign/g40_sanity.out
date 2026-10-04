@@ -1,0 +1,8 @@
+guard: sampler_ns=0  capacity(0-7/8-15)=628/1023  kernel=6.17.0-G-LOCK-40-rcufix+
+workload                     pv          ivh      delta   ref(09-15)
+perf_sched_pipe           19341        46473    +140.3%      +146.9%
+ebizzy_mmap                 965         1622     +68.1%      +104.3%
+stressng_dentry        71705.50    141696.76     +97.6%       +99.5%
+fsmark_tmpfs           136087.7     452957.6    +232.8%      +167.0%
+hackbench                25.565        5.787     +77.4%       +76.3%
+G40-SANITY-DONE

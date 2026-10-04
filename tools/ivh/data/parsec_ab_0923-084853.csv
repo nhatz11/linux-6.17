@@ -1,0 +1,13 @@
+pkg,pair,arm,seconds,migrations
+streamcluster,1,off,471.515594410,0
+streamcluster,1,on,303.879739491,328824
+streamcluster,2,off,460.810508184,0
+streamcluster,2,on,298.661405027,332283
+streamcluster,3,off,483.249538205,0
+streamcluster,3,on,302.057908608,322499
+streamcluster,4,off,469.305711550,0
+streamcluster,4,on,299.911415054,325285
+streamcluster,5,off,474.387444397,0
+streamcluster,5,on,302.397292431,326106
+streamcluster,6,off,459.117365147,0
+streamcluster,6,on,300.895986168,329399

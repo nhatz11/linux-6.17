@@ -1,0 +1,10 @@
+verdict    workload                   median   n  wins  per-block %
+CANDIDATE  ebizzy_mmap               +291.3%   2   2/2  +293.1 +289.5
+CANDIDATE  fsmark_tmpfs              +235.4%   2   2/2  +180.0 +290.8
+CANDIDATE  perf_sched_pipe           +229.1%   2   2/2  +244.8 +213.4
+CANDIDATE  stressng_dentry           +110.2%   2   2/2  +108.8 +111.5
+
+CANDIDATE ebizzy_mmap
+CANDIDATE fsmark_tmpfs
+CANDIDATE perf_sched_pipe
+CANDIDATE stressng_dentry

@@ -1,0 +1,16 @@
+workload,rep,seconds,total_acq,slowpath
+parsec_blackscholes,1,22.312,3705060,39795
+parsec_blackscholes,2,21.587,2237366,17118
+parsec_blackscholes,3,22.140,2260016,17531
+parsec_swaptions,1,35.563,1966391,2808
+parsec_swaptions,2,35.412,1955176,2451
+parsec_swaptions,3,35.754,1984552,2775
+parsec_vips,1,12.024,2634744,17969
+parsec_vips,2,11.190,2479399,13928
+parsec_vips,3,11.034,2369020,4631
+parsec_ferret,1,65.355,4310620,2760
+parsec_ferret,2,63.609,4317104,3533
+parsec_ferret,3,63.960,4209073,3351
+parsec_bodytrack,1,60.867,9171964,126615
+parsec_bodytrack,2,60.683,7756119,91434
+parsec_bodytrack,3,60.576,7774361,88936
