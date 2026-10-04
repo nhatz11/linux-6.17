@@ -167,10 +167,60 @@ pause_filter_count, pause_filter_thresh, vCPU pinning, SEV mode
 
 ---
 
-## 6. Workloads
+## 6. Workloads -- the 10-workload suite
 
-Reuse `tools/ivh/campaign/benchmarks.tsv` as the invocation authority — taking
-invocations from anywhere else has produced wrong configs before. Start with the
-ones with the strongest lock-contention signal: `hackbench -T -g1 -f8 -l150000`,
-ebizzy, dbench, fsmark, and PARSEC dedup/vips. Note ebizzy serialises on an
-rwsem (mmap_lock), so a qspinlock-only spin metric will miss most of its wait.
+Run ALL TEN on both bench guests. Do not narrow the suite: the VM-vs-CVM gap is
+expected to vary with how much time a workload's vCPUs spend in USER mode (the
+kernel-mode filter is the only thing the CVM loses), so the SPREAD across
+workloads is itself evidence. A single workload cannot show that.
+
+| workload | invocation | recorded |
+|---|---|---|
+| hackbench | `hackbench -T -g1 -f8 -l150000` | +76.3% |
+| memtier | `memtier_benchmark -P memcache_binary -s 127.0.0.1 -p 11211 -t 16 -c 50 --key-maximum=100 --ratio=1:0 -d 32 --test-time=10 --hide-histogram` | +26.21% |
+| ebizzy | `ebizzy -S 15 -t 16 -m -s 4194304` | +104.3% ‡ |
+| fsmark | `fs_mark -d /dev/shm/fsmark -D 16 -n 30000 -s 4096 -t 16 -L 1` | +208.8% |
+| dbench | `dbench -t 15 16 -D /root/dbench_test` | +14.66% ‡ |
+| NHextend-csmin | `NHEXTEND_DURATION=8 NHEXTEND_LOOP_SPIN=600000 IVH_AFL_DISABLE=1 NHEXTEND_CS_MIN=1 NHextend-csmin -l -n 16` | +18-20% |
+| parsec dedup | `./bin/parsecmgmt -a run -p dedup -c gcc -i native -n 16` | +86.86% |
+| parsec vips | `./bin/parsecmgmt -a run -p vips -c gcc -i native -n 16` | +57.39% |
+| parsec bodytrack | `./bin/parsecmgmt -a run -p bodytrack -c gcc -i native -n 16` | +14.39% |
+| parsec canneal | `./bin/parsecmgmt -a run -p canneal -c gcc -i native -n 16` | +12.55% |
+
+PARSEC rows run from `cwd /root/parsec-benchmark`.
+
+### Per-workload traps -- every one of these cost real time to find
+
+- **memtier** needs its server tuned FIRST:
+  `memcached -u root -d -m 1024 -t 16 -p 11211 -o hashpower=15`. hashpower must
+  be >=15 at `-t 16`. Stop it with `systemctl stop memcached` BEFORE `pkill`;
+  `Restart=always` revives it otherwise.
+- **ebizzy** needs a DISCARDED WARMUP after every arm switch. Without one,
+  migrations drop ~3x and a +52% win reads as +0.57%. Its path is
+  machine-specific (`/home/nick/Desktop/ebizzy` on the old box) -- rebuild it.
+  Its recorded +104.3% was ALSO probe-inflated; the honest probe-off figure is
+  nearer +25-50%.
+- **fsmark** must use `-n 30000`. At the campaign's `-n 2000` it finishes in
+  0.48s and measures startup. Also: its total spin RISES while per-acquisition
+  spin falls, because the acquisition count explodes ~55x. Report both.
+- **dbench** must drop `-F`: +14.66% (t=10.87) without it versus -1% with it.
+  tmpfs is the LOSING direction (-16 to -20% across 6 variants).
+- **NHextend-csmin** is the csmin + pre-acquire-stamp binary with AFL off. Its
+  wait MUST come from the program's own `Total wait time` (the userspace AFL
+  lock). The kernel qspinlock counter reads ~118 events of pure noise for it and
+  once flipped its verdict from 0.17x to 113x.
+- **dedup** needs the page cache dropped before EVERY run plus a discarded
+  warmup (`tools/ivh/parsec_ab.sh` does both). Without it a 672MB ISO's cache
+  warming produced a bogus 3.6x spread. Under UNIFORM contention its PV arm
+  spans 15-231s and the row becomes unquotable -- check PV-arm CV before
+  reporting, drop above ~40%.
+- **vips** is BIMODAL in the PV arm with a ~3-in-10 disaster rate; verdicts
+  reversed at n=4/6/8/10 within one sitting. It needs ~50 pairs, and the
+  disaster rate and magnitude must be reported SEPARATELY.
+- **canneal, swaptions, ferret** sit at or near the instrument's idle floor on
+  lock rate. Expect small effects; treat them as do-no-harm controls and report
+  absolute ms, not percentages.
+
+`tools/ivh/campaign/benchmarks.tsv` is the invocation authority for anything not
+listed here, but note it has NO PARSEC rows and its fsmark/dbench rows are the
+ones corrected above.
