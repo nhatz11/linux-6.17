@@ -1536,6 +1536,24 @@ unsigned long ivh_pv_beat_publish_mask = 0xfffUL;
  * <asm/ivh_tsc_beat.h> for the nesting argument and the range rationale.
  */
 unsigned long ivh_pv_prev_check_mask __read_mostly = 0xffUL;
+/*
+ * G-LOCK-55: which CS-length reference Gate 2's time-left term consumes.
+ *   0 (default) = task->last_cs_ns -- the most recently completed CS.
+ *   1           = task->min_cs_ns  -- the shortest CS this task has completed.
+ *
+ * Kernel locks had no way to express the second: the rseq publisher
+ * (bpf_sched.c, NHEXTEND_CS_MIN=1) only exists for userspace workloads, so on
+ * hackbench/dbench/dentry the minimum was simply not collected.
+ *
+ * Expect reference=1 to make Gate 2 MORE permissive, not less: the gate
+ * computes time_left = runway - cs_ns, so a smaller cs_ns leaves more runway
+ * and rejects less. And min_cs_ns ratchets -- a kernel CS can be ~15 ns, so it
+ * converges toward that floor. That is measurable, not obviously desirable,
+ * which is why 0 stays the default.
+ */
+unsigned long ivh_cs_gate2_reference __read_mostly;
+/* G-LOCK-55: 0 = ivh_cs_owner.last_cs (default), 1 = ivh_cs_owner.min_cs. */
+unsigned long ivh_cs_heh_reference __read_mostly;
 
 /*
  * is_cs_preempted() knobs. All default 0 / inert: at these values the feature
@@ -2797,6 +2815,24 @@ static const struct ctl_table ivh_pv_sysctls[] = {
 		.maxlen		= sizeof(unsigned long),
 		.mode		= 0644,
 		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "ivh_cs_heh_reference",
+		.data		= &ivh_cs_heh_reference,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
+	},
+	{
+		.procname	= "ivh_cs_gate2_reference",
+		.data		= &ivh_cs_gate2_reference,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
 	},
 	{
 		.procname	= "ivh_pv_prev_check_mask",

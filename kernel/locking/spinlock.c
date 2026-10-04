@@ -89,7 +89,18 @@ static __always_inline void cs_exit(raw_spinlock_t *lock)
 	if (current->lock_depth == 0 && current->cs_start_ts) {
 		u64 now = ivh_cs_clock();
 
-		current->last_cs_ns = now - current->cs_wall_start_ts;
+		u64 d = now - current->cs_wall_start_ts;
+
+		current->last_cs_ns = d;
+		/*
+		 * Running minimum, for ivh_cs_gate2_reference=1. Kernel locks
+		 * have no other source for this -- the rseq publisher only
+		 * exists for userspace workloads -- so without it Gate 2's
+		 * CS-length term cannot be driven from a minimum at all on
+		 * hackbench/dbench/dentry.
+		 */
+		if (!current->min_cs_ns || d < current->min_cs_ns)
+			current->min_cs_ns = d;
 		current->cs_start_ts = 0;
 		current->cs_wall_start_ts = 0;
 	}

@@ -1446,6 +1446,16 @@ struct task_struct {
 	u64				cs_start_ts;
 	u64				cs_wall_start_ts;
 	u64				last_cs_ns;
+	/*
+	 * min_cs_ns: the SHORTEST outermost CS this task has completed, ns.
+	 * 0 == no sample yet. Monotone non-increasing by construction -- it
+	 * ratchets and never recovers, which is deliberate for a measurement
+	 * knob but is why it is NOT the default: a kernel CS can be as short
+	 * as ~15 ns (lock/unlock with almost nothing between), so min_cs_ns
+	 * converges toward that floor and makes Gate 2 maximally permissive.
+	 * Selected by ivh_cs_gate2_reference; see ivh_gate2_cs_ns().
+	 */
+	u64				min_cs_ns;
 
 	/*
 	 * ivh_exclude: sticky per-task "opt out" bit (0/1). Checked as

@@ -846,7 +846,22 @@ static inline bool is_cs_preempted(struct qspinlock *lock, struct pv_node *prev,
 	 * time; ivh_cs_noise_cycles is the knob for that.
 	 */
 	if (READ_ONCE(ivh_cs_criterion) == 1) {
-		u64 last = READ_ONCE(o->last_cs);
+		/*
+		 * G-LOCK-55: ivh_cs_heh_reference picks the BASELINE this hold
+		 * is judged against -- the holder CPU's previous hold (0,
+		 * default) or its shortest so far (1). Falls back to last_cs
+		 * when the minimum is unset, so flipping the knob on a CPU that
+		 * has not completed a hold cannot feed a zero baseline and fire
+		 * on everything. The noise margin below is ivh_cs_noise_cycles
+		 * either way; this changes the baseline, not the margin.
+		 * Read stays inside the tag -> smp_rmb -> tsc -> ... -> tag
+		 * re-read window, same as last_cs.
+		 */
+		u64 last = READ_ONCE(ivh_cs_heh_reference) ?
+			   READ_ONCE(o->min_cs) : 0;
+
+		if (!last)
+			last = READ_ONCE(o->last_cs);
 
 		if (!last) {
 			this_cpu_inc(ivh_cs_abstain_nolastcs);

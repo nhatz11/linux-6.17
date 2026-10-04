@@ -101,6 +101,23 @@ extern unsigned long ivh_pv_beat_publish_mask;
  * and the CS head probe all go dark while every enable= sysctl still reads 1.
  */
 extern unsigned long ivh_pv_prev_check_mask;
+/*
+ * ivh_cs_gate2_reference (G-LOCK-55) -- 0 = task->last_cs_ns (default),
+ * 1 = task->min_cs_ns. See ivh_gate2_cs_ns() in fair.c.
+ */
+extern unsigned long ivh_cs_gate2_reference;
+/*
+ * ivh_cs_heh_reference (G-LOCK-55) -- which reference the HEAD EARLY HALT
+ * predicate compares a holder's elapsed time against:
+ *   0 (default) = ivh_cs_owner.last_cs, the holder CPU's previous hold
+ *   1           = ivh_cs_owner.min_cs,  its shortest hold so far
+ * The noise margin added on top is ivh_cs_noise_cycles either way (22000
+ * cycles = 10 us as shipped), so this knob changes the BASELINE, not the
+ * margin. Independent of ivh_cs_gate2_reference on purpose: the two consume
+ * different clocks (TSC cycles here, ns in Gate 2) and are separate
+ * mechanisms, so they must be ablatable separately.
+ */
+extern unsigned long ivh_cs_heh_reference;
 
 /*
  * ivh_pv_tier1_confirm (G-LOCK-25 scoping) -- tier 1 (prev->state !=
@@ -552,6 +569,13 @@ struct ivh_cs_owner {
 	void	*lock;	/* the qspinlock this CPU is holding; NULL == none */
 	u64	tsc;	/* raw rdtsc() at the moment of acquisition */
 	u64	last_cs;	/* G-LOCK-31: this CPU's last completed stamped hold, cycles; 0 == unknown */
+	/*
+	 * G-LOCK-55: the SHORTEST stamped hold this CPU has completed, cycles;
+	 * 0 == unknown. Selected instead of last_cs by ivh_cs_heh_reference.
+	 * Ratchets and never recovers, by construction. Struct is 32 bytes with
+	 * this field and stays inside its own cacheline.
+	 */
+	u64	min_cs;
 } ____cacheline_aligned_in_smp;
 
 DECLARE_PER_CPU_ALIGNED(struct ivh_cs_owner, ivh_cs_owner);

@@ -13837,6 +13837,20 @@ static __always_inline unsigned long ivh_gate_capacity(struct rq *rq, unsigned l
  * at the same instant in account_idle_time() (kernel/sched/cputime.c), so
  * the max() has the same meaning in both branches below.
  */
+/*
+ * G-LOCK-55: which CS-length reference Gate 2 uses for @t.
+ *
+ * Falls back to last_cs_ns whenever the minimum is still unset (0 == no sample
+ * yet), so switching the knob on a task that has not completed a CS cannot
+ * feed the gate a zero and make it unconditionally permissive.
+ */
+static __always_inline u64 ivh_gate2_cs_ns(struct task_struct *t)
+{
+	if (READ_ONCE(ivh_cs_gate2_reference) && t->min_cs_ns)
+		return t->min_cs_ns;
+	return t->last_cs_ns;
+}
+
 static __always_inline bool ivh_gate_time_left_reject(struct rq *rq, u64 last_cs_ns,
 						      bool tsc_pe)
 {
@@ -13955,7 +13969,7 @@ static __always_inline bool ivh_steal_imminent(struct rq *rq)
 			this_cpu_inc(ivh_g2_zero_input);
 	}
 
-	if (ivh_gate_time_left_reject(rq, current->last_cs_ns, tsc_pe)) {
+	if (ivh_gate_time_left_reject(rq, ivh_gate2_cs_ns(current), tsc_pe)) {
 		this_cpu_inc(ivh_steal_imminent_time_left_reject);
 		return false;
 	}
@@ -13981,7 +13995,7 @@ static __always_inline bool ivh_rq_capacity_and_timeleft_ok(struct rq *rq,
 	if (ivh_gate_capacity(rq, cap_src) > ivh_capacity_threshold)
 		return false;
 
-	return !ivh_gate_time_left_reject(rq, t->last_cs_ns, tsc_pe);
+	return !ivh_gate_time_left_reject(rq, ivh_gate2_cs_ns(t), tsc_pe);
 }
 
 /**

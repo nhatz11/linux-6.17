@@ -627,8 +627,20 @@ SYSCALL_DEFINE0(ivh_cs_enter)
 
 		if (!copy_from_user_nofault(&last_cs_ns,
 					     &current->rseq->last_cs_overall_ns,
-					     sizeof(last_cs_ns)))
+					     sizeof(last_cs_ns))) {
 			current->last_cs_ns = last_cs_ns;
+			/*
+			 * Keep the minimum fed from the same source, so
+			 * ivh_cs_gate2_reference=1 means the same thing for an
+			 * rseq publisher as it does for a kernel lock. (A
+			 * workload already publishing its own minimum -- e.g.
+			 * NHEXTEND_CS_MIN=1 -- then yields min-of-min, which is
+			 * just that minimum.)
+			 */
+			if (last_cs_ns &&
+			    (!current->min_cs_ns || last_cs_ns < current->min_cs_ns))
+				current->min_cs_ns = last_cs_ns;
+		}
 	}
 
 	bpf_sched_pre_lock_migrate();

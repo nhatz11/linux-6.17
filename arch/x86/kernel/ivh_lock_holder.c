@@ -289,6 +289,15 @@ void __ivh_cs_owner_clear(struct qspinlock *lock)
 		/* G-LOCK-31: written after the NULL store, so a reader that sees
 		 * the tag still naming a lock never pairs it with this value. */
 		this_cpu_write(ivh_cs_owner.last_cs, (u64)held);
+		{
+			/* G-LOCK-55: running minimum, same write ordering --
+			 * after the NULL store, so a reader that still sees the
+			 * tag never pairs it with this value. */
+			u64 m = this_cpu_read(ivh_cs_owner.min_cs);
+
+			if (!m || (u64)held < m)
+				this_cpu_write(ivh_cs_owner.min_cs, (u64)held);
+		}
 	}
 
 	/*
