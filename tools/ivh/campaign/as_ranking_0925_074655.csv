@@ -1,0 +1,11 @@
+workload,rep,arm,value,migrations
+hackbench,1,pv,23.535,0
+hackbench,1,t12,4.969,21419
+hackbench,1,t12bypL,4.686,18436
+hackbench,1,t12combo,4.836,16953
+hackbench,1,t12bypLcombo,4.816,17041
+perf_sched_pipe,1,pv,19789,0
+perf_sched_pipe,1,t12,48608,136
+perf_sched_pipe,1,t12bypL,42498,135
+perf_sched_pipe,1,t12combo,46369,114
+perf_sched_pipe,1,t12bypLcombo,44998,122

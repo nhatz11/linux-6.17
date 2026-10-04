@@ -1,0 +1,108 @@
+guard: sampler_ns=0  capacity(0-7/8-15)=640/1023  kernel=6.17.0-G-LOCK-40-rcufix+
+########## hackbench ##########
+hackbench,1,pv,22.026,0,0
+hackbench,1,ivh,4.980,360146,17841
+hackbench,2,ivh,4.734,384329,17466
+hackbench,2,pv,22.665,0,0
+hackbench,3,pv,22.639,0,0
+hackbench,3,ivh,5.303,122799,27392
+########## perf_sched_pipe ##########
+perf_sched_pipe,1,pv,20362,0,0
+perf_sched_pipe,1,ivh,47722,66971,130
+perf_sched_pipe,2,ivh,51703,11965,105
+perf_sched_pipe,2,pv,19676,0,0
+perf_sched_pipe,3,pv,19650,0,0
+perf_sched_pipe,3,ivh,59470,5,102
+########## stressng_dentry ##########
+stressng_dentry,1,pv,70626.44,0,0
+stressng_dentry,1,ivh,138334.57,1262345,14816
+stressng_dentry,2,ivh,138211.48,1529159,14398
+stressng_dentry,2,pv,69665.19,0,0
+stressng_dentry,3,pv,73300.05,0,0
+stressng_dentry,3,ivh,136428.81,1207067,13995
+########## ebizzy_mmap ##########
+ebizzy_mmap,1,pv,941,0,0
+ebizzy_mmap,1,ivh,1384,56077,4779
+ebizzy_mmap,2,ivh,1425,8218,4932
+ebizzy_mmap,2,pv,944,0,0
+ebizzy_mmap,3,pv,958,0,0
+ebizzy_mmap,3,ivh,1396,8247,5029
+########## fsmark_tmpfs ##########
+fsmark_tmpfs,1,pv,166243.2,0,0
+fsmark_tmpfs,1,ivh,415571.1,7,100
+fsmark_tmpfs,2,ivh,451338.3,4,34
+fsmark_tmpfs,2,pv,160815.9,0,0
+fsmark_tmpfs,3,pv,150770.4,0,0
+fsmark_tmpfs,3,ivh,396673.8,93,71
+########## dbench ##########
+dbench,1,pv,236.075,0,0
+dbench,1,ivh,267.094,8297,51094
+dbench,2,ivh,265.348,8641,50417
+dbench,2,pv,236.203,0,0
+dbench,3,pv,226.965,0,0
+dbench,3,ivh,269.558,6352,52529
+########## dedup ##########
+dedup,1,pv,38.029958267,0,0
+dedup,1,ivh,12.621146760,1169,5300
+dedup,2,ivh,11.384398925,990,4586
+dedup,2,pv,14.695734149,0,0
+dedup,3,pv,37.340137428,0,0
+dedup,3,ivh,10.489280812,679,3742
+########## vips ##########
+vips,1,pv,23.697516381,0,0
+vips,1,ivh,15.796353288,291,3188
+vips,2,ivh,20.181395943,477,4525
+vips,2,pv,22.562377924,0,0
+vips,3,pv,31.963872480,0,0
+vips,3,ivh,15.361235733,300,3297
+########## blackscholes ##########
+blackscholes,1,pv,21.833874191,0,0
+blackscholes,1,ivh,21.038147520,36,312
+blackscholes,2,ivh,20.814729885,28,257
+blackscholes,2,pv,22.239093386,0,0
+blackscholes,3,pv,21.146765288,0,0
+blackscholes,3,ivh,20.254312352,52,275
+########## swaptions ##########
+swaptions,1,pv,35.306543622,0,0
+swaptions,1,ivh,32.725814757,47,591
+swaptions,2,ivh,32.459274092,16,497
+swaptions,2,pv,36.600993496,0,0
+swaptions,3,pv,37.021423635,0,0
+swaptions,3,ivh,32.875364196,235,616
+########## freqmine ##########
+freqmine,1,pv,44.524623503,0,0
+freqmine,1,ivh,44.967217106,151,624
+freqmine,2,ivh,41.652340515,74,637
+freqmine,2,pv,43.073996718,0,0
+freqmine,3,pv,46.136317365,0,0
+freqmine,3,ivh,44.773007886,81,697
+########## ferret ##########
+ferret,1,pv,68.862736671,0,0
+ferret,1,ivh,59.975814383,50,2436
+ferret,2,ivh,59.540635506,43,2356
+ferret,2,pv,68.621697235,0,0
+ferret,3,pv,68.417240647,0,0
+ferret,3,ivh,60.716771836,30,2255
+########## bodytrack ##########
+bodytrack,1,pv,71.361149161,0,0
+bodytrack,1,ivh,59.425660119,17483,29536
+bodytrack,2,ivh,58.898727530,16660,29098
+bodytrack,2,pv,71.065471580,0,0
+bodytrack,3,pv,71.071890317,0,0
+bodytrack,3,ivh,59.499985080,15440,29008
+########## canneal ##########
+canneal,1,pv,75.649275399,0,0
+canneal,1,ivh,73.368359432,6446,21235
+canneal,2,ivh,74.458904752,6575,21232
+canneal,2,pv,77.516942021,0,0
+canneal,3,pv,75.523444494,0,0
+canneal,3,ivh,72.512530682,5134,21156
+########## psearchy ##########
+psearchy,1,pv,7.272390,0,0
+psearchy,1,ivh,7.203741,126214,161
+psearchy,2,ivh,7.260010,118422,91
+psearchy,2,pv,7.151292,0,0
+psearchy,3,pv,7.263298,0,0
+psearchy,3,ivh,7.143839,153521,84
+WROTE fullstack_0925_214941.csv
+FULLSTACK-DONE

@@ -1,0 +1,10 @@
+pkg,pair,arm,seconds,migrations
+dedup,1,off,165.988107019,0
+dedup,1,on,7.584128517,26976
+dedup,2,on,9.223878607,31634
+dedup,2,off,24.726174804,0
+dedup,3,off,86.534626117,0
+dedup,3,on,11.053913680,35298
+dedup,4,on,10.186939407,33832
+dedup,4,off,194.388308128,0
+dedup,5,off,85.145055184,0

@@ -1,0 +1,29 @@
+guard: sampler_ns=0  capacity(0-7/8-15)=634/1023  kernel=6.17.0-G-LOCK-40-rcufix+
+########## blackscholes ##########
+blackscholes,1,pv,22.044222389
+blackscholes,1,ivh,20.115630282
+blackscholes,2,ivh,20.474570467
+blackscholes,2,pv,22.308730743
+blackscholes,3,pv,22.907694992
+blackscholes,3,ivh,20.548745747
+blackscholes,4,ivh,20.255906622
+blackscholes,4,pv,22.347000830
+blackscholes,5,pv,21.719440483
+blackscholes,5,ivh,20.749381783
+blackscholes,6,ivh,20.572114248
+blackscholes,6,pv,21.905492390
+########## canneal ##########
+canneal,1,pv,76.191822508
+canneal,1,ivh,74.857893270
+canneal,2,ivh,74.487154741
+canneal,2,pv,75.811371978
+canneal,3,pv,76.763977668
+canneal,3,ivh,74.672104611
+canneal,4,ivh,74.706032143
+canneal,4,pv,76.396139614
+canneal,5,pv,75.508339048
+canneal,5,ivh,74.308404588
+canneal,6,ivh,73.751277535
+canneal,6,pv,75.119517493
+WROTE g40_migalone_0925_065736.csv
+G40-MIGALONE-DONE

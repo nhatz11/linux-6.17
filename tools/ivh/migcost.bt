@@ -1,0 +1,128 @@
+#!/usr/bin/env bpftrace
+/*
+ * migcost.bt -- decompose one IVH self-migration into its two latencies.
+ *
+ * Anchors (all four are real events, none inferred):
+ *   t_enter  kprobe:bpf_sched_pre_lock_migrate   entering the migration function
+ *   t_commit kprobe:set_cpus_allowed_ptr         gates passed, target chosen, committing
+ *   t_onrq   tp:sched:sched_migrate_task         set_task_cpu(): now on the TARGET rq
+ *   t_run    tp:sched:sched_switch (as next)     actually running on the target
+ *
+ * COST  = t_onrq - t_enter    "entering migration function -> on target vCPU"
+ *   SELECT = t_commit - t_enter   4 gates + cfs_select_run_cpu under my_spinlock
+ *   MECH   = t_onrq  - t_commit   set_cpus_allowed_ptr -> set_task_cpu on target
+ * DELAY = t_run  - t_onrq     "on target runqueue -> running"
+ * so COST = SELECT + MECH exactly; that identity is the correctness check.
+ *
+ * GARBAGE COLLECTION (the first version got this wrong and read SELECT
+ * negative): a stale @commit[tid] left by an invocation whose migration never
+ * completed was later matched by an unrelated sched_migrate_task -- e.g. the
+ * load balancer moving the same thread -- pairing a new @enter with an old
+ * @commit. kretprobe:set_cpus_allowed_ptr wipes the per-tid state when the
+ * call returns. Every entry is therefore created and destroyed inside one
+ * invocation and cannot outlive it. The finalizer at sched_switch runs BEFORE
+ * that return, because in mechanism 0 the task resumes on the target from
+ * inside affine_move_task()'s wait, so no complete sample is lost to the GC.
+ *
+ * mechanism 0 calls set_cpus_allowed_ptr TWICE (restrict, then restore). The
+ * restore cannot be mistaken for a commit: the finalizer has already deleted
+ * @enter, and the commit probe requires @enter to be live.
+ */
+/* $1 = seconds to trace, then exit() so the maps are flushed cleanly. A
+ * SIGTERM mid-run was observed to drop the whole report. */
+BEGIN { @dur = (uint64)$1; printf("migcost armed for %d s\n", @dur); }
+interval:s:1 { @el = @el + 1; if (@el >= @dur) { exit(); } }
+
+kprobe:bpf_sched_pre_lock_migrate
+{
+	@enter[tid] = nsecs;
+	@calls = count();
+}
+
+kprobe:set_cpus_allowed_ptr
+/ @enter[tid] != 0 && arg0 == (uint64)curtask /
+{
+	@commit[tid] = nsecs;
+	@commits = count();
+}
+
+tracepoint:sched:sched_migrate_task
+/ @commit[args->pid] != 0 /
+{
+	@onrq[args->pid] = nsecs;
+	@onrqs = count();
+	@dest_cpu[args->dest_cpu] = count();
+}
+
+tracepoint:sched:sched_switch
+/ @onrq[args->next_pid] != 0 /
+{
+	$p = args->next_pid;
+	$e = @enter[$p];
+	$c = @commit[$p];
+	$o = @onrq[$p];
+	$r = nsecs;
+
+	@n            = count();
+	@sum_cost_ns  = sum($o - $e);
+	@sum_sel_ns   = sum($c - $e);
+	@sum_mech_ns  = sum($o - $c);
+	@sum_delay_ns = sum($r - $o);
+	@h_cost_us    = hist(($o - $e) / 1000);
+	@h_delay_us   = hist(($r - $o) / 1000);
+	@by_comm[args->next_comm] = count();
+	@c_n[args->next_comm]     = count();
+	@c_cost[args->next_comm]  = sum($o - $e);
+	@c_sel[args->next_comm]   = sum($c - $e);
+	@c_mech[args->next_comm]  = sum($o - $c);
+	@c_delay[args->next_comm] = sum($r - $o);
+
+	delete(@enter[$p]);
+	delete(@commit[$p]);
+	delete(@onrq[$p]);
+}
+
+kprobe:__x64_sys_ivh_cs_enter { @sys_t0[tid] = nsecs; @sys_n = count(); }
+kretprobe:__x64_sys_ivh_cs_enter
+/ @sys_t0[tid] != 0 /
+{
+	@sys_ns = sum(nsecs - @sys_t0[tid]);
+	@h_sys_us = hist((nsecs - @sys_t0[tid]) / 1000);
+	@sys_by_comm[comm] = count();
+	delete(@sys_t0[tid]);
+}
+
+/*
+ * rwsem slowpath wait, per comm. ivh_slowpath_wait_ns counts QSPINLOCKS ONLY,
+ * and ebizzy -m contends on mmap_lock, which is an rwsem -- so the qspinlock
+ * counter alone makes "saved" a lower bound on a term worth <1% of vCPU time.
+ * Time inside rwsem_down_*_slowpath is the lock wait (optimistic spin plus
+ * block), which is the quantity migration is supposed to shorten.
+ */
+kprobe:rwsem_down_write_slowpath { @rww_t0[tid] = nsecs; }
+kretprobe:rwsem_down_write_slowpath
+/ @rww_t0[tid] != 0 /
+{
+	@rww_ns[comm] = sum(nsecs - @rww_t0[tid]);
+	@rww_n[comm]  = count();
+	delete(@rww_t0[tid]);
+}
+kprobe:rwsem_down_read_slowpath { @rwr_t0[tid] = nsecs; }
+kretprobe:rwsem_down_read_slowpath
+/ @rwr_t0[tid] != 0 /
+{
+	@rwr_ns[comm] = sum(nsecs - @rwr_t0[tid]);
+	@rwr_n[comm]  = count();
+	delete(@rwr_t0[tid]);
+}
+
+/* GC: nothing per-tid may outlive the call that created it. */
+kretprobe:set_cpus_allowed_ptr
+{
+	delete(@enter[tid]);
+	delete(@commit[tid]);
+	delete(@onrq[tid]);
+}
+
+END { clear(@enter); clear(@commit); clear(@onrq); clear(@sys_t0);
+      clear(@rww_t0); clear(@rwr_t0); clear(@dur); clear(@el); }

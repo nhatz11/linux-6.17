@@ -1,0 +1,4 @@
+# knobs phase_pct=0 deadband=1000 carry=8 idle_sub=0 min_steal_ns=500000
+cpu,span_ns,true_steal_ns,true_local_ns,true_rt_ns,true_active_ns,kern_steal_ns,cap,cap_acct,d_windows,d_extended
+3,12002988017,5291653400,1020505534,510941843,5179887240,6171787325,592,619,74,0
+15,12001523410,1394817268,1595694761,507096431,8503914950,1497596803,936,943,89,22

@@ -1,0 +1,5 @@
+hackbench_pipe_thr	/root	120	hackbench -T -g4 -f8 -l50000	grep -oP '^Time:\s*\K[0-9.]+'	lo
+dbench_16	/root	120	dbench -F -t 15 36 -D /root/dbench_test	grep -oP 'Throughput\s+\K[0-9.]+'	hi
+ebizzy_mmap	/root	120	/home/nick/Desktop/ebizzy -S 15 -t 36 -m -s 4194304	grep -oP '^\K[0-9]+(?= records/s)'	hi
+stressng_flock	/root	120	stress-ng --flock 36 -t 15s --metrics-brief	grep -oP 'flock\s+\d+\s+[0-9.]+\s+[0-9.]+\s+[0-9.]+\s+\K[0-9.]+'	hi
+stressng_dentry	/root	120	stress-ng --dentry 36 -t 15s --metrics-brief	grep -oP 'dentry\s+\d+\s+[0-9.]+\s+[0-9.]+\s+[0-9.]+\s+\K[0-9.]+'	hi

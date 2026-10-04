@@ -1,0 +1,47 @@
+#!/usr/bin/env bpftrace
+/*
+ * POINT 4 -- migratable-thread census.
+ *
+ * ivh_pre_lock() is __always_inline and absent from kallsyms, so it is probed
+ * at its THREE call sites (kernel/locking/spinlock.c:308,327,345), all of which
+ * call it BEFORE the IRQ-disabling acquire, so all three can migrate:
+ *      _raw_spin_lock  _raw_spin_lock_irqsave  _raw_spin_lock_irq
+ * ivh_eval_cooldown_ok() is reached only after every static gate passes, so the
+ * tids seen there are the provably migratable population.
+ *
+ * Gate order mirrors ivh_pre_lock():
+ *   ivh_exclude -> lock_depth>0 -> rcu_preempt_depth (iff ivh_rcu_guard) ->
+ *   __state!=TASK_RUNNING -> cooldown -> [fair.c:13938] cpumask_weight<=1
+ * cpumask is checked LAST because it lives in fair.c after the cooldown, so a
+ * pinned thread still reaches ivh_eval_cooldown_ok.
+ *
+ * BPF programs hold rcu_read_lock() themselves: nesting read in-probe is always
+ * >=1, so the caller is in a reader only at depth >=2.
+ * preemptible() is not readable (x86 keeps preempt_count per-cpu, not in
+ * task_struct); its share comes out by subtraction.
+ */
+kprobe:_raw_spin_lock,
+kprobe:_raw_spin_lock_irqsave,
+kprobe:_raw_spin_lock_irq
+/comm == str($1)/ {
+    @calls = count();
+    @tid_seen[tid] = 1;
+
+    $guard = *kaddr("ivh_rcu_guard");
+    $ld = curtask->lock_depth;
+    $rcu = curtask->rcu_read_lock_nesting;
+    $st = curtask->__state;
+    $bits = curtask->cpus_ptr->bits[0];
+
+    if (curtask->ivh_exclude != 0)            { @why["2_ivh_exclude"] = count(); }
+    else if ($ld > 0)                          { @why["3_lock_depth>0_nested"] = count(); }
+    else if ($guard != 0 && $rcu >= 2)         { @why["4_in_RCU_reader_GUARDED"] = count(); }
+    else if ($st != 0)                         { @why["5_not_TASK_RUNNING"] = count(); }
+    else if ($bits != 0 && ($bits & ($bits - 1)) == 0) { @why["G3_pinned_to_one_cpu"] = count(); @tid_pinned[tid] = 1; }
+    else                                       { @why["0_PASSES_visible_gates"] = count(); @tid_ok[tid] = 1; }
+
+    /* informational: how often the caller is in an RCU reader, guard or not */
+    if ($rcu >= 2) { @in_rcu_any = count(); }
+}
+kprobe:ivh_eval_cooldown_ok    /comm == str($1)/ { @gated_ok = count(); @tid_gated[tid] = 1; }
+kprobe:bpf_sched_pre_lock_migrate /comm == str($1)/ { @evaluated = count(); @tid_eval[tid] = 1; }

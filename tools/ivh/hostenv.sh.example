@@ -1,0 +1,9 @@
+#!/bin/bash
+# Copy to hostenv.sh (gitignored) and fill in for the machine you are on.
+# The harnesses that reach the hypervisor or the co-runner VM source this.
+export IVH_HOST_IP=10.0.0.1              # hypervisor / host running the TD
+export IVH_HOST_USER=youruser
+export IVH_HOST="$IVH_HOST_USER@$IVH_HOST_IP"
+export IVH_HOST_PASS=changeme            # used by sshpass and `sudo -S` on the host
+export IVH_CORUNNER_IP=192.168.122.2     # the contending VM, reachable FROM the host
+export IVH_CORUNNER="$IVH_HOST_USER@$IVH_CORUNNER_IP"

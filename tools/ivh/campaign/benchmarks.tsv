@@ -1,0 +1,76 @@
+#name	dir	timeout	command	extractor
+hackbench_pipe_thr	/root	120	hackbench -T -g1 -f8 -l150000	grep -oP '^Time:\s*\K[0-9.]+'	lo
+hackbench_sock_thr	/root	120	hackbench -T -s 512 -g1 -f8 -l100000	grep -oP '^Time:\s*\K[0-9.]+'	lo
+hackbench_pipe_proc	/root	120	hackbench -p -g1 -f8 -l150000	grep -oP '^Time:\s*\K[0-9.]+'	lo
+perf_sched_messaging	/root	120	perf bench sched messaging -g 20 -l 2000	grep -oP 'Total time:\s*\K[0-9.]+'	lo
+perf_sched_pipe	/root	120	perf bench sched pipe -l 300000	grep -oP '^\s*\K[0-9]+(?= ops/sec)'	hi
+perf_futex_hash	/root	120	perf bench futex hash -t 16 -r 15	grep -oP 'Averaged\s+\K[0-9]+'	hi
+perf_futex_wake	/root	120	bash -c 'perf bench futex wake -t 16 2>&1'	grep -oP 'Wokeup.*in \K[0-9.]+'	lo
+perf_futex_wake_par	/root	120	bash -c 'perf bench futex wake-parallel -t 16 2>&1'	grep -oP 'latency .*in \K[0-9.]+'	lo
+perf_futex_requeue	/root	120	bash -c 'perf bench futex requeue -t 16 2>&1'	grep -oP 'Requeued.*in \K[0-9.]+'	lo
+perf_futex_lockpi	/root	120	perf bench futex lock-pi -t 16 -r 15	grep -oP 'Averaged\s+\K[0-9]+'	hi
+perf_epoll_wait	/root	120	perf bench epoll wait -t 16 -r 15	grep -oP 'Averaged\s+\K[0-9]+'	hi
+perf_epoll_ctl	/root	120	perf bench epoll ctl -t 16 -r 15	grep -oP 'Averaged\s+\K[0-9]+'	hi
+perf_syscall_basic	/root	120	perf bench syscall basic -l 30000000	grep -oP '\K[0-9]+(?= ops/sec)'	hi
+sysbench_threads	/root	120	sysbench threads --threads=16 --thread-locks=4 --time=15 run	grep -oP 'total number of events:\s*\K[0-9]+'	hi
+sysbench_mutex	/root	120	sysbench mutex --threads=16 --mutex-num=16 --mutex-locks=40000 run	grep -oP 'total time:\s*\K[0-9.]+'	lo
+dbench_16	/root	120	dbench -F -t 15 16 -D /root/dbench_test	grep -oP 'Throughput\s+\K[0-9.]+'	hi
+ebizzy_mmap	/root	120	/home/nick/Desktop/ebizzy -S 15 -t 16 -m -s 4194304	grep -oP '^\K[0-9]+(?= records/s)'	hi
+ebizzy_malloc	/root	120	/home/nick/Desktop/ebizzy -S 15 -t 16 -s 4194304	grep -oP '^\K[0-9]+(?= records/s)'	hi
+schbench	/root	120	bash -c '/root/bench/schbench/schbench -m 2 -t 8 -r 15 2>&1'	grep -oP 'average rps:\s*\K[0-9.]+'	hi
+spinbench_short	/root	120	/root/bench/micro/spinbench -t 16 -s 15 -c 50 -k 2000	grep -oP 'ops_per_sec:\s*\K[0-9]+'	hi
+spinbench_med	/root	120	/root/bench/micro/spinbench -t 16 -s 15 -c 500 -k 2000	grep -oP 'ops_per_sec:\s*\K[0-9]+'	hi
+spinbench_long	/root	120	/root/bench/micro/spinbench -t 16 -s 15 -c 5000 -k 2000	grep -oP 'ops_per_sec:\s*\K[0-9]+'	hi
+libslock_tas	/root/bench/libslock	120	./bin/stress_spinlock -n 16 -d 15000 -l 1 -a 200 -p 2000	grep -oP '#acquires.*\(\s*\K[0-9]+'	hi
+libslock_ttas	/root/bench/libslock	120	./bin/stress_ttas -n 16 -d 15000 -l 1 -a 200 -p 2000	grep -oP '#acquires.*\(\s*\K[0-9]+'	hi
+libslock_ticket	/root/bench/libslock	120	./bin/stress_ticket -n 16 -d 15000 -l 1 -a 200 -p 2000	grep -oP '#acquires.*\(\s*\K[0-9]+'	hi
+libslock_mcs	/root/bench/libslock	120	./bin/stress_mcs -n 16 -d 15000 -l 1 -a 200 -p 2000	grep -oP '#acquires.*\(\s*\K[0-9]+'	hi
+phoenix_wordcount	/root/bench/phoenix/phoenix-2.0/tests/word_count	180	bash -c 'S=$(date +%s.%N); for i in 1 2 3 4 5; do ./word_count /root/bench/data_wc.txt >/dev/null; done; E=$(date +%s.%N); echo "elapsed: $(echo "$E-$S"|bc)"'	grep -oP 'elapsed:\s*\K[0-9.]+'	lo
+phoenix_kmeans	/root/bench/phoenix/phoenix-2.0/tests/kmeans	180	bash -c 'S=$(date +%s.%N); for i in 1 2 3; do ./kmeans -d 3 -c 100 -p 100000 -s 1000 >/dev/null; done; E=$(date +%s.%N); echo "elapsed: $(echo "$E-$S"|bc)"'	grep -oP 'elapsed:\s*\K[0-9.]+'	lo
+fio_tmpfs	/root	120	fio --name=r --directory=/dev/shm/fiobench --size=64m --numjobs=16 --rw=randrw --bs=4k --ioengine=psync --time_based --runtime=15 --group_reporting --minimal	awk -F';' '{print $7+$48}'	hi
+fsmark_tmpfs	/root	180	fs_mark -d /dev/shm/fsmark -D 16 -n 2000 -s 4096 -t 16 -L 1	grep -oP '^\s*\d+\s+\d+\s+\d+\s+\K[0-9.]+'	hi
+netperf_tcp_stream	/root	120	bash -c 'for i in $(seq 1 16); do netperf -H 127.0.0.1 -l 15 -t TCP_STREAM -P 0 & done; wait' 	awk '{s+=$5} END{print s}'	hi
+netperf_tcp_rr	/root	120	bash -c 'for i in $(seq 1 16); do netperf -H 127.0.0.1 -l 15 -t TCP_RR -P 0 & done; wait'	awk '{s+=$6} END{print s}'	hi
+iperf3_16	/root	120	iperf3 -c 127.0.0.1 -P 16 -t 15 -J	python3 -c 'import json,sys; print(json.load(sys.stdin)["end"]["sum_sent"]["bits_per_second"]/1e9)'	hi
+stressng_flock	/root	120	stress-ng --flock 16 -t 15s --metrics-brief	grep -oP 'flock\s+\d+\s+[0-9.]+\s+[0-9.]+\s+[0-9.]+\s+\K[0-9.]+'	hi
+stressng_futex	/root	120	stress-ng --futex 16 -t 15s --metrics-brief	grep -oP 'futex\s+\d+\s+[0-9.]+\s+[0-9.]+\s+[0-9.]+\s+\K[0-9.]+'	hi
+stressng_mmap	/root	120	stress-ng --mmap 16 -t 15s --metrics-brief	grep -oP 'mmap\s+\d+\s+[0-9.]+\s+[0-9.]+\s+[0-9.]+\s+\K[0-9.]+'	hi
+stressng_pipe	/root	120	stress-ng --pipe 16 -t 15s --metrics-brief	grep -oP 'pipe\s+\d+\s+[0-9.]+\s+[0-9.]+\s+[0-9.]+\s+\K[0-9.]+'	hi
+stressng_sem	/root	120	stress-ng --sem 16 -t 15s --metrics-brief	grep -oP 'sem\s+\d+\s+[0-9.]+\s+[0-9.]+\s+[0-9.]+\s+\K[0-9.]+'	hi
+stressng_fork	/root	120	stress-ng --fork 16 -t 15s --metrics-brief	grep -oP 'fork\s+\d+\s+[0-9.]+\s+[0-9.]+\s+[0-9.]+\s+\K[0-9.]+'	hi
+stressng_dentry	/root	120	stress-ng --dentry 16 -t 15s --metrics-brief	grep -oP 'dentry\s+\d+\s+[0-9.]+\s+[0-9.]+\s+[0-9.]+\s+\K[0-9.]+'	hi
+stressng_sock	/root	120	stress-ng --sock 16 -t 15s --metrics-brief	grep -oP 'sock\s+\d+\s+[0-9.]+\s+[0-9.]+\s+[0-9.]+\s+\K[0-9.]+'	hi
+wis_lock1	/root/bench/will-it-scale	120	./lock1_threads -t 16 -s 15	grep -oP "average:\\K[0-9]+"	hi
+wis_lock2	/root/bench/will-it-scale	120	./lock2_threads -t 16 -s 15	grep -oP "average:\\K[0-9]+"	hi
+wis_futex1	/root/bench/will-it-scale	120	./futex1_threads -t 16 -s 15	grep -oP "average:\\K[0-9]+"	hi
+wis_futex2	/root/bench/will-it-scale	120	./futex2_threads -t 16 -s 15	grep -oP "average:\\K[0-9]+"	hi
+wis_futex3	/root/bench/will-it-scale	120	./futex3_threads -t 16 -s 15	grep -oP "average:\\K[0-9]+"	hi
+wis_futex4	/root/bench/will-it-scale	120	./futex4_threads -t 16 -s 15	grep -oP "average:\\K[0-9]+"	hi
+wis_page_fault1	/root/bench/will-it-scale	120	./page_fault1_threads -t 16 -s 15	grep -oP "average:\\K[0-9]+"	hi
+wis_page_fault2	/root/bench/will-it-scale	120	./page_fault2_threads -t 16 -s 15	grep -oP "average:\\K[0-9]+"	hi
+wis_page_fault3	/root/bench/will-it-scale	120	./page_fault3_threads -t 16 -s 15	grep -oP "average:\\K[0-9]+"	hi
+wis_mmap1	/root/bench/will-it-scale	120	./mmap1_threads -t 16 -s 15	grep -oP "average:\\K[0-9]+"	hi
+wis_mmap2	/root/bench/will-it-scale	120	./mmap2_threads -t 16 -s 15	grep -oP "average:\\K[0-9]+"	hi
+wis_brk1	/root/bench/will-it-scale	120	./brk1_threads -t 16 -s 15	grep -oP "average:\\K[0-9]+"	hi
+wis_tlb_flush1	/root/bench/will-it-scale	120	./tlb_flush1_threads -t 16 -s 15	grep -oP "average:\\K[0-9]+"	hi
+wis_tlb_flush2	/root/bench/will-it-scale	120	./tlb_flush2_threads -t 16 -s 15	grep -oP "average:\\K[0-9]+"	hi
+wis_open1	/root/bench/will-it-scale	120	./open1_threads -t 16 -s 15	grep -oP "average:\\K[0-9]+"	hi
+wis_open2	/root/bench/will-it-scale	120	./open2_threads -t 16 -s 15	grep -oP "average:\\K[0-9]+"	hi
+wis_unlink1	/root/bench/will-it-scale	120	./unlink1_threads -t 16 -s 15	grep -oP "average:\\K[0-9]+"	hi
+wis_unlink2	/root/bench/will-it-scale	120	./unlink2_threads -t 16 -s 15	grep -oP "average:\\K[0-9]+"	hi
+wis_dup1	/root/bench/will-it-scale	120	./dup1_threads -t 16 -s 15	grep -oP "average:\\K[0-9]+"	hi
+wis_pipe1	/root/bench/will-it-scale	120	./pipe1_threads -t 16 -s 15	grep -oP "average:\\K[0-9]+"	hi
+wis_unix1	/root/bench/will-it-scale	120	./unix1_threads -t 16 -s 15	grep -oP "average:\\K[0-9]+"	hi
+wis_poll1	/root/bench/will-it-scale	120	./poll1_threads -t 16 -s 15	grep -oP "average:\\K[0-9]+"	hi
+wis_eventfd1	/root/bench/will-it-scale	120	./eventfd1_threads -t 16 -s 15	grep -oP "average:\\K[0-9]+"	hi
+wis_signal1	/root/bench/will-it-scale	120	./signal1_threads -t 16 -s 15	grep -oP "average:\\K[0-9]+"	hi
+wis_context_switch1	/root/bench/will-it-scale	120	./context_switch1_threads -t 16 -s 15	grep -oP "average:\\K[0-9]+"	hi
+wis_sched_yield	/root/bench/will-it-scale	120	./sched_yield_threads -t 16 -s 15	grep -oP "average:\\K[0-9]+"	hi
+wis_posix_semaphore1	/root/bench/will-it-scale	120	./posix_semaphore1_threads -t 16 -s 15	grep -oP "average:\\K[0-9]+"	hi
+wis_fallocate1	/root/bench/will-it-scale	120	./fallocate1_threads -t 16 -s 15	grep -oP "average:\\K[0-9]+"	hi
+wis_lseek1	/root/bench/will-it-scale	120	./lseek1_threads -t 16 -s 15	grep -oP "average:\\K[0-9]+"	hi
+wis_pread1	/root/bench/will-it-scale	120	./pread1_threads -t 16 -s 15	grep -oP "average:\\K[0-9]+"	hi
+wis_pwrite1	/root/bench/will-it-scale	120	./pwrite1_threads -t 16 -s 15	grep -oP "average:\\K[0-9]+"	hi
+wis_read1	/root/bench/will-it-scale	120	./read1_threads -t 16 -s 15	grep -oP "average:\\K[0-9]+"	hi
+wis_write1	/root/bench/will-it-scale	120	./write1_threads -t 16 -s 15	grep -oP "average:\\K[0-9]+"	hi
+wis_getppid1	/root/bench/will-it-scale	120	./getppid1_threads -t 16 -s 15	grep -oP "average:\\K[0-9]+"	hi

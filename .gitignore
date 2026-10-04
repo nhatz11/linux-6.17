@@ -193,3 +193,5 @@ sphinx_*/
 
 # Rust analyzer configuration
 /rust-project.json
+tools/ivh/hostenv.sh
+tools/ivh/data/*.raw

@@ -1,0 +1,4 @@
+workload,rep,seconds,total_acq,slowpath,trylock,acq_per_s,slow_per_s
+memtier_distro,1,11.188,94250296,633889,117652,8423860,56655
+memtier_distro,2,11.184,93949658,626260,117741,8400733,55999
+memtier_distro,3,11.216,93574567,643142,120781,8342737,57340

@@ -1,0 +1,13 @@
+pkg,pair,arm,seconds,migrations
+ferret,1,off,68.091522675,0
+ferret,1,on,56.948295351,2243
+ferret,2,on,59.374465893,2344
+ferret,2,off,67.753285038,0
+ferret,3,off,67.806589510,0
+ferret,3,on,56.502181201,2272
+ferret,4,on,58.252097107,2327
+ferret,4,off,67.895354711,0
+ferret,5,off,68.122708496,0
+ferret,5,on,57.112879314,2144
+ferret,6,on,58.065290121,2432
+ferret,6,off,68.703361542,0

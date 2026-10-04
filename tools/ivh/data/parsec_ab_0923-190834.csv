@@ -1,0 +1,13 @@
+pkg,pair,arm,seconds,migrations
+blackscholes,1,off,24.870265505,0
+blackscholes,1,on,22.155495837,308
+blackscholes,2,on,21.672760494,428
+blackscholes,2,off,28.268743465,0
+blackscholes,3,off,26.296971583,0
+blackscholes,3,on,25.233393421,204
+blackscholes,4,on,22.508106660,279
+blackscholes,4,off,26.621266446,0
+blackscholes,5,off,25.563095530,0
+blackscholes,5,on,25.519357816,275
+blackscholes,6,on,24.499785745,143
+blackscholes,6,off,26.649411118,0

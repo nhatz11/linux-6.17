@@ -1,0 +1,41 @@
+#!/usr/bin/env bpftrace
+/*
+ * dedup_wait.bt -- what does dedup ACTUALLY wait on?  $1 = seconds.
+ *
+ * ivh_slowpath_wait_ns counts kernel QSPINLOCKS and reads ~181 ms over a
+ * 135 s dedup run (0.13%), which cannot be where its 126 lost seconds live.
+ * PARSEC dedup is a pipeline: stages joined by BOUNDED QUEUES guarded by
+ * pthread mutex + condvar, so a stalled stage BLOCKS IN FUTEX rather than
+ * spinning. This measures:
+ *   FUTEX   time inside the futex syscall  (queue-full / queue-empty blocking)
+ *   OFFCPU  involuntary off-CPU time       (preemption, the thing IVH targets)
+ * Probes fire at the blocking rate, not the lock-acquire rate, so overhead is
+ * low; the headline numbers still come from the uninstrumented pass.
+ */
+BEGIN { @dur = (uint64)$1; }
+interval:s:1 { @el = @el + 1; if (@el >= @dur) { exit(); } }
+
+tracepoint:syscalls:sys_enter_futex { @ft0[tid] = nsecs; }
+tracepoint:syscalls:sys_exit_futex
+/ @ft0[tid] != 0 /
+{
+	@futex_ns[comm] = sum(nsecs - @ft0[tid]);
+	@futex_n[comm]  = count();
+	delete(@ft0[tid]);
+}
+
+/* involuntary off-CPU: switched out while still RUNNABLE = preempted */
+tracepoint:sched:sched_switch
+{
+	if (args->prev_state == 0) {
+		@preempt_t0[args->prev_pid] = nsecs;
+		@preempted[args->prev_comm] = count();
+	}
+	if (@preempt_t0[args->next_pid] != 0) {
+		@offcpu_ns[args->next_comm] = sum(nsecs - @preempt_t0[args->next_pid]);
+		@offcpu_n[args->next_comm]  = count();
+		delete(@preempt_t0[args->next_pid]);
+	}
+}
+
+END { clear(@ft0); clear(@preempt_t0); clear(@dur); clear(@el); }

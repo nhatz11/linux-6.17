@@ -1,0 +1,5 @@
+workload,arm,rep,perf,dur_s,spin_iters,spin_attempts,spin_ns,wall_ns,wait_events,migs,t1_fired,t2_fired,heh_bailed,bypass_fired,evict_marked
+fsmark_tmpfs,mig_t1,1,66089.3000,10.043,6846402,3688,160890447,461030928,50571,0,728,0,0,0,0
+fsmark_tmpfs,mig_t1_heh,1,66521.6000,9.880,4954870,2533,116439445,327074248,14716,0,1634,0,0,0,0
+fsmark_tmpfs,mig_t1_heh_t2,1,67341.8000,9.842,9975133,10574,234415626,837545888,52707,0,6704,740,0,0,0
+fsmark_tmpfs,mig_t1_heh_t2_sk,1,66448.5000,9.885,4855763,4328,114110430,357157183,15922,0,3121,241,0,0,2
