@@ -130,14 +130,28 @@ enum { IVH_AFL_OK = 0, IVH_AFL_ABORTED = -1 };
  * preferred pattern in any hot CS loop, see ivh_afl_beat()'s comment. */
 #define IVH_AFL_BEAT_INTERVAL ((int)(IVH_AFL_BEAT_MASK + 1u))
 
-/* FUTEX_WAKE count on unlock. 1 is the validated starting default per this
- * project's "measure before adding complexity" discipline -- waking more
- * than one is a real, known latency hedge (against the woken thread's own
- * scheduling delay) but its payoff has NOT been measured on this host, so
- * it is left as an easy runtime override (IVH_AFL_WAKE env var) rather than
- * built as adaptive logic. */
+/* FUTEX_WAKE count on unlock. Now 2: a deliberate hedge against lock-WAITER
+ * preemption (LWP). Under host oversubscription the single waiter the kernel
+ * pops may sit on a preempted vCPU, in which case the lock stays idle for a
+ * whole host quantum (ms) even though other waiters are runnable. Waking a
+ * second waiter costs one futex syscall plus one failed acquire (us) and
+ * makes that stall require BOTH popped waiters to be preempted.
+ *
+ * Note the asymmetry that motivates this, not a measured win on this host:
+ * the hedge is ~us, the stall it hedges against is ~ms. The loser thread
+ * re-runs the state==2 exchange and sleeps again, which is the same bounded,
+ * self-healing spurious-wake path already described in ivh_afl_lock_slow();
+ * it also holds state at 2, so the next unlock issues one more wake. Watch
+ * wakes_woke_nobody and total_threads_woken (IVH_AFL_STATS) for that cascade.
+ *
+ * FUTEX_WAKE takes the kernel's hash-bucket order, so this hedges blindly --
+ * it cannot prefer a waiter known to be on a running vCPU. Targeted selection
+ * would need a per-waiter futex word, i.e. a different lock shape.
+ *
+ * Runtime override: IVH_AFL_WAKE env var. Set IVH_AFL_WAKE=1 for the old
+ * behaviour, which is the A/B baseline for measuring whether this pays. */
 #ifndef IVH_AFL_WAKE_COUNT
-#define IVH_AFL_WAKE_COUNT 1
+#define IVH_AFL_WAKE_COUNT 2
 #endif
 
 /* Every FUTEX_WAIT carries this timeout. This is NOT a tuning knob for
@@ -196,6 +210,17 @@ struct ivh_afl_lock {
 	 * private ones would be pure loss.
 	 */
 	uint32_t shared;
+	/*
+	 * Mid-spin hook (2026-10-01). Called from the pure-spin branch every
+	 * mid_spin_iters iterations while waiting, so a waiter can re-evaluate
+	 * its own vCPU health and relocate itself mid-wait instead of only
+	 * before the acquisition attempt. NULL (the default after
+	 * ivh_afl_init) disables it entirely, so every existing user of this
+	 * header is unaffected. The caller owns all policy; the lock only
+	 * provides the call site and the rate limit.
+	 */
+	void (*mid_spin)(void *);
+	uint32_t mid_spin_iters;
 #ifdef IVH_AFL_DEBUG
 	volatile int owner_tid;
 #endif
@@ -360,6 +385,8 @@ static void ivh_afl_global_init(void)
 
 static inline void ivh_afl_init(struct ivh_afl_lock *l)
 {
+	l->mid_spin = NULL;
+	l->mid_spin_iters = 0;
 	memset((void *)l, 0, sizeof(*l));
 	l->state = 0;
 	l->hb_tsc = __rdtsc();
@@ -455,6 +482,28 @@ static inline void ivh_afl_cpu_relax(void)
 }
 
 /*
+ * Spin hint for the DISABLED (pure busy-wait) path only.
+ *
+ * `pause` is deliberately expensive -- ~140 cycles on Skylake+ -- which is
+ * correct when the spin is bounded by a real sleep escape hatch, and ruinous
+ * when IVH_AFL_DISABLE=1 forces an unbounded spin. NHextend3.c, the original
+ * busy-wait benchmark this path is meant to reproduce, spins on `lfence`
+ * instead (NHextend3.c:238, `#define rmb() asm volatile ("lfence")`, used in
+ * its `while (data->lock && !data->done) { rmb(); }` loop at :522,:547).
+ *
+ * The mismatch made IVH_AFL_DISABLE=1 an INVALID control: measured -42% at
+ * loop_spin=50000 where the same arm with the lock enabled gave +7.6%, and
+ * tools/bpf/docs/ivh_afl_confound_and_threshold_search_2026-09-12-night.md:46
+ * recorded -56.3% and called it "not a valid neutral control ... ruinous when
+ * forced to spin on it forever with sleeping disabled". That doc's "named
+ * next step, not yet done" was exactly this change; this is it.
+ */
+static inline void ivh_afl_spin_relax_unbounded(void)
+{
+	asm volatile("lfence" ::: "memory");
+}
+
+/*
  * Acquire. Returns IVH_AFL_OK, or IVH_AFL_ABORTED if *abort_flag became
  * true while waiting (only meaningful if ivh_afl_set_abort_flag() was
  * called -- see the shutdown-deadlock note on ivh_afl_shutdown_wake()).
@@ -463,6 +512,7 @@ static inline int ivh_afl_lock(struct ivh_afl_lock *l)
 {
 	uint32_t expected;
 	unsigned spins = 0;
+	uint32_t mid_n = 0;
 	struct timespec timeout;
 	/* Earliest TSC at which re-reading l->hb_tsc could possibly change
 	 * this waiter's stale/not-stale verdict; see "Tier-2a, DEADLINE SKIP"
@@ -543,7 +593,14 @@ static inline int ivh_afl_lock(struct ivh_afl_lock *l)
 		}
 
 		if (!l->enabled) {
-			ivh_afl_cpu_relax();
+			if (l->mid_spin && l->mid_spin_iters &&
+			    ++mid_n >= l->mid_spin_iters) {
+				mid_n = 0;
+				l->mid_spin(l->hook_arg);
+			}
+			/* lfence, not pause -- matches NHextend3's original
+			 * busy-wait. See ivh_afl_spin_relax_unbounded(). */
+			ivh_afl_spin_relax_unbounded();
 			continue; /* pure-spin fallback: never sleep */
 		}
 

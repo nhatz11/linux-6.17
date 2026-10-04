@@ -66,7 +66,19 @@ done
 bpftool map update name ivh_cfg key 0 0 0 0 value "$CFG" 0 0 0 \
   || echo "*** ERROR: ivh_cfg map update FAILED -- IVH will make no migrations ***" >&2
 
-cd /root/vcapacity && setsid nohup ./vcap_probe -p 200 -s 200 \
+# REMOVED 2026-10-01 (vcap_probe deleted -- obsolete since vcap measures its own demand, and it inflated every PV-relative number): cd /root/vcapacity && setsid nohup ./vcap_probe -p 200 -s 200 \
+# --- vcap: the measurement daemon (TSC-gap steal -> capacity + active time).
+# Replaces vcap_probe, deleted 2026-10-01: it computed nothing and inflated
+# every PV-relative number by damaging the baseline (IVH is insensitive to it,
+# PV is not).  vcap needs /proc/ivh_cpu_stats (G-LOCK-51+) for tsc_khz and
+# exits immediately without it, so it is guarded.
+# ivh_ucw_max_age_ns MUST exceed vcap's loop period (~5.2s at -p 200 -s 5000)
+# or the staleness watchdog expires capacity to 1024 between publishes and the
+# arm silently becomes "IVH off".  A mismatch here is SILENT.
+if [ -e /proc/ivh_cpu_stats ]; then
+    [ -e /proc/sys/kernel/ivh_ucw_max_age_ns ] && echo 16000000000 > /proc/sys/kernel/ivh_ucw_max_age_ns
+    cd /root/vcapacity && (pgrep -x vcap >/dev/null || (nohup ./vcap -p 200 -s 5000 >/root/ivh_logs/vcap.log 2>&1 & sleep 2))
+fi
   > /root/ivh_logs/vcap_probe.log 2>&1 < /dev/null &
 
 sleep 3

@@ -392,6 +392,18 @@ struct thread_data {
         unsigned long long                      wait_stuck_cnt, wait_stuck_ns;   /* bad -> bad  */
         unsigned long long                      wait_resc_cnt,  wait_resc_ns;    /* bad -> good */
         unsigned long long                      wait_good_cnt,  wait_good_ns;    /* good start  */
+        /* mid-spin migration (NHextend-fin) */
+        unsigned long long                      ms_polls;        /* hook invocations            */
+        unsigned long long                      ms_danger;       /* polls that saw DANGER set   */
+        unsigned long long                      ms_syscalls;     /* ivh_cs_enter calls made     */
+        unsigned long long                      ms_moved;        /* ...that changed CPU         */
+        unsigned long long                      ms_to_healthy;   /* ...landing on cpu>=8        */
+        unsigned long long                      ms_flips;        /* DANGER value changed vs last*/
+        unsigned long long                      ms_sys_ns;       /* ns spent inside the syscall */
+        unsigned long long                      ms_waits_polled; /* waits with >=1 poll         */
+        unsigned long long                      ms_skip_healthy; /* suppressed: already on cpu>=8*/
+        unsigned long long                      ms_skip_cool;    /* suppressed: per-thread cooldown*/
+        unsigned long long                      ms_skip_once;    /* suppressed: already migrated this wait */
         unsigned long long                      sum_migration_ns;
         unsigned long long                      max_migration_ns;
         unsigned long long                      slow_migration_count; /* ivh_cs_enter() > 1ms */
@@ -545,6 +557,7 @@ static unsigned long long get_time_cputime(void)
 
 static int post_sleep = 1;   /* NHEXTEND_POST_SLEEP=0 disables */
 static int post_spin;        /* NHEXTEND_POST_SPIN=1: do_spin() instead of do_sleep() */
+static int ms_once_per_wait; /* NHEXTEND_MIDSPIN_ONCE=1: at most one migration per wait */
 /*
  * NHEXTEND_NO_HOLD_STEAL=1 drops the hold-side read_vcap_steal() sample.
  *
@@ -578,6 +591,7 @@ static int no_hold_steal;
  * minimum, for the case where CSmin is known a priori.
  */
 static int use_cs_min;
+static unsigned midspin_iters;   /* NHEXTEND_MIDSPIN_ITERS, 0 = disabled */
 static unsigned long long cs_min_pinned_ns;
 
 static void do_sleep(unsigned usecs)
@@ -594,18 +608,21 @@ static void do_sleep(unsigned usecs)
  * sleeping. Same duration as the do_sleep() it replaces, so the two are a
  * clean A/B on "idle vCPU vs warm vCPU" with the backoff length held fixed.
  *
- *   do_sleep  gives the vCPU up, so the host may deschedule it and the thread
- *             pays a wake-up plus a cold cache on its next acquisition.
- *   no sleep  returns straight to the lock, so 16 threads hammer one
+ * Why this sits between the two existing options:
+ *   do_sleep  gives the vCPU up, so the host may deschedule it, and the
+ *             thread then pays a wake-up plus a cold cache on its next
+ *             acquisition.
+ *   no sleep  returns straight to the lock, so 16 threads hammer the same
  *             cacheline and the lock word ping-pongs between vCPUs.
- *   do_spin   keeps the vCPU runnable while touching NOTHING shared -- in
- *             particular it does NOT call ivh_afl_publish_heartbeat(), which
- *             the real critical section does, because that writes l->hb_tsc
- *             and would put the bouncing straight back.
+ *   do_spin   keeps the vCPU runnable (nothing for the host to steal, nothing
+ *             to wake) while touching NOTHING shared -- in particular it does
+ *             NOT call ivh_afl_publish_heartbeat(), which the real critical
+ *             section does, because that writes l->hb_tsc and would put the
+ *             bouncing straight back.
  *
- * Same dependent wmb() loop the critical section runs, so the instruction mix
- * matches a CS; only the shared writes are absent. The clock is read once per
- * batch so the bound costs ~nothing.
+ * The body is the same dependent wmb() loop the critical section runs, so the
+ * instruction mix matches a CS; only the shared writes are absent. The clock
+ * is read once per WMB_BATCH iterations so the bound costs ~nothing.
  */
 #define IVH_SPIN_WMB_BATCH 64
 
@@ -621,8 +638,135 @@ static void do_spin(unsigned usecs)
         }
 }
 
+/*
+ * Per-thread pointer to this thread's own tdata, set once at the top of
+ * run_thread(). The lock's before_sleep/after_wake hooks run synchronously
+ * on whichever thread calls ivh_afl_lock(), so referencing this __thread
+ * variable from inside the hooks always resolves to the CALLING thread's
+ * own tdata -- unlike the header's single shared hook_arg, which is one
+ * pointer per LOCK, not per thread, and would be the wrong thread's data
+ * whenever more than one thread ever slept on the same lock.
+ */
 static __thread struct thread_data *g_tdata;
 
+/*
+ * Mid-spin migration policy (NHextend-fin, 2026-10-01).
+ *
+ * Called from ivh_afl_lock()'s pure-spin branch every lock.mid_spin_iters
+ * iterations. The predicate is the kernel's own advisory bit: the
+ * IVH_DANGER flag is set iff ivh_rq_capacity_and_timeleft_ok() is false for
+ * the vCPU this thread is on, i.e. exactly "bad capacity AND no time left"
+ * -- so no /proc read is needed to evaluate it, just a load from the rseq
+ * page this thread already owns.
+ *
+ * ms_flips counts how often the observed bit differs from the previous poll.
+ * That number decides whether this mechanism can work at all: the kernel
+ * only refreshes the bit on return-to-userspace, which for a pure userspace
+ * spin loop means the timer tick (1ms at CONFIG_HZ=1000). If ms_flips is ~0
+ * while ms_polls is large, the extra polls are re-reading a stale value and
+ * no polling rate can help.
+ */
+static __thread int ms_last_danger = -1;
+static __thread unsigned long long ms_last_sys_ns;
+/*
+ * Reset at the top of every wait. With NHEXTEND_MIDSPIN_ONCE=1 a thread may
+ * relocate at most once per waiting session: a second move inside one wait
+ * means the first destination was wrong, and re-rolling costs another full
+ * migration against a destination pool only 8 vCPUs wide.
+ */
+static __thread int ms_wait_used;
+static unsigned long long ms_cooldown_ns = 1000000ULL; /* NHEXTEND_MIDSPIN_COOLDOWN_NS */
+
+static void ivh_mid_spin_hook(void *arg)
+{
+        struct thread_data *t = g_tdata;
+        int d, cpu;
+        unsigned long long now;
+
+        (void)arg;
+        if (!t)
+                return;
+
+        t->ms_polls++;
+        d = ivh_danger() ? 1 : 0;
+        if (ms_last_danger >= 0 && d != ms_last_danger)
+                t->ms_flips++;
+        ms_last_danger = d;
+
+        if (!d)
+                return;
+        t->ms_danger++;
+
+        /* Filter 0 -- one migration per waiting session. */
+        if (ms_once_per_wait && ms_wait_used) {
+                t->ms_skip_once++;
+                return;
+        }
+
+        /*
+         * Filter 1 -- already healthy. The kernel only refreshes IVH_DANGER
+         * on return-to-userspace (the 1ms tick for a pure userspace spin),
+         * so after a successful migration the bit stays SET until the next
+         * tick even though the thread is now on a good vCPU. Acting on it
+         * again buys nothing and costs a ~1.2ms syscall. sched_getcpu() is a
+         * vDSO read (~20ns), i.e. ~60,000x cheaper than finding out the hard
+         * way.
+         */
+        cpu = sched_getcpu();
+        if (cpu >= 8) {
+                t->ms_skip_healthy++;
+                return;
+        }
+
+        /*
+         * Filter 2 -- per-thread cooldown. Independent of filter 1: a
+         * migration that did NOT land us on cpu>=8 (destination gates
+         * refused, or we were pushed back) would otherwise be retried on
+         * every poll against the same stale bit. One tick period is the
+         * natural value, since that is the soonest the observation can
+         * change. This is a TASK-local limiter; ivh_eval_cooldown_ns is the
+         * kernel's per-VCPU one and does not dedupe a single thread's
+         * repeats.
+         */
+        now = get_time_ns();
+        if (ms_last_sys_ns && now - ms_last_sys_ns < ms_cooldown_ns) {
+                t->ms_skip_cool++;
+                return;
+        }
+        ms_last_sys_ns = now;
+        ms_wait_used = 1;
+
+        {
+                int cpu_post;
+                unsigned long long t0 = get_time_ns();
+                ivh_cs_enter();
+                t->ms_sys_ns += get_time_ns() - t0;
+                t->ms_syscalls++;
+                cpu_post = sched_getcpu();
+                if (cpu >= 0 && cpu_post >= 0 && cpu != cpu_post) {
+                        t->ms_moved++;
+                        if (cpu_post >= 8)
+                                t->ms_to_healthy++;
+                }
+        }
+}
+
+
+#ifdef IVH_AFL_STATS
+static struct ivh_afl_stats g_afl_totals;
+#endif
+
+/*
+ * Hooks bracketing an actual FUTEX_WAIT sleep. See
+ * ivh_adaptive_futex_lock.h's file header and struct ivh_afl_lock's design
+ * doc sec 5.4 for why these exist: a thread that is genuinely blocked in
+ * the kernel is not spin-waiting, so wait_counter (whose own name is
+ * "spin-wait nesting depth") should reflect that, and an outstanding
+ * cr_counter extension request is something the kernel itself consumes on
+ * return-to-userspace (kernel/rseq.c) -- carrying one into a sleep is a
+ * real inconsistency, not a cosmetic one, exactly like carrying it across
+ * the old lock's inner poll loop was already handled via unextend().
+ */
 static void ivh_afl_hook_before_sleep(void *arg)
 {
         (void)arg;
@@ -657,42 +801,14 @@ static void grab_lock(struct thread_data *tdata, struct data *data)
 
         g_tdata = tdata;
 
-        {
-                /*
-                 * 2026-10-01: migration_count used to be incremented on every
-                 * syscall that was MADE, with no check that the thread
-                 * actually moved -- so "Total migrations" was a count of
-                 * attempts that got past the advisory danger bit. Every
-                 * figure derived from it (cost per migration, migrations per
-                 * iteration, the eval tables' migration columns) was really
-                 * per-attempt. Bracket the syscall with sched_getcpu() and
-                 * count the CPU change; keep the attempt count separately so
-                 * the old number is still recoverable.
-                 */
-                int cpu_pre = sched_getcpu();
-                unsigned long long _t0 = get_time_ns();
-                int made = ivh_cs_enter_checked();
-                unsigned long long _dt = get_time_ns() - _t0;
-                int cpu_post = sched_getcpu();
-
-                if (!made) {
-                        tdata->syscall_skipped_count++;
-                } else {
-                        tdata->syscall_made_count++;
-                        tdata->sum_migration_ns += _dt;
-                        if (_dt > tdata->max_migration_ns)
-                                tdata->max_migration_ns = _dt;
-                        if (_dt > 1000000ULL) /* >1ms = got stuck in schedule() */
-                                tdata->slow_migration_count++;
-                        if (cpu_pre != cpu_post && cpu_pre >= 0 && cpu_post >= 0) {
-                                tdata->migration_count++;
-                                tdata->sum_moved_ns += _dt;
-                                if (cpu_post >= 8)
-                                        tdata->migration_to_healthy++;
-                        }
-                }
-        }
-
+        /*
+         * NHextend-fin: the PRE-LOCK migration call is deliberately absent.
+         * NHextend-full calls ivh_cs_enter_checked() here, before the wait.
+         * This binary moves that decision into the spin loop instead (see
+         * ivh_mid_spin_hook below), so with the hook disarmed it must behave
+         * exactly like PV -- that is the smoke test.
+         */
+        ms_wait_used = 0;
         start_wait = get_time();
         start_wait_ns = get_time_ns();
 
@@ -1040,14 +1156,25 @@ int main (int argc, char **argv)
                         const char *ps = getenv("NHEXTEND_POST_SLEEP");
                         if (ps)
                                 post_sleep = atoi(ps);
-                        const char *pp = getenv("NHEXTEND_POST_SPIN");
-                        if (pp)
-                                post_spin = atoi(pp);
                 }
                 {
                         const char *nh = getenv("NHEXTEND_NO_HOLD_STEAL");
                         if (nh)
                                 no_hold_steal = atoi(nh);
+                }
+                {
+                        const char *mi = getenv("NHEXTEND_MIDSPIN_ITERS");
+                        if (mi)
+                                midspin_iters = (unsigned)strtoul(mi, NULL, 10);
+                        const char *mc = getenv("NHEXTEND_MIDSPIN_COOLDOWN_NS");
+                        if (mc)
+                                ms_cooldown_ns = strtoull(mc, NULL, 10);
+                        const char *mo = getenv("NHEXTEND_MIDSPIN_ONCE");
+                        if (mo)
+                                ms_once_per_wait = atoi(mo);
+                        const char *pp = getenv("NHEXTEND_POST_SPIN");
+                        if (pp)
+                                post_spin = atoi(pp);
                 }
                 {
                         const char *cm = getenv("NHEXTEND_CS_MIN");
@@ -1123,6 +1250,12 @@ int main (int argc, char **argv)
         ivh_afl_init(&data.lock);
         ivh_afl_set_abort_flag(&data.lock, (const volatile bool *)&data.done);
         ivh_afl_set_hooks(&data.lock, ivh_afl_hook_before_sleep, ivh_afl_hook_after_wake, NULL);
+        if (midspin_iters) {
+                data.lock.mid_spin = ivh_mid_spin_hook;
+                data.lock.mid_spin_iters = midspin_iters;
+                fprintf(stderr, "mid-spin migration ARMED: every %u spin iterations\n",
+                        midspin_iters);
+        }
 
         cpus = sysconf(_SC_NPROCESSORS_CONF);
         if (num_threads <= 0)
@@ -1326,6 +1459,35 @@ int main (int argc, char **argv)
                                rc, tot?100.0*rc/tot:0, rc?rn/rc:0);
                         printf("  started cpu>=8                   : %llu (%.2f%%)  avg wait %llu ns\n",
                                gc, tot?100.0*gc/tot:0, gc?gn/gc:0);
+                        }
+                        {
+                        unsigned long long p=0,dg=0,sc=0,mv=0,th=0,fl=0,sn=0,sh2=0,sk=0,so=0;
+                        for (i = 0; i < num_threads; i++) {
+                                p  += data.tdata[i].ms_polls;   dg += data.tdata[i].ms_danger;
+                                sc += data.tdata[i].ms_syscalls;mv += data.tdata[i].ms_moved;
+                                th += data.tdata[i].ms_to_healthy; fl += data.tdata[i].ms_flips;
+                                sn += data.tdata[i].ms_sys_ns;
+                                sh2 += data.tdata[i].ms_skip_healthy;
+                                sk  += data.tdata[i].ms_skip_cool;
+                                so  += data.tdata[i].ms_skip_once;
+                        }
+                        if (midspin_iters || p) {
+                        printf("\nMid-spin migration (every %u spin iters):\n", midspin_iters);
+                        printf("  polls                 : %llu\n", p);
+                        printf("  DANGER bit set        : %llu  (%.2f%% of polls)\n", dg,
+                               p ? 100.0*dg/p : 0.0);
+                        printf("  DANGER value FLIPPED  : %llu  (%.3f%% of polls) <- if ~0, the bit is stale\n",
+                               fl, p ? 100.0*fl/p : 0.0);
+                        printf("  SUPPRESSED already cpu>=8 : %llu\n", sh2);
+                        printf("  SUPPRESSED cooldown %llu ns: %llu\n", ms_cooldown_ns, sk);
+                        printf("  SUPPRESSED once-per-wait  : %llu\n", so);
+                        printf("  syscalls AVOIDED by filters: %llu  (%.1f%% of danger hits)\n",
+                               sh2 + sk + so, dg ? 100.0*(sh2+sk+so)/dg : 0.0);
+                        printf("  syscalls made         : %llu  avg %llu ns  total %.3f s\n", sc,
+                               sc ? sn/sc : 0, sn/1e9);
+                        printf("  ...CPU actually moved : %llu  (%.1f%%)   to cpu>=8: %llu\n", mv,
+                               sc ? 100.0*mv/sc : 0.0, th);
+                        }
                         }
                         printf("\nLock cycle decomposition (ns):\n");
                         printf("  handoff  release -> next acquire  : avg %llu  max %llu  (n=%llu)\n",
