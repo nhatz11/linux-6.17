@@ -225,7 +225,8 @@ static int is_cpu_preempted(struct rq *rq, u64 now_time)
 #define ACC_TIER1_ACTIVE  9  /* accepted: active (non-idle) worker */
 #define ACC_TIER2_IDLE    10 /* accepted (fallback record): idle vCPU */
 #define REJ_USER_LOCKHOLDER 11 /* target's curr holds a USERSPACE lock (rseq cr_counter) */
-#define REJ_MAX           12
+#define REJ_DEST_MARGIN   12 /* rejected by the ivh_cfg[1] relative destination margin */
+#define REJ_MAX           16
 
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -288,6 +289,22 @@ static __always_inline void bump_reason(u32 reason)
  * Rollback: bpftool map update name ivh_cfg key 0 0 0 0 value 0 0 0 0
  */
 #define IVH_CFG_CAP_SOURCE   0
+/*
+ * ivh_cfg[1]: destination-quality margin, as a PERCENT of source capacity.
+ * 0 (default) = unchanged behaviour, so loading this build alters nothing until
+ * the key is written. N = a destination must read at least src*(100+N)/100.
+ *
+ * RELATIVE on purpose. IVH_CAP_FLOOR (850) was retired 2026-08-03 because a
+ * fixed constant on the capacity scale cannot be right in every regime: the
+ * same eight contended vCPUs measured 506-520 saturated, 742-823 idle and
+ * 890-936 under hackbench. A percentage of the source survives that drift.
+ * The existing IVH_CAP_MARGIN_MIN (20) is ~2.6% at a capacity of 758, i.e.
+ * inside the sample-to-sample drift, which is why marginal targets are
+ * accepted under uniform starvation.
+ *   set:  bpftool map update name ivh_cfg key 1 0 0 0 value 15 0 0 0
+ *   off:  bpftool map update name ivh_cfg key 1 0 0 0 value 0 0 0 0
+ */
+#define IVH_CFG_DEST_MARGIN_PCT  1
 #define IVH_CAP_SRC_VCAP     0
 #define IVH_CAP_SRC_UC       3
 
@@ -309,6 +326,16 @@ struct {
 static __always_inline unsigned long ivh_cap_of(struct rq *rq, u32 src)
 {
     return src == IVH_CAP_SRC_UC ? rq->ivh_uc_capacity : rq->cpu_capacity;
+}
+
+/* Read ivh_cfg[1] once, at the top of a scan (same reason as cap_source:
+ * a mid-scan change would produce a half-strict candidate set). */
+static __always_inline u32 ivh_dest_margin_pct_now(void)
+{
+    u32 key = IVH_CFG_DEST_MARGIN_PCT;
+    u32 *v = bpf_map_lookup_elem(&ivh_cfg, &key);
+
+    return v ? *v : 0;
 }
 
 /* Read ivh_cfg[0] once, at the top of a scan. */
@@ -457,6 +484,7 @@ struct task_ctx {
     int *found_active_worker_ptr;      /* 1 once a Tier 1 (active worker) target is found */
     u32 cap_source;                    /* ivh_cfg[0], resolved ONCE per scan (see ivh_cap_of) */
     u32 scan_max;                      /* max capacity over all CPUs, resolved ONCE per scan */
+    u32 dest_margin_pct;               /* ivh_cfg[1], resolved ONCE per scan; 0 = inactive */
 };
 
 /*
@@ -663,7 +691,15 @@ static int process_cpu(u32 iter, void *data)
         unsigned long dcap = ivh_cap_of(select_rq, ctx->cap_source);
         unsigned long src  = (unsigned long)ctx->source_capacity;
 
-        /* Noise rail first -- cheap, and it is the binding one under uniform
+        /* Relative rail (ivh_cfg[1], percent of src). 0 => inactive, so this
+         * build is behaviour-identical to the previous one until the key is
+         * set. Checked FIRST because it is the strictest when enabled. */
+        if (ctx->dest_margin_pct &&
+            dcap * 100 < src * (100 + (unsigned long)ctx->dest_margin_pct)) {
+            bump_reason(REJ_NOT_BETTER);
+            return 0;
+        }
+        /* Noise rail -- cheap, and it is the binding one under uniform
          * contention where the midpoint test degenerates. */
         if (dcap < src + IVH_CAP_MARGIN_MIN) {
             bump_reason(REJ_NOT_BETTER);
@@ -680,6 +716,22 @@ static int process_cpu(u32 iter, void *data)
         }
     }
 #else
+    /* Relative destination rail (ivh_cfg[1], percent of source capacity).
+     * 0 => inactive, so this build is behaviour-identical to the previous one
+     * until the key is set.  Lives HERE, in the compiled-in branch: the
+     * IVH_CAP_MARGIN_REL arm above is #if'd OUT (REL == 0) and a copy placed
+     * there measures nothing -- which is exactly how the 1003-0631/0638 sweeps
+     * came to test an unmodified selector.  It gets its OWN counter so that
+     * "did it fire" is a reading, never an inference. */
+    if (ctx->dest_margin_pct) {
+        unsigned long dcap = ivh_cap_of(select_rq, ctx->cap_source);
+        unsigned long src  = (unsigned long)ctx->source_capacity;
+
+        if (dcap * 100 < src * (100 + (unsigned long)ctx->dest_margin_pct)) {
+            bump_reason(REJ_DEST_MARGIN);
+            return 0;
+        }
+    }
     if (ivh_cap_of(select_rq, ctx->cap_source)
         < (unsigned long)ctx->source_capacity + IVH_CAP_MARGIN) {
         bump_reason(REJ_NOT_BETTER);
@@ -922,7 +974,8 @@ int BPF_PROG(test3, struct rq *rq, struct task_struct *curr, u64 now_time, int a
         .average_capacity = average_capacity,
         .found_active_worker_ptr = &found_active_worker,
         .cap_source = cap_src,
-        .scan_max = smc.max
+        .scan_max = smc.max,
+        .dest_margin_pct = ivh_dest_margin_pct_now()
     };
 
     unsigned long mm_bits = curr->mm ? curr->mm->cpu_bitmap[0] : 0UL;
