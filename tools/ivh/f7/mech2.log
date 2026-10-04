@@ -1,0 +1,17 @@
+  === nhextend: migcost_light, 1497 completed migrations tracked ===
+    top comm           NHextend-csmin
+    MECH  total       9.0 ms   per migration    5.98 us   <- THE migration cost
+    DELAY total    1293.4 ms   per migration  864.01 us   (target-rq wait, NOT summed)
+    rwsem WRITE wait       618.6 ms  (comm git)
+    rwsem READ wait        248.2 ms  (comm git)
+  === fsmark: migcost_light, 684 completed migrations tracked ===
+    top comm           fs_mark
+    MECH  total       2.3 ms   per migration    3.42 us   <- THE migration cost
+    DELAY total      19.4 ms   per migration   28.41 us   (target-rq wait, NOT summed)
+    rwsem WRITE wait     15562.0 ms  (comm fs_mark)
+  === dedup: migcost_light, 12266 completed migrations tracked ===
+    top comm           dedup
+    MECH  total      64.4 ms   per migration    5.25 us   <- THE migration cost
+    DELAY total   13655.2 ms   per migration 1113.25 us   (target-rq wait, NOT summed)
+    rwsem WRITE wait     98038.0 ms  (comm dedup)
+    rwsem READ wait        209.5 ms  (comm dedup)
